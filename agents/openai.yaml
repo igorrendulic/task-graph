@@ -1,4 +1,4 @@
 interface:
   display_name: "Task Graph"
   short_description: "Manage task flow"
-  default_prompt: "Use $mailio-kanban to create implementation tasks, plan dependency-safe parallel batches, or start backend tasks with automatic worker-agent coordination."
+  default_prompt: "Use $task-graph to create implementation tasks, plan dependency-safe parallel batches, or start project tasks with automatic worker-agent coordination."

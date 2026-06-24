@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manage go-mailio-server-private .agent kanban task files."""
+"""Manage project-local .agent kanban task files."""
 
 from __future__ import annotations
 
@@ -266,7 +266,7 @@ def main() -> None:
     parser.add_argument("command", choices=("board", "plan", "start", "done"))
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--task", help="Task filename for the done command")
-    parser.add_argument("--limit", type=int, default=2, help="Maximum recommended parallel launch count")
+    parser.add_argument("--limit", type=int, default=5, help="Maximum recommended parallel launch count")
     args = parser.parse_args()
 
     repo = args.repo.resolve()

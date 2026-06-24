@@ -1,19 +1,19 @@
 ---
-name: mailio-kanban
-description: Manage the go-mailio-server-private agent kanban workflow in .agent/kanban.md and .agent/tasks/{todo,in-progress,done}. Use when the user asks to create implementation tasks, plan task files for backend work, start kanban implementation, pick the next task, move task files between todo/in-progress/done, or coordinate parallelizable Mailio backend tasks with clean-context Codex runs.
+name: task-graph
+description: Manage project-local agent task graphs and kanban workflow in .agent/kanban.md and .agent/tasks/{todo,in-progress,done}. Use when the user asks to create implementation tasks, plan task files, start kanban implementation, pick the next task, move task files between todo/in-progress/done, or coordinate parallelizable project work with clean-context Codex runs.
 ---
 
-# Mailio Kanban
+# Task Graph
 
 ## Board Paths
 
-Assume the repository root is `go-mailio-server-private/` inside the current workspace unless the user gives another path.
+Assume the repository root is the current working directory unless the user gives another path.
 
 - Board: `.agent/kanban.md`
 - Task folders: `.agent/tasks/todo`, `.agent/tasks/in-progress`, `.agent/tasks/done`
 - Helper: `scripts/kanban.py`
 
-Run helper commands from any directory, passing `--repo /path/to/go-mailio-server-private` when the current directory is not the backend repo.
+Run helper commands from any directory, passing `--repo <repo-root>` when the current directory is not the target repo. The target repo must contain `.agent/`; if it does not, ask before creating project workflow files.
 
 ## Commands
 
@@ -21,7 +21,7 @@ Run helper commands from any directory, passing `--repo /path/to/go-mailio-serve
 
 Use this workflow when the user asks to create an implementation plan or task breakdown.
 
-1. Inspect the requested feature and the relevant backend code.
+1. Inspect the requested feature and the relevant project code, docs, tests, and conventions.
 2. Decompose work into small implementation tasks that can be completed from a fresh context.
 3. Assign stable numeric prefixes (`001-...md`, `002-...md`) and concise slug names.
 4. Mark parallelization explicitly in each task:
@@ -36,13 +36,14 @@ Use this workflow when the user asks to create an implementation plan or task br
    - `Parallel`
    - `Acceptance Criteria`
    - `Test Notes`
-6. Put new task files in `.agent/tasks/todo/`.
-7. Regenerate `.agent/kanban.md` so TODO, IN PROGRESS, and DONE match the filesystem.
+6. Keep each task scoped tightly enough for a fresh-context agent, and include project-specific commands or tests discovered from the repo in `Test Notes`.
+7. Put new task files in `.agent/tasks/todo/`.
+8. Regenerate `.agent/kanban.md` so TODO, IN PROGRESS, and DONE match the filesystem.
 
 Use the helper after writing task files:
 
 ```bash
-python3 /Users/igor/.codex/skills/mailio-kanban/scripts/kanban.py board --repo /Users/igor/workspace/mailio-workspace/go-mailio-server-private
+python3 <skill-dir>/scripts/kanban.py board --repo <repo-root>
 ```
 
 ## start command
@@ -54,7 +55,7 @@ Use this workflow when the user asks to start implementation.
    - A task is startable only when every dependency named in `Dependencies` is already in `done`.
    - Tasks can run in parallel when they are startable and neither task depends on the other.
    - Tasks with dependencies still in `todo` or `in-progress` are sequential or blocked and must not be launched.
-   - Use a default parallel launch limit of `2` unless the user gives a different limit.
+   - Use a default parallel launch limit of `5` unless the user gives a different limit.
 3. If more than one task is recommended in the launch batch, spawn worker agents for those tasks by default. Do not wait for the user to explicitly ask for parallel agents.
 4. If only one task is recommended, start that task locally with the helper `start` command.
 5. For each worker agent, use this prompt shape:
@@ -77,19 +78,19 @@ Use this workflow when the user asks to start implementation.
 Use the helper to plan parallel work without moving files:
 
 ```bash
-python3 /Users/igor/.codex/skills/mailio-kanban/scripts/kanban.py plan --repo /Users/igor/workspace/mailio-workspace/go-mailio-server-private --limit 2
+python3 <skill-dir>/scripts/kanban.py plan --repo <repo-root> --limit 5
 ```
 
 Use the helper to start the next task:
 
 ```bash
-python3 /Users/igor/.codex/skills/mailio-kanban/scripts/kanban.py start --repo /Users/igor/workspace/mailio-workspace/go-mailio-server-private
+python3 <skill-dir>/scripts/kanban.py start --repo <repo-root>
 ```
 
 Use the helper to finish a task after verification:
 
 ```bash
-python3 /Users/igor/.codex/skills/mailio-kanban/scripts/kanban.py done --repo /Users/igor/workspace/mailio-workspace/go-mailio-server-private --task 001-example.md
+python3 <skill-dir>/scripts/kanban.py done --repo <repo-root> --task 001-example.md
 ```
 
 ## Helper Behavior
