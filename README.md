@@ -1,6 +1,4 @@
-Here’s a more sellable README version:
-
-Task Graph Skill
+# Task Graph
 
 Turn implementation plans into dependency-aware task graphs for parallel, context-isolated AI coding agents.
 
@@ -8,6 +6,7 @@ Task Graph is a skill for Codex and Claude Code that helps agents execute large 
 
 Instead of asking one long-running agent to hold the entire plan in context, Task Graph converts an approved implementation plan into small, explicit task files. Each task declares its scope, dependencies, acceptance criteria, and test notes. The helper script then identifies which tasks are unblocked and can safely run in parallel.
 
+```text
 Implementation Plan
        ↓
 Task Decomposition
@@ -17,131 +16,152 @@ Dependency Graph
 Parallel Scheduling
        ↓
 Isolated Agent Execution
+```
 
-Why Use Task Graph?
+## Why Use Task Graph?
 
 Large coding-agent runs tend to fail in predictable ways:
 
-* The agent carries too much stale context.
-* Independent work is executed sequentially.
-* Dependent work starts too early.
-* Parallel agents conflict because ownership is unclear.
-* The original implementation plan turns into informal chat history.
+- The agent carries too much stale context.
+- Independent work is executed sequentially.
+- Dependent work starts too early.
+- Parallel agents conflict because ownership is unclear.
+- The original implementation plan turns into informal chat history.
 
-Task Graph makes the execution boundary explicit.
+Task Graph makes the execution boundary explicit: first write or approve the plan, then decompose it into a graph of executable tasks, then run only the tasks whose dependencies are satisfied. Each agent owns exactly one task and reads only the context it needs.
 
-First, write or approve the plan. Then decompose it into a graph of executable tasks. Then run only the tasks whose dependencies are satisfied, with each agent owning exactly one task and reading only the context it needs.
+## What It Does
 
-What It Does
-
-Task Graph manages project-local agent work inside .agent/.
+Task Graph manages project-local agent work inside `.agent/`.
 
 It helps you:
 
-* Convert an implementation plan into small markdown task files.
-* Declare task dependencies explicitly.
-* Identify which tasks are startable.
-* Schedule independent tasks in parallel.
-* Keep each agent focused on one task.
-* Track progress through todo, in-progress, and done.
-* Regenerate a kanban-style board from the filesystem state.
+- Convert an implementation plan into small markdown task files.
+- Declare task dependencies explicitly.
+- Identify which tasks are startable.
+- Schedule independent tasks in parallel.
+- Keep each agent focused on one task.
+- Track progress through `todo`, `in-progress`, and `done`.
+- Regenerate a kanban-style board from filesystem state.
 
 The workflow is intentionally conservative. A task is only startable when all dependencies are already done. Parallel execution is allowed only when tasks are independently unblocked.
 
-Project Structure
+## Project Structure
 
 Each target project uses this layout:
 
+```text
 .agent/
   kanban.md
   tasks/
     todo/
     in-progress/
     done/
+```
 
 The skill includes a helper script:
 
+```text
 scripts/kanban.py
+```
 
-The helper can:
+The helper can regenerate the board, inspect startable tasks, compute a parallel launch batch, move the next task into progress, and mark verified tasks as done.
 
-* regenerate the board
-* inspect startable tasks
-* compute a parallel launch batch
-* move the next task into progress
-* mark verified tasks as done
-
-Installation
+## Installation
 
 Install for both Codex and Claude Code:
 
+```bash
 ./install.sh
+```
 
 Install only for Codex:
 
+```bash
 ./install.sh --codex-only
+```
 
 Install only for Claude Code:
 
+```bash
 ./install.sh --claude-only
+```
 
 For local development, symlink this repo instead of copying it:
 
+```bash
 ./install.sh --link --force
+```
 
 Default install locations:
 
+```text
 Codex:       ${CODEX_HOME:-$HOME/.codex}/skills/task-graph
 Claude Code: ${CLAUDE_HOME:-$HOME/.claude}/skills/task-graph
+```
 
-Usage
+## Usage
 
-Create tasks from an approved implementation plan:
+Ask Codex to create tasks from an approved implementation plan:
 
-Use $task-graph tasks to create implementation tasks from this plan.
+```text
+$task-graph tasks
+```
 
-Start dependency-safe execution:
+Ask Codex to start dependency-safe execution. The default parallel launch limit is `5`:
 
-Use `$task-graph start` to begin execution with the default parallel launch limit of 5.
+```text
+$task-graph start
+```
 
-Use a different parallel limit:
+Override the parallel launch limit:
 
-Use `$task-graph start --limit 3`.
+```text
+$task-graph start --limit 3
+```
 
-You can also call the helper directly.
+Optionally you can also call the helper directly.
 
-Optionally inspect the task graph (or manually navigate to .agent/kanban.md):
+Inspect the task graph:
 
+```bash
 python3 <skill-dir>/scripts/kanban.py plan --repo <repo-root> --limit 5
+```
 
 Start the next unblocked task:
 
+```bash
 python3 <skill-dir>/scripts/kanban.py start --repo <repo-root>
+```
 
 Mark a verified task as done:
 
+```bash
 python3 <skill-dir>/scripts/kanban.py done --repo <repo-root> --task 001-example.md
+```
 
 Regenerate the board:
 
+```bash
 python3 <skill-dir>/scripts/kanban.py board --repo <repo-root>
+```
 
-Task Contract
+## Task Contract
 
 Each generated task is designed for a fresh-context agent and should include:
 
-* Goal
-* Context
-* Scope
-* Out Of Scope
-* Dependencies
-* Parallel
-* Acceptance Criteria
-* Test Notes
+- `Goal`
+- `Context`
+- `Scope`
+- `Out Of Scope`
+- `Dependencies`
+- `Parallel`
+- `Acceptance Criteria`
+- `Test Notes`
 
-The Dependencies section is the scheduling source of truth. None means the task is unblocked. The Parallel section is human-readable guidance; dependency parsing determines what can actually start.
+The `Dependencies` section is the scheduling source of truth. `None` means the task is unblocked. The `Parallel` section is human-readable guidance; dependency parsing determines what can actually start.
 
-Example Use Case
+## Example Use Case
 
 You have an implementation plan for a backend feature that touches database schema, API handlers, validation, tests, and documentation.
 
@@ -149,27 +169,29 @@ A single agent could attempt the entire plan, but it may mix concerns, start wor
 
 Task Graph decomposes the plan into files like:
 
+```text
 001-add-database-schema.md
 002-add-repository-methods.md
 003-add-api-validation.md
 004-add-handler-tests.md
 005-update-documentation.md
+```
 
-If 003-add-api-validation.md and 005-update-documentation.md do not depend on each other, they can run in parallel. If 004-add-handler-tests.md depends on the API handler work, it waits until that dependency is done.
+If `003-add-api-validation.md` and `005-update-documentation.md` do not depend on each other, they can run in parallel. If `004-add-handler-tests.md` depends on the API handler work, it waits until that dependency is done.
 
-Design Principles
+## Design Principles
 
 Task Graph is built around a few strict rules:
 
-* Plans are approved before execution.
-* Tasks are explicit files, not hidden chat state.
-* Dependencies are declared in markdown and parsed by the helper.
-* Agents own one task at a time.
-* Context is intentionally limited.
-* Work moves to done only after verification.
-* The kanban board is generated from filesystem state.
+- Plans are approved before execution.
+- Tasks are explicit files, not hidden chat state.
+- Dependencies are declared in markdown and parsed by the helper.
+- Agents own one task at a time.
+- Context is intentionally limited.
+- Work moves to done only after verification.
+- The kanban board is generated from filesystem state.
 
-Why This Exists
+## Why This Exists
 
 AI coding agents are getting better at implementation, but large plans still need execution discipline.
 
