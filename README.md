@@ -1,6 +1,6 @@
 # Task Graph
 
-Turn implementation plans into dependency-aware task graphs for parallel, context-isolated AI coding agents.
+> Turn implementation plans into dependency-aware task graphs for parallel, context-isolated AI coding agents.
 
 Task Graph is a skill for Codex and Claude Code that helps agents execute large implementation plans without losing control of scope, context, or task order.
 
