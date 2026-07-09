@@ -40,6 +40,7 @@ It helps you:
 - Declare task dependencies explicitly.
 - Identify which tasks are startable.
 - Schedule independent tasks in parallel.
+- Reserve launch batches and track them in a durable run ledger.
 - Keep each agent focused on one task.
 - Track progress through `todo`, `in-progress`, and `done`.
 - Regenerate a kanban-style board from filesystem state.
@@ -54,6 +55,22 @@ By default, one approved implementation plan lands as one final GitHub PR from t
 
 The main agent owns `.agent` task state during this flow. It moves launched tasks to `in-progress` before creating task worktrees. Subagents should not move files under `.agent/tasks/` or rewrite `.agent/kanban.md`; they commit only their task's code, tests, and documentation changes. After the main agent integrates and verifies a task branch, it moves that task to `done` and regenerates the board.
 
+## Durable Runs
+
+Task Graph stores per-run coordination files under `.agent/runs/<run-id>/`:
+
+```text
+.agent/runs/<run-id>/
+  progress.md
+  briefs/
+  reports/
+  reviews/
+```
+
+The run ledger lets the controller recover after compaction or restart. A task marked complete in `progress.md` is treated as done for launch purposes and is not reserved again.
+
+Subagents use file handoffs rather than long pasted context. The controller writes a task brief, the subagent writes a report, and reviews can use the report plus a focused diff package. Subagents report one of `DONE`, `DONE_WITH_CONCERNS`, `NEEDS_CONTEXT`, or `BLOCKED`; the controller reviews and integrates only after the status is resolved.
+
 ## Project Structure
 
 Each target project uses this layout:
@@ -61,6 +78,7 @@ Each target project uses this layout:
 ```text
 .agent/
   kanban.md
+  runs/
   tasks/
     todo/
     in-progress/
@@ -74,6 +92,8 @@ scripts/kanban.py
 ```
 
 The helper can regenerate the board, inspect startable tasks, compute a parallel launch batch, move the next task into progress, and mark verified tasks as done.
+
+It can also reserve a batch for a run, emit machine-readable planning JSON, and initialize run ledgers for restart-safe execution.
 
 ## Installation
 
@@ -136,6 +156,18 @@ Inspect the task graph:
 python3 <skill-dir>/scripts/kanban.py plan --repo <repo-root> --limit 5
 ```
 
+Inspect the task graph as JSON:
+
+```bash
+python3 <skill-dir>/scripts/kanban.py plan --repo <repo-root> --limit 5 --json
+```
+
+Reserve the next launch batch for a run:
+
+```bash
+python3 <skill-dir>/scripts/kanban.py reserve --repo <repo-root> --limit 5 --run-id <run-id>
+```
+
 Start the next unblocked task:
 
 ```bash
@@ -158,6 +190,7 @@ python3 <skill-dir>/scripts/kanban.py board --repo <repo-root>
 
 Each generated task is designed for a fresh-context agent and should include:
 
+- `Type` (`ship` or `scout`; omitted means `ship`)
 - `Goal`
 - `Context`
 - `Scope`
@@ -168,6 +201,8 @@ Each generated task is designed for a fresh-context agent and should include:
 - `Test Notes`
 
 The `Dependencies` section is the scheduling source of truth. `None` means the task is unblocked. The `Parallel` section is human-readable guidance; dependency parsing determines what can actually start.
+
+`ship` tasks deliver code, tests, or docs that should be integrated into the feature branch. `scout` tasks investigate, reproduce, audit, or plan and deliver a report; they only become code work if you explicitly convert them into ship tasks.
 
 ## Example Use Case
 
@@ -196,8 +231,10 @@ Task Graph is built around a few strict rules:
 - Dependencies are declared in markdown and parsed by the helper.
 - Agents own one task at a time.
 - Subagents work in isolated Git worktrees and task branches.
+- Subagents communicate through task briefs, report files, and status values.
 - The main agent integrates task branches into one feature branch by default.
 - The main agent owns kanban state after integration.
+- The run ledger is the recovery source after context loss.
 - Context is intentionally limited.
 - Work moves to done only after verification.
 - The kanban board is generated from filesystem state.

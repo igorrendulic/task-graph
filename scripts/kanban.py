@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 from dataclasses import dataclass
@@ -19,6 +20,15 @@ class Task:
     path: Path
     title: str
     dependencies: tuple[str, ...]
+    task_type: str
+
+
+@dataclass(frozen=True)
+class Schedule:
+    batch: list[Task]
+    remaining_startable: list[Task]
+    blocked: list[Task]
+    available: set[str]
 
 
 def title_from_file(path: Path) -> str:
@@ -64,6 +74,11 @@ def parse_dependencies(path: Path) -> tuple[str, ...]:
     return tuple(dict.fromkeys(names))
 
 
+def parse_task_type(path: Path) -> str:
+    task_type = section_text(path.read_text(encoding="utf-8"), "Type").strip().lower()
+    return task_type if task_type in {"ship", "scout"} else "ship"
+
+
 def agent_dir(repo: Path) -> Path:
     directory = repo / ".agent"
     if not directory.exists():
@@ -89,6 +104,7 @@ def read_tasks(repo: Path) -> list[Task]:
                     path=path,
                     title=title_from_file(path),
                     dependencies=parse_dependencies(path),
+                    task_type=parse_task_type(path),
                 )
             )
     return tasks
@@ -139,6 +155,30 @@ def active_names(tasks: list[Task]) -> set[str]:
     return names
 
 
+def run_dir(repo: Path, run_id: str) -> Path:
+    return agent_dir(repo) / "runs" / run_id
+
+
+def progress_path(repo: Path, run_id: str) -> Path:
+    return run_dir(repo, run_id) / "progress.md"
+
+
+def completed_names_from_ledger(repo: Path, run_id: str | None) -> set[str]:
+    if not run_id:
+        return set()
+    path = progress_path(repo, run_id)
+    if not path.exists():
+        return set()
+
+    names: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = re.match(r"-\s+(\d{3}-[a-z0-9][a-z0-9-]*\.md):\s+complete\b", line)
+        if match:
+            names.add(match.group(1))
+            names.add(match.group(1)[:3])
+    return names
+
+
 def is_startable(task: Task, completed: set[str]) -> bool:
     return all(dep in completed for dep in task.dependencies)
 
@@ -176,6 +216,92 @@ def launch_batch(startable: list[Task], limit: int) -> list[Task]:
         if all(can_run_in_parallel(task, chosen) for chosen in selected):
             selected.append(task)
     return selected
+
+
+def schedule_tasks(repo: Path, limit: int, run_id: str | None = None) -> Schedule:
+    if limit < 1:
+        raise SystemExit("--limit must be at least 1")
+
+    tasks = read_tasks(repo)
+    ledger_completed = completed_names_from_ledger(repo, run_id)
+    completed = done_names(tasks) | ledger_completed
+    available = active_names(tasks) | ledger_completed
+    todo = sorted((task for task in tasks if task.column == "todo"), key=lambda task: task.path.name)
+    launchable_todo = [
+        task
+        for task in todo
+        if task.path.name not in ledger_completed and task.path.name[:3] not in ledger_completed
+    ]
+    startable = [task for task in launchable_todo if is_startable(task, completed)]
+    batch = launch_batch(startable, limit)
+    batch_names = {task.path.name for task in batch}
+    remaining_startable = [task for task in startable if task.path.name not in batch_names]
+    blocked = [task for task in launchable_todo if task not in startable]
+    return Schedule(batch=batch, remaining_startable=remaining_startable, blocked=blocked, available=available)
+
+
+def task_payload(task: Task, available: set[str]) -> dict[str, object]:
+    return {
+        "file": task.path.name,
+        "title": task.title,
+        "type": task.task_type,
+        "column": task.column,
+        "dependencies": list(task.dependencies),
+        "unresolved_dependencies": list(unresolved_dependencies(task, available)),
+    }
+
+
+def print_schedule(schedule: Schedule, limit: int) -> None:
+    print(f"Recommended launch batch (limit {limit}):")
+    if schedule.batch:
+        for task in schedule.batch:
+            print(f"- {task.path.name}: {task.title}")
+    else:
+        print("- None")
+
+    print("\nAdditional startable parallel candidates:")
+    if schedule.remaining_startable:
+        for task in schedule.remaining_startable:
+            print(f"- {task.path.name}: {task.title}")
+    else:
+        print("- None")
+
+    print("\nSequential or blocked tasks:")
+    if schedule.blocked:
+        for task in schedule.blocked:
+            unresolved = unresolved_dependencies(task, schedule.available)
+            deps = ", ".join(unresolved) if unresolved else "waiting on in-progress dependency"
+            print(f"- {task.path.name}: {task.title} ({deps})")
+    else:
+        print("- None")
+
+
+def print_schedule_json(schedule: Schedule, limit: int) -> None:
+    payload = {
+        "limit": limit,
+        "recommended_launch_batch": [task_payload(task, schedule.available) for task in schedule.batch],
+        "additional_startable_parallel_candidates": [
+            task_payload(task, schedule.available) for task in schedule.remaining_startable
+        ],
+        "sequential_or_blocked_tasks": [task_payload(task, schedule.available) for task in schedule.blocked],
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def ensure_run_dirs(repo: Path, run_id: str) -> Path:
+    directory = run_dir(repo, run_id)
+    for name in ("briefs", "reports", "reviews"):
+        (directory / name).mkdir(parents=True, exist_ok=True)
+    path = directory / "progress.md"
+    if not path.exists():
+        path.write_text(f"# Task Graph Run {run_id}\n\n", encoding="utf-8")
+    return directory
+
+
+def append_progress(repo: Path, run_id: str, task: Task, status: str) -> None:
+    path = progress_path(repo, run_id)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"- {task.path.name}: {status} (type {task.task_type})\n")
 
 
 def move_task(repo: Path, source_column: str, dest_column: str, task_name: str | None = None) -> Path:
@@ -219,41 +345,23 @@ def command_start(repo: Path) -> None:
 
 
 def command_plan(repo: Path, limit: int) -> None:
-    if limit < 1:
-        raise SystemExit("--limit must be at least 1")
+    schedule = schedule_tasks(repo, limit)
+    print_schedule(schedule, limit)
 
-    tasks = read_tasks(repo)
-    completed = done_names(tasks)
-    available = active_names(tasks)
-    todo = sorted((task for task in tasks if task.column == "todo"), key=lambda task: task.path.name)
-    startable = [task for task in todo if is_startable(task, completed)]
-    batch = launch_batch(startable, limit)
-    batch_names = {task.path.name for task in batch}
-    remaining_startable = [task for task in startable if task.path.name not in batch_names]
-    blocked = [task for task in todo if task not in startable]
 
-    print(f"Recommended launch batch (limit {limit}):")
-    if batch:
-        for task in batch:
-            print(f"- {task.path.name}: {task.title}")
-    else:
+def command_reserve(repo: Path, limit: int, run_id: str) -> None:
+    ensure_run_dirs(repo, run_id)
+    schedule = schedule_tasks(repo, limit, run_id)
+
+    print(f"Reserved launch batch (limit {limit}):")
+    if not schedule.batch:
         print("- None")
+        return
 
-    print("\nAdditional startable parallel candidates:")
-    if remaining_startable:
-        for task in remaining_startable:
-            print(f"- {task.path.name}: {task.title}")
-    else:
-        print("- None")
-
-    print("\nSequential or blocked tasks:")
-    if blocked:
-        for task in blocked:
-            unresolved = unresolved_dependencies(task, available)
-            deps = ", ".join(unresolved) if unresolved else "waiting on in-progress dependency"
-            print(f"- {task.path.name}: {task.title} ({deps})")
-    else:
-        print("- None")
+    for task in schedule.batch:
+        moved = move_task(repo, "todo", "in-progress", task.path.name)
+        append_progress(repo, run_id, task, "in-progress")
+        print(f"- {task.path.name}: {task.title} -> {moved}")
 
 
 def command_done(repo: Path, task_name: str) -> None:
@@ -263,17 +371,27 @@ def command_done(repo: Path, task_name: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("board", "plan", "start", "done"))
+    parser.add_argument("command", choices=("board", "plan", "reserve", "start", "done"))
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--task", help="Task filename for the done command")
     parser.add_argument("--limit", type=int, default=5, help="Maximum recommended parallel launch count")
+    parser.add_argument("--run-id", help="Run identifier for run ledger commands")
+    parser.add_argument("--json", action="store_true", help="Print machine-readable JSON where supported")
     args = parser.parse_args()
 
     repo = args.repo.resolve()
     if args.command == "board":
         print(f"Board: {rewrite_board(repo)}")
     elif args.command == "plan":
-        command_plan(repo, args.limit)
+        schedule = schedule_tasks(repo, args.limit)
+        if args.json:
+            print_schedule_json(schedule, args.limit)
+        else:
+            print_schedule(schedule, args.limit)
+    elif args.command == "reserve":
+        if not args.run_id:
+            raise SystemExit("reserve requires --run-id <id>")
+        command_reserve(repo, args.limit, args.run_id)
     elif args.command == "start":
         command_start(repo)
     elif args.command == "done":
