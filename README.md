@@ -46,6 +46,14 @@ It helps you:
 
 The workflow is intentionally conservative. A task is only startable when all dependencies are already done. Parallel execution is allowed only when tasks are independently unblocked.
 
+## Worktree Isolation
+
+When Task Graph launches subagents, each subagent should work in its own Git worktree on its own task branch. The main agent keeps one integration branch for the full implementation plan, then merges or cherry-picks completed task branches back into that integration branch.
+
+By default, one approved implementation plan lands as one final GitHub PR from the integration branch. Task branches are temporary, reviewable artifacts for isolated agent work; they do not each become a GitHub PR unless you explicitly ask for that or the tasks are independently shippable.
+
+The main agent owns `.agent` task state during this flow. It moves launched tasks to `in-progress` before creating task worktrees. Subagents should not move files under `.agent/tasks/` or rewrite `.agent/kanban.md`; they commit only their task's code, tests, and documentation changes. After the main agent integrates and verifies a task branch, it moves that task to `done` and regenerates the board.
+
 ## Project Structure
 
 Each target project uses this layout:
@@ -187,6 +195,9 @@ Task Graph is built around a few strict rules:
 - Tasks are explicit files, not hidden chat state.
 - Dependencies are declared in markdown and parsed by the helper.
 - Agents own one task at a time.
+- Subagents work in isolated Git worktrees and task branches.
+- The main agent integrates task branches into one feature branch by default.
+- The main agent owns kanban state after integration.
 - Context is intentionally limited.
 - Work moves to done only after verification.
 - The kanban board is generated from filesystem state.

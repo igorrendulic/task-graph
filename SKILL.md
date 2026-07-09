@@ -56,24 +56,39 @@ Use this workflow when the user asks to start implementation.
    - Tasks can run in parallel when they are startable and neither task depends on the other.
    - Tasks with dependencies still in `todo` or `in-progress` are sequential or blocked and must not be launched.
    - Use a default parallel launch limit of `5` unless the user gives a different limit.
-3. If more than one task is recommended in the launch batch, spawn worker agents for those tasks by default. Do not wait for the user to explicitly ask for parallel agents.
-4. If only one task is recommended, start that task locally with the helper `start` command.
-5. For each worker agent, use this prompt shape:
-   - You are not alone in the codebase; other agents may be editing related files in parallel. Do not revert edits you did not make, and adjust your implementation to accommodate concurrent changes.
+3. Establish an integration branch for the overall implementation plan before launching work:
+   - Use the current branch when it is already the intended feature branch.
+   - Otherwise create or switch to a feature branch for the plan, for example `task-graph/<plan-slug>`.
+   - The integration branch is the only branch that should become the final GitHub PR by default.
+4. Move each task in the launch batch from `.agent/tasks/todo/` to `.agent/tasks/in-progress/` on the integration branch, then regenerate `.agent/kanban.md`.
+5. If more than one task is recommended in the launch batch, spawn worker agents for those tasks by default. Do not wait for the user to explicitly ask for parallel agents.
+6. For every spawned worker agent, create a dedicated Git worktree and task branch from the integration branch:
+   - Use a branch name that includes the task prefix and slug, for example `task-graph/<plan-slug>/001-add-schema`.
+   - Use a unique worktree path outside the main checkout or in a repo-ignored worktree directory.
+   - Never launch two worker agents in the same checkout.
+7. For each worker agent, use this prompt shape:
+   - You are working in a dedicated Git worktree on a dedicated task branch. Do not switch branches or edit another agent's worktree.
    - Own exactly one task file: `<task-file>`.
-   - Move only that task from `.agent/tasks/todo/` to `.agent/tasks/in-progress/`, then regenerate `.agent/kanban.md`.
+   - Do not move `.agent/tasks/...` files and do not regenerate `.agent/kanban.md`; the main agent owns kanban state after integration.
    - Read only that task file, this skill, done task artifacts if needed, and the minimum code required for the task.
    - Implement only the task's `Scope`; respect `Out Of Scope`.
    - Run the narrowest useful tests first, then broader tests when appropriate.
-   - Move only that task from `.agent/tasks/in-progress/` to `.agent/tasks/done/` after implementation and verification, then regenerate `.agent/kanban.md`.
-   - In the final response, list changed files, test commands, and any known conflicts or follow-up needed.
-6. Before implementing locally, clear working context in practice:
+   - Commit the task's code, tests, and documentation changes on the task branch.
+   - In the final response, list the task branch, worktree path, commit SHA, changed files, test commands, and any known conflicts or follow-up needed.
+8. If only one task is recommended, prefer the same worktree and task-branch flow unless the user explicitly asks for local in-checkout execution.
+9. Before implementing a task locally, clear working context in practice:
    - Read only the selected task file, this skill, and the minimum code needed for that task.
    - Do not carry assumptions from previously completed tasks unless they are present in code, the selected task, or done task artifacts.
-7. Implement only the selected task's `Scope`.
-8. Run the narrowest useful tests first, then broader tests when appropriate.
-9. Move the task file from `in-progress` to `done` only after implementation and verification are complete.
-10. Regenerate `.agent/kanban.md`.
+10. Implement only the selected task's `Scope`.
+11. Run the narrowest useful tests first, then broader tests when appropriate.
+12. Integrate completed task branches back into the integration branch:
+   - Merge or cherry-pick completed task branch commits in dependency order.
+   - Resolve conflicts on the integration branch, not inside unrelated task worktrees.
+   - Run the relevant verification after integrating each task branch, or after the batch when tasks are genuinely independent.
+13. Move task files through `.agent/tasks/...` only from the integration branch:
+   - Move the task to `done` only after its task branch is integrated and verification passes.
+   - Regenerate `.agent/kanban.md` after task-state changes.
+14. Create one final GitHub PR from the integration branch by default. Create separate PRs per task branch only when the user explicitly asks or the tasks are independently shippable.
 
 Use the helper to plan parallel work without moving files:
 
