@@ -97,6 +97,12 @@ It can also reserve a batch for a run, emit machine-readable planning JSON, and 
 
 ## Installation
 
+Install without cloning the repo:
+
+```bash
+npx task-graph-skill@latest install
+```
+
 Install for both Codex and Claude Code:
 
 ```bash
@@ -106,12 +112,16 @@ Install for both Codex and Claude Code:
 Install only for Codex:
 
 ```bash
+npx task-graph-skill@latest install --codex-only
+# or, from a local clone:
 ./install.sh --codex-only
 ```
 
 Install only for Claude Code:
 
 ```bash
+npx task-graph-skill@latest install --claude-only
+# or, from a local clone:
 ./install.sh --claude-only
 ```
 
