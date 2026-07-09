@@ -65,7 +65,7 @@ Use this workflow when the user asks to start implementation.
 4. Establish an integration branch for the overall implementation plan before launching work:
    - Use the current branch when it is already the intended feature branch.
    - Otherwise create or switch to a feature branch for the plan, for example `task-graph/<plan-slug>`.
-   - The integration branch is the only branch that should become the final GitHub PR by default.
+   - The integration branch is the only branch that should be offered for a final GitHub PR.
 5. Reserve the launch batch on the integration branch:
    - Run `reserve --run-id <run-id> --limit <n>` to move startable tasks to `in-progress`, regenerate `.agent/kanban.md`, and initialize `.agent/runs/<run-id>/`.
    - Keep task briefs in `.agent/runs/<run-id>/briefs/`, subagent reports in `.agent/runs/<run-id>/reports/`, and review notes or diff packages in `.agent/runs/<run-id>/reviews/`.
@@ -114,8 +114,9 @@ Use this workflow when the user asks to start implementation.
    - Move the task to `done` only after its task branch is integrated and verification passes.
    - Regenerate `.agent/kanban.md` after task-state changes.
    - Append a `complete` entry to `.agent/runs/<run-id>/progress.md` with the relevant commits and review result.
-18. After all ship tasks are integrated, run a final whole-branch review before creating the final PR.
-19. Create one final GitHub PR from the integration branch by default. Create separate PRs per task branch only when the user explicitly asks or the tasks are independently shippable.
+18. After all ship tasks are integrated, run a final whole-branch review and the relevant verification.
+19. Stop before creating any GitHub PR. Report the integration branch, commits, verification results, and review notes, then ask the user whether they want a PR created.
+20. Create a GitHub PR only after the user explicitly confirms. Create separate PRs per task branch only when the user explicitly asks or the tasks are independently shippable.
 
 Use the helper to plan parallel work without moving files:
 

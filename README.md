@@ -51,7 +51,7 @@ The workflow is intentionally conservative. A task is only startable when all de
 
 When Task Graph launches subagents, each subagent should work in its own Git worktree on its own task branch. The main agent keeps one integration branch for the full implementation plan, then merges or cherry-picks completed task branches back into that integration branch.
 
-By default, one approved implementation plan lands as one final GitHub PR from the integration branch. Task branches are temporary, reviewable artifacts for isolated agent work; they do not each become a GitHub PR unless you explicitly ask for that or the tasks are independently shippable.
+By default, one approved implementation plan integrates into one feature branch. After final review and verification, Task Graph should report the branch, commits, verification results, and review notes, then ask whether you want a GitHub PR created. It should not create a PR unless you explicitly confirm. Task branches are temporary, reviewable artifacts for isolated agent work; they do not each become a GitHub PR unless you explicitly ask for that or the tasks are independently shippable.
 
 The main agent owns `.agent` task state during this flow. It moves launched tasks to `in-progress` before creating task worktrees. Subagents should not move files under `.agent/tasks/` or rewrite `.agent/kanban.md`; they commit only their task's code, tests, and documentation changes. After the main agent integrates and verifies a task branch, it moves that task to `done` and regenerates the board.
 
