@@ -71,6 +71,14 @@ The run ledger lets the controller recover after compaction or restart. A task m
 
 Subagents use file handoffs rather than long pasted context. The controller writes a task brief, the subagent writes a report, and reviews can use the report plus a focused diff package. Subagents report one of `DONE`, `DONE_WITH_CONCERNS`, `NEEDS_CONTEXT`, or `BLOCKED`; the controller reviews and integrates only after the status is resolved.
 
+## Improvement Loop Checkpoints
+
+Some runs need an implementation task followed by an audit task to prove the desired outcome was reached. After each failed audit that reports `DONE_WITH_CONCERNS` because the outcome is still below the acceptance bar, Task Graph should pause before launching more work.
+
+The controller should read the audit report, summarize the target outcome, measured result, remaining gap, listed concerns, and prior loop attempts in the same run. It should then ask whether to stop with the current unresolved result or continue into another focused improvement-and-audit loop.
+
+This checkpoint happens after the first failed audit and every later failed audit. Passing audits continue through the normal review, integration, and verification flow.
+
 ## Project Structure
 
 Each target project uses this layout:

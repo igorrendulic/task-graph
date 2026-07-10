@@ -96,7 +96,7 @@ Use this workflow when the user asks to start implementation.
    - `BLOCKED`: the task cannot be completed as scoped.
 10. Handle subagent statuses before integration:
    - For `DONE`, create a task diff/review package and run a task-scoped review for spec compliance and code quality.
-   - For `DONE_WITH_CONCERNS`, read the concerns and decide whether to review, dispatch a fix, or escalate before integration.
+   - For `DONE_WITH_CONCERNS`, read the concerns and resolve them before integration. If the concerns are implementation-local, decide whether to review, dispatch a focused fix, or escalate. If the concerns come from a failed audit or verification report showing the desired outcome was not reached, follow the outcome improvement checkpoint before creating more work.
    - For `NEEDS_CONTEXT`, provide the missing context and re-dispatch the same task.
    - For `BLOCKED`, either provide context, use a more capable agent, split the task, or escalate to the user.
 11. If a task's `Type` is `scout`, capture its report in the run directory and mark it done after review; do not integrate code unless the user explicitly converts it into ship work.
@@ -117,6 +117,25 @@ Use this workflow when the user asks to start implementation.
 18. After all ship tasks are integrated, run a final whole-branch review and the relevant verification.
 19. Stop before creating any GitHub PR. Report the integration branch, commits, verification results, and review notes, then ask the user whether they want a PR created.
 20. Create a GitHub PR only after the user explicitly confirms. Create separate PRs per task branch only when the user explicitly asks or the tasks are independently shippable.
+
+### Outcome improvement checkpoints
+
+Use this checkpoint when a failed audit or verification report returns `DONE_WITH_CONCERNS` because the target outcome is still not met. An improvement loop is a focused implementation attempt followed by an audit or verification task for the same outcome.
+
+Do not create, reserve, dispatch, or run another improvement loop until the user chooses what to do next. First read the audit report and present a concise checkpoint with:
+
+- the report path and status;
+- the target outcome or acceptance criterion;
+- the measured result and remaining gap;
+- the concerns or failed criteria listed in the report;
+- the improvement loops already attempted in this run, when visible from `.agent/runs/<run-id>/reports/` or `progress.md`.
+
+Ask the user to choose between:
+
+- `Stop`: stop chasing the outcome for now, report the current unresolved state, and leave remaining work unresolved.
+- `Continue`: create or run the next focused improvement-and-audit loop aimed only at the remaining gap.
+
+Apply this checkpoint after each failed audit, including the first failed audit. Do not wait for repeated failures. If an audit returns `DONE` and the target outcome is met, continue the normal review, integration, and verification flow without asking for another loop.
 
 Use the helper to plan parallel work without moving files:
 
