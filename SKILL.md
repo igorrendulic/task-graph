@@ -72,7 +72,8 @@ Use this workflow when the user asks to start implementation.
    - Otherwise create or switch to a feature branch for the plan, for example `task-graph/<plan-slug>`.
    - The integration branch is the only branch that should be offered for a final GitHub PR.
 6. Reserve the launch batch on the integration branch:
-   - Run `reserve --plan <plan-slug> --run-id <run-id> --limit <n>` to move startable tasks to `in-progress`, regenerate `.agent/<plan-slug>/kanban.md`, and initialize `.agent/<plan-slug>/runs/<run-id>/`.
+   - Require one delivery mode for the run: `no-mistakes`, `direct-pr`, or `local-only`. Record it with `reserve --plan <plan-slug> --run-id <run-id> --limit <n> --delivery-mode <mode>` before moving tasks to `in-progress`.
+   - Add `--yolo` only when the operator explicitly authorizes green routine delivery for this run. +yolo never permits a red merge, a security-sensitive or irreversible action, or an explicit discard.
    - Keep task briefs in `.agent/<plan-slug>/runs/<run-id>/briefs/`, subagent reports in `.agent/<plan-slug>/runs/<run-id>/reports/`, review notes in `.agent/<plan-slug>/runs/<run-id>/reviews/`, and portable diff packages in `.agent/<plan-slug>/runs/<run-id>/diffs/`.
 7. For every `Managed workers` or **Unattended `codex exec`** task, create a dedicated Git worktree and task branch from the integration branch:
    - Detect whether the controller is already in a linked worktree before creating more worktrees.
@@ -82,6 +83,7 @@ Use this workflow when the user asks to start implementation.
    - Never launch two worker agents in the same checkout.
    - Record the task branch, worktree path, base commit, and eventual head commit in the run ledger.
    - Never remove a worktree that contains unintegrated, unpushed, or otherwise unlanded work unless the user explicitly confirms discard.
+   - Before `launch-exec`, verify that the selected worktree is a registered Git worktree root on the task branch and must not be the controller checkout.
 8. For `Managed workers`, if more than one task is recommended in the launch batch, spawn worker agents for those tasks by default. Do not wait for the user to explicitly ask for parallel agents. Use this prompt shape for each worker:
    - You are working in a dedicated Git worktree on a dedicated task branch. Do not switch branches or edit another agent's worktree.
    - Own exactly one task file: `<task-file>`.
@@ -94,35 +96,41 @@ Use this workflow when the user asks to start implementation.
    - Write the full report to `.agent/<plan-slug>/runs/<run-id>/reports/<task-file>`.
    - Reply with only status, task branch, worktree path, commit SHA, one-line test summary, concerns, and report path.
 9. For **Unattended `codex exec`**, tmux is required. After writing the task brief, use `launch-exec` for each reserved task in its dedicated worktree; it writes a durable runtime record before execution, captures output in a task-specific log, and preserves the exited pane for diagnosis. It runs `codex exec` with the normal workspace-write sandbox and the installed CLI's execution policy; never automatically use `--dangerously-bypass-approvals-and-sandbox`. The launcher persists the worker's final response to the controller-owned report path with `--output-last-message`; require that response to include one of the task status values below, a summary, tests, concerns, and a suggested commit message. The worker must edit and test only in its task worktree, and must not write run artifacts or commit. After a `DONE`, the controller inspects the worktree diff, runs the required verification, creates the task-branch commit, and records its SHA before archiving or reviewing the task. The runtime record contains the tmux session, pane PID (the process identifier), command, worktree, branch, brief/report/log paths, start/finish timestamps, and exit result. On resume, inspect the runtime record, report, and log before retrying; do not relaunch a completed task. Local `codex exec` still requires an awake machine or remote host.
-10. For `Cloud delegation`, launch only when the selected Codex surface and workspace policy support it. Record the cloud task identifier, task branch/worktree or remote checkout reference, and result/report location in the run ledger. Do not fall back from cloud delegation to local execution without asking the operator.
-11. Every worker, exec process, or cloud task must report one of these statuses:
+10. Monitor each unattended local worker with low intrusion:
+   - Run one standalone `python3 <skill-dir>/scripts/kanban.py status --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task <task-file> --json` probe immediately after launch. This is a standalone `status --json` check.
+   - Before every later probe, use the platform-native wait mechanism for 60 seconds. Do not schedule automatic checks more often than once per minute.
+   - Stop automatic polling as soon as the status is `SUCCEEDED_AWAITING_REVIEW`, `NEEDS_ATTENTION`, `STALE`, or `UNKNOWN`.
+   - The controller must never use shell `sleep`, compound commands, or `status --watch` for controller monitoring. Each automatic status probe must remain a standalone read-only command.
+11. For `Cloud delegation`, launch only when the selected Codex surface and workspace policy support it. Record the cloud task identifier, task branch/worktree or remote checkout reference, and result/report location in the run ledger. Do not fall back from cloud delegation to local execution without asking the operator.
+12. Every worker, exec process, or cloud task must report one of these statuses:
    - `DONE`: implementation is complete and ready for review.
    - `DONE_WITH_CONCERNS`: implementation is complete, but the report lists correctness, scope, or maintainability concerns.
    - `NEEDS_CONTEXT`: the subagent needs specific missing information before continuing.
    - `BLOCKED`: the task cannot be completed as scoped.
-12. Handle every result from the entire currently unblocked batch before launching its dependents:
+13. Handle every result from the entire currently unblocked batch before launching its dependents:
    - For each `DONE`, ensure the task branch has a verified task commit. For unattended workers, the controller creates this commit from the dedicated worktree before continuing. Run `archive-diff` with the recorded task base and head commits, then run a task-scoped review for spec compliance and code quality. Link the patch and summary paths from the review note and final ledger entry.
    - For `DONE_WITH_CONCERNS`, read the concerns and resolve them before integration. If the concerns are implementation-local, decide whether to review, dispatch a focused fix, or escalate. If the concerns come from a failed audit or verification report showing the desired outcome was not reached, follow the outcome improvement checkpoint before creating more work.
    - For `NEEDS_CONTEXT`, provide the missing context and re-dispatch the same task.
-   - For `BLOCKED`, either provide context, use a more capable agent, split the task, or escalate to the user.
-13. If a task's `Type` is `scout`, capture its report in the run directory and mark it done after review; do not integrate code unless the user explicitly converts it into ship work.
-14. If only one task is recommended, prefer the same worktree and task-branch flow unless the user explicitly asks for local in-checkout execution.
-15. Before implementing a task locally, clear working context in practice:
+    - For `BLOCKED`, either provide context, use a more capable agent, split the task, or escalate to the user.
+    - After a successful report, approved review, and test evidence, run `delivery-ready` to select the permitted controller action. `no-mistakes` requires its full pipeline, `direct-pr` opens a PR, and `local-only` fast-forwards only a clean integration branch. With +yolo, the controller may merge a green PR or fast-forward locally; otherwise it asks for approval.
+14. If a task's `Type` is `scout`, capture its report in the run directory and mark it done after review; do not integrate code unless the user explicitly converts it into ship work.
+15. If only one task is recommended, prefer the same worktree and task-branch flow unless the user explicitly asks for local in-checkout execution.
+16. Before implementing a task locally, clear working context in practice:
    - Read only the selected task file, this skill, and the minimum code needed for that task.
    - Do not carry assumptions from previously completed tasks unless they are present in code, the selected task, or done task artifacts.
-16. Implement only the selected task's `Scope`.
-17. Run the narrowest useful tests first, then broader tests when appropriate.
-18. Integrate completed and reviewed task branches back into the integration branch as one batch:
+17. Implement only the selected task's `Scope`.
+18. Run the narrowest useful tests first, then broader tests when appropriate.
+19. Integrate completed and reviewed task branches back into the integration branch as one batch:
    - Merge or cherry-pick completed task branch commits in dependency order.
    - Resolve conflicts on the integration branch, not inside unrelated task worktrees.
    - Run the relevant verification once after the batch when its tasks are genuinely independent; only then mark each integrated task done and immediately calculate and reserve the next unblocked batch.
-19. Move task files through `.agent/<plan-slug>/...` only from the integration branch:
+20. Move task files through `.agent/<plan-slug>/...` only from the integration branch:
    - Move the task to `done` only after its task branch is integrated and verification passes.
    - Regenerate `.agent/<plan-slug>/kanban.md` after task-state changes.
    - Append a `complete` entry to `.agent/<plan-slug>/runs/<run-id>/progress.md` with the relevant commits and review result.
-20. After all ship tasks are integrated, run a final whole-branch review and the relevant verification.
-21. Stop before creating any GitHub PR. Report the integration branch, commits, verification results, and review notes, then ask the user whether they want a PR created.
-22. Create a GitHub PR only after the user explicitly confirms. Create separate PRs per task branch only when the user explicitly asks or the tasks are independently shippable.
+21. After all ship tasks are integrated, run a final whole-branch review and the relevant verification.
+22. Stop before creating any GitHub PR. Report the integration branch, commits, verification results, and review notes, then ask the user whether they want a PR created.
+23. Create a GitHub PR only after the user explicitly confirms. Create separate PRs per task branch only when the user explicitly asks or the tasks are independently shippable.
 
 ### Outcome improvement checkpoints
 
@@ -158,7 +166,7 @@ python3 <skill-dir>/scripts/kanban.py plan --repo <repo-root> --plan <plan-slug>
 Reserve a launch batch and initialize the run ledger:
 
 ```bash
-python3 <skill-dir>/scripts/kanban.py reserve --repo <repo-root> --plan <plan-slug> --limit 5 --run-id <run-id>
+python3 <skill-dir>/scripts/kanban.py reserve --repo <repo-root> --plan <plan-slug> --limit 5 --run-id <run-id> --delivery-mode direct-pr
 ```
 
 Use the helper to start the next task:
@@ -202,6 +210,7 @@ The helper is intentionally conservative:
 - `plan --plan <plan-slug> --limit <n>` prints the recommended parallel launch batch, additional startable tasks, and sequential or blocked tasks without moving files.
 - `plan --json --limit <n>` prints the same scheduling decision as structured JSON.
 - `reserve --plan <plan-slug> --limit <n> --run-id <id>` moves the recommended launch batch to `in-progress`, rewrites the board, and initializes `.agent/<plan-slug>/runs/<id>/progress.md`.
+- `delivery-ready --plan <plan-slug> --run-id <id> --task <file>` refuses incomplete evidence and otherwise reports the policy-authorized controller delivery action.
 - `start --plan <plan-slug>` selects the first startable todo task by filename, moves it to `in-progress`, rewrites the board, and prints the task path plus possible parallel candidates.
 - `done --plan <plan-slug> --task <file>` moves a matching in-progress task to `done` and rewrites the board.
 - `archive-diff --plan <plan-slug> --run-id <id> --task <file> --base <commit> --head <commit> --branch <branch> --review <relative-path>` validates an in-progress task and commit revisions, then writes a binary-capable patch and metadata summary to `.agent/<plan-slug>/runs/<id>/diffs/` without changing task state.

@@ -82,6 +82,20 @@ Every `$task-graph start` requires an explicit execution-mode selection before T
 
 `codex exec` is not laptop-independent: a local process still needs an awake machine or remote host. Cloud delegation is the mode for work that must continue after the local machine is unavailable.
 
+## Guarded delivery policy
+
+Every run records one delivery mode when it is reserved: `no-mistakes` for the full project validation pipeline and PR delivery, `direct-pr` for verified PR delivery without that pipeline, or `local-only` for a clean local fast-forward. Add `+yolo` only when you want the controller to complete the routine green merge or fast-forward for that run. +yolo never permits a red merge, a security-sensitive or irreversible action, or an explicit discard.
+
+Before an unattended worker launches, Task Graph verifies that its directory is a registered Git worktree root on the task branch and must not be the controller checkout. Its runtime record preserves that worktree identity and base commit. Status is conservative: a recognized harness process is running, an idle shell is idle or dead, and an unrecognized process is `UNKNOWN` and must be inspected rather than relaunched automatically.
+
+After a successful worker report, approved review, and tests, `delivery-ready` states the permitted controller action. `no-mistakes` runs the validation pipeline, `direct-pr` opens a PR, and `local-only` fast-forwards only a clean integration branch. Worktrees with uncommitted or unlanded work are never removed without an explicit discard confirmation.
+
+## Low-intrusion local-worker monitoring
+
+After launching an unattended local worker, the controller runs one standalone `kanban.py status ... --json` probe immediately after launch. This standalone `status --json` probe is followed by a platform-native wait of 60 seconds before every later probe, so automatic checks occur at most once per minute. Automatic polling stops when the worker status is terminal: `SUCCEEDED_AWAITING_REVIEW`, `NEEDS_ATTENTION`, `STALE`, or `UNKNOWN`.
+
+Controller monitoring must never use shell `sleep`, compound commands, or `status --watch`; each probe is a standalone read-only status command. Approval is needed only for the standalone status-command prefix, never for an artificial delay command. This cadence applies to automatic controller monitoring only: users can still run the read-only dashboard examples below whenever they request them. In short: never use shell `sleep` for automatic monitoring.
+
 ## Faster DAG Batches
 
 Task Graph launches the entire currently unblocked batch, up to the selected limit. It collects, reviews, integrates, and verifies that independent batch before calculating the next one, so dependents start immediately after their prerequisites are proven. During task creation, tightly coupled linear work should be coalesced into one bounded task; use separate task files only for real parallelism or independently reviewable milestones.

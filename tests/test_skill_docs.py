@@ -73,6 +73,59 @@ class SkillDocsTest(unittest.TestCase):
             self.assertIn("--json", document)
             self.assertIn("tmux attach -t", document)
 
+    def test_docs_define_low_intrusion_local_worker_monitoring(self) -> None:
+        skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        for document in (skill, readme):
+            self.assertIn("immediately after launch", document)
+            self.assertIn("platform-native wait", document)
+            self.assertIn("60 seconds", document)
+            self.assertIn("standalone", document)
+            self.assertIn("status --json", document)
+            self.assertIn("never use shell `sleep`", document)
+            self.assertIn("compound commands", document)
+            self.assertIn("status --watch", document)
+
+        self.assertIn("SUCCEEDED_AWAITING_REVIEW", skill)
+        self.assertIn("NEEDS_ATTENTION", skill)
+        self.assertIn("STALE", skill)
+        self.assertIn("UNKNOWN", skill)
+
+        for terminal_status in (
+            "SUCCEEDED_AWAITING_REVIEW",
+            "NEEDS_ATTENTION",
+            "STALE",
+            "UNKNOWN",
+        ):
+            self.assertIn(terminal_status, readme)
+
+        self.assertIn("Approval is needed only for the standalone status-command prefix", readme)
+        self.assertIn("never for an artificial delay command", readme)
+        self.assertLess(
+            readme.index("immediately after launch"),
+            readme.index("platform-native wait of 60 seconds"),
+        )
+        self.assertLess(
+            readme.index("platform-native wait of 60 seconds"),
+            readme.index("before every later probe"),
+        )
+
+    def test_docs_define_guarded_delivery_policy(self) -> None:
+        skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        for document in (skill, readme):
+            self.assertIn("no-mistakes", document)
+            self.assertIn("direct-pr", document)
+            self.assertIn("local-only", document)
+            self.assertIn("+yolo", document)
+            self.assertIn("explicit discard", document)
+
+        self.assertIn("must not be the controller checkout", skill)
+        self.assertIn("delivery-ready", skill)
+        self.assertIn("UNKNOWN", skill)
+
 
 if __name__ == "__main__":
     unittest.main()

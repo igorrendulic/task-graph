@@ -665,6 +665,69 @@ def final_report_status(report: Path | None) -> str | None:
     return match.group(1) if match else None
 
 
+def read_run_policy(repo: Path, plan: str, run_id: str) -> dict[str, object]:
+    path = policy_path(repo, plan, run_id)
+    try:
+        policy = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit(f"Missing run policy: {path}") from None
+    if not isinstance(policy, dict) or not isinstance(policy.get("yolo"), bool):
+        raise SystemExit(f"Invalid run policy: {path}")
+    return validate_run_policy(policy.get("mode"), policy["yolo"])
+
+
+def command_delivery_ready(repo: Path, plan: str, run_id: str, task_name: str) -> str:
+    policy = read_run_policy(repo, plan, run_id)
+    run = run_dir(repo, plan, run_id)
+    try:
+        record = json.loads(runtime_path(repo, plan, run_id, task_name).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit("delivery requires verified review and tests") from None
+    report = resolve_artifact(run, record.get("report")) if isinstance(record, dict) else None
+    review = run / "reviews" / task_name
+    if (
+        not is_valid_runtime_record(record)
+        or record.get("exit_code") != 0
+        or final_report_status(report) != "DONE"
+        or not review.exists()
+        or "Review status: approved" not in review.read_text(encoding="utf-8")
+    ):
+        raise SystemExit("delivery requires verified review and tests")
+    mode = policy["mode"]
+    yolo = policy["yolo"]
+    if mode == "no-mistakes":
+        return "RUN_NO_MISTAKES"
+    if mode == "direct-pr":
+        return "MERGE_GREEN_PR" if yolo else "OPEN_PR"
+    return "FAST_FORWARD_LOCAL" if yolo else "AWAIT_LOCAL_APPROVAL"
+
+
+def delivery_path(repo: Path, plan: str, run_id: str, task_name: str) -> Path:
+    return run_dir(repo, plan, run_id) / "delivery" / f"{Path(task_name).stem}.json"
+
+
+def command_teardown(repo: Path, plan: str, run_id: str, task_name: str, discard: bool) -> None:
+    try:
+        record = json.loads(runtime_path(repo, plan, run_id, task_name).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit("teardown requires a runtime record") from None
+    if not is_valid_runtime_record(record):
+        raise SystemExit("teardown requires a valid runtime record")
+    delivery = delivery_path(repo, plan, run_id, task_name)
+    landed = delivery.exists() and json.loads(delivery.read_text(encoding="utf-8")).get("result") == "landed"
+    if not landed and not discard:
+        raise SystemExit("teardown refuses dirty or unlanded work without explicit discard")
+    worktree = Path(str(record["worktree"]))
+    dirty = bool(git_output(worktree, "status", "--porcelain").strip())
+    if dirty and not discard:
+        raise SystemExit("teardown refuses dirty or unlanded work without explicit discard")
+    if discard:
+        write_atomic(delivery, json.dumps({"result": "discarded", "at": utc_now()}) + "\n")
+    result = subprocess.run(["git", "worktree", "remove", str(worktree)], cwd=repo, text=True, capture_output=True)
+    if result.returncode:
+        raise SystemExit(result.stderr.strip() or "git worktree remove failed")
+
+
 def status_entry(
     *, plan: str, run_id: str, task_name: str, run: Path, record: dict[str, object] | None,
     tmux_alive: callable, stale_after: timedelta, now: datetime,
@@ -834,7 +897,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("archive-diff", "board", "plan", "reserve", "start", "done", "launch-exec", "finish-runtime", "status"),
+        choices=("archive-diff", "board", "plan", "reserve", "start", "done", "launch-exec", "finish-runtime", "delivery-ready", "teardown", "status"),
     )
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--plan", help="Lowercase kebab-case plan slug")
@@ -847,6 +910,7 @@ def main() -> None:
     parser.add_argument("--run-id", help="Run identifier for run ledger commands")
     parser.add_argument("--delivery-mode", choices=sorted(DELIVERY_MODES))
     parser.add_argument("--yolo", action="store_true", help="Allow green routine delivery for this run")
+    parser.add_argument("--discard", action="store_true", help="Explicitly discard unlanded worker work")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON where supported")
     parser.add_argument("--worktree", type=Path, help="Dedicated task worktree for launch-exec")
     parser.add_argument("--exit-code", type=int, help="Wrapper exit code for finish-runtime")
@@ -912,6 +976,14 @@ def main() -> None:
         if missing:
             raise SystemExit(f"finish-runtime requires {' '.join(missing)}")
         command_finish_runtime(repo, args.plan, args.run_id, args.task, args.exit_code)
+    elif args.command == "delivery-ready":
+        if not args.run_id or not args.task:
+            raise SystemExit("delivery-ready requires --run-id <id> --task <filename>")
+        print(command_delivery_ready(repo, args.plan, args.run_id, args.task))
+    elif args.command == "teardown":
+        if not args.run_id or not args.task:
+            raise SystemExit("teardown requires --run-id <id> --task <filename>")
+        command_teardown(repo, args.plan, args.run_id, args.task, args.discard)
 
 
 if __name__ == "__main__":

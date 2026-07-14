@@ -470,6 +470,32 @@ class KanbanTest(unittest.TestCase):
         self.assertEqual("001-work.md", payload["tasks"][0]["task"])
         self.assertEqual(before, sorted(path.relative_to(self.repo) for path in self.repo.rglob("*")))
 
+    def test_delivery_readiness_requires_green_evidence_even_when_yolo(self) -> None:
+        run = self.repo / ".agent" / self.plan / "runs" / "run-a"
+        run.mkdir(parents=True)
+        (run / "policy.json").write_text(
+            json.dumps({"mode": "direct-pr", "yolo": True}), encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(SystemExit, "verified review and tests"):
+            KANBAN.command_delivery_ready(self.repo, self.plan, "run-a", "001-work.md")
+
+        self.write_runtime("run-a", "001-work.md", finished_at=datetime.now(UTC).isoformat(), exit_code=0)
+        report = run / "reports" / "001-work.md"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text("DONE\nTests: passed\n", encoding="utf-8")
+        review = run / "reviews" / "001-work.md"
+        review.parent.mkdir(parents=True, exist_ok=True)
+        review.write_text("Review status: approved\n", encoding="utf-8")
+
+        self.assertEqual("MERGE_GREEN_PR", KANBAN.command_delivery_ready(self.repo, self.plan, "run-a", "001-work.md"))
+
+    def test_teardown_refuses_unlanded_work_without_explicit_discard(self) -> None:
+        self.write_runtime("run-a", "001-work.md")
+
+        with self.assertRaisesRegex(SystemExit, "unlanded work"):
+            KANBAN.command_teardown(self.repo, self.plan, "run-a", "001-work.md", discard=False)
+
 
 if __name__ == "__main__":
     unittest.main()
