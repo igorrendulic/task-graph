@@ -523,13 +523,25 @@ def command_launch_exec(
     if not brief.exists():
         raise SystemExit(f"Task brief does not exist: {brief}")
 
-    command = ["codex", "exec", "--sandbox", "workspace-write"]
+    command = [
+        "codex",
+        "exec",
+        "--sandbox",
+        "workspace-write",
+        "--output-last-message",
+        str(report),
+    ]
     record = new_runtime_record(
         task=task, plan=plan, run_id=run_id, branch=branch, worktree=worktree,
         brief=brief, report=report, log=log, command=command,
     )
     write_runtime_record(record_path, record)
-    prompt = f"Read {brief}. Work only on the assigned task and write the final report to {report}."
+    prompt = (
+        f"Read {brief}. Work only on the assigned task in the current worktree. "
+        "Do not write outside that worktree and do not run git commit. "
+        "Return the complete final report in your final response, including status, summary, "
+        "tests, concerns, and a suggested commit message."
+    )
     codex_command = " ".join(shlex.quote(item) for item in [*command, prompt])
     wrapper = (
         f"set -o pipefail; {codex_command} 2>&1 | tee -a {shlex.quote(str(log))}; "

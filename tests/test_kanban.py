@@ -288,7 +288,7 @@ class KanbanTest(unittest.TestCase):
                 )
         self.assertFalse((self.repo / ".agent" / self.plan / "runs" / "run-a" / "runtime").exists())
 
-    def test_launch_exec_uses_the_supported_workspace_write_command(self) -> None:
+    def test_launch_exec_captures_the_final_report_without_granting_controller_access(self) -> None:
         task_name = "001-work.md"
         run_id = "run-a"
         write_task(self.repo, self.plan, "in-progress", task_name, "Work")
@@ -314,9 +314,23 @@ class KanbanTest(unittest.TestCase):
 
         runtime = self.repo / ".agent" / self.plan / "runs" / run_id / "runtime" / "001-work.json"
         record = json.loads(runtime.read_text(encoding="utf-8"))
-        self.assertEqual(["codex", "exec", "--sandbox", "workspace-write"], record["command"])
+        self.assertEqual(
+            [
+                "codex",
+                "exec",
+                "--sandbox",
+                "workspace-write",
+                "--output-last-message",
+                str(self.repo / ".agent" / self.plan / "runs" / run_id / "reports" / task_name),
+            ],
+            record["command"],
+        )
         wrapper = run.call_args_list[0].args[0][-1]
         self.assertNotIn("--ask-for-approval", wrapper)
+        self.assertNotIn("--add-dir", wrapper)
+        self.assertIn("Return the complete final report", wrapper)
+        self.assertNotIn("write the final report", wrapper)
+        self.assertIn("do not run git commit", wrapper)
 
     def write_runtime(self, run_id: str, task_name: str, **overrides: object) -> Path:
         directory = self.repo / ".agent" / self.plan / "runs" / run_id / "runtime"

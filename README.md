@@ -53,7 +53,7 @@ When Task Graph launches subagents, each subagent should work in its own Git wor
 
 By default, one approved implementation plan integrates into one feature branch. After final review and verification, Task Graph should report the branch, commits, verification results, and review notes, then ask whether you want a GitHub PR created. It should not create a PR unless you explicitly confirm. Task branches are temporary, reviewable artifacts for isolated agent work; they do not each become a GitHub PR unless you explicitly ask for that or the tasks are independently shippable.
 
-The main agent owns `.agent/<plan-slug>/` task state during this flow. It derives and announces the short lowercase kebab-case plan slug from the approved plan, then passes it to every helper command. It moves launched tasks to `in-progress` before creating task worktrees. Subagents should not move files under the selected plan directory or rewrite its board; they commit only their task's code, tests, and documentation changes. After the main agent integrates and verifies a task branch, it moves that task to `done` and regenerates the board.
+The main agent owns `.agent/<plan-slug>/` task state during this flow. It derives and announces the short lowercase kebab-case plan slug from the approved plan, then passes it to every helper command. It moves launched tasks to `in-progress` before creating task worktrees. Subagents should not move files under the selected plan directory or rewrite its board. For unattended `codex exec` tasks, workers edit and test only in their task worktree, return their complete report in the final response, and do not commit; the controller persists that response, reviews the diff, and creates the task-branch commit. After the main agent integrates and verifies a task branch, it moves that task to `done` and regenerates the board.
 
 ## Durable Runs
 
@@ -70,7 +70,7 @@ Task Graph stores per-run coordination files under `.agent/<plan-slug>/runs/<run
 
 The run ledger lets the controller recover after compaction or restart. A task marked complete in `progress.md` is treated as done for launch purposes and is not reserved again.
 
-Subagents use file handoffs rather than long pasted context. The controller writes a task brief, the subagent writes a report, and reviews can use the report plus a focused diff package. Subagents report one of `DONE`, `DONE_WITH_CONCERNS`, `NEEDS_CONTEXT`, or `BLOCKED`; the controller reviews and integrates only after the status is resolved.
+Subagents use file handoffs rather than long pasted context. The controller writes a task brief and persists each unattended worker's final response as its report; reviews can use the report plus a focused diff package. Subagents report one of `DONE`, `DONE_WITH_CONCERNS`, `NEEDS_CONTEXT`, or `BLOCKED`; the controller reviews and integrates only after the status is resolved.
 
 ## Execution Modes
 
