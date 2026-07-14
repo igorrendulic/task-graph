@@ -17,6 +17,7 @@ from pathlib import Path
 
 
 COLUMNS = ("todo", "in-progress", "done")
+DELIVERY_MODES = frozenset({"no-mistakes", "direct-pr", "local-only"})
 PLAN_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 RUNTIME_FIELDS = {
     "version", "plan", "run_id", "task", "session", "pid", "command", "branch",
@@ -329,6 +330,16 @@ def ensure_run_dirs(repo: Path, plan: str, run_id: str) -> Path:
     return directory
 
 
+def validate_run_policy(mode: str | None, yolo: bool) -> dict[str, object]:
+    if mode not in DELIVERY_MODES:
+        raise SystemExit("invalid delivery mode; reserve requires --delivery-mode no-mistakes|direct-pr|local-only")
+    return {"mode": mode, "yolo": yolo}
+
+
+def policy_path(repo: Path, plan: str, run_id: str) -> Path:
+    return run_dir(repo, plan, run_id) / "policy.json"
+
+
 def append_progress(repo: Path, plan: str, run_id: str, task: Task, status: str) -> None:
     path = progress_path(repo, plan, run_id)
     with path.open("a", encoding="utf-8") as handle:
@@ -380,8 +391,12 @@ def command_plan(repo: Path, plan: str, limit: int) -> None:
     print_schedule(schedule, limit)
 
 
-def command_reserve(repo: Path, plan: str, limit: int, run_id: str) -> None:
+def command_reserve(
+    repo: Path, plan: str, limit: int, run_id: str, delivery_mode: str | None, yolo: bool
+) -> None:
+    policy = validate_run_policy(delivery_mode, yolo)
     ensure_run_dirs(repo, plan, run_id)
+    write_atomic(policy_path(repo, plan, run_id), json.dumps(policy) + "\n")
     schedule = schedule_tasks(repo, plan, limit, run_id)
 
     print(f"Reserved launch batch (limit {limit}):")
@@ -785,6 +800,8 @@ def main() -> None:
     parser.add_argument("--review", help="Relative review path for archive-diff")
     parser.add_argument("--limit", type=int, default=5, help="Maximum recommended parallel launch count")
     parser.add_argument("--run-id", help="Run identifier for run ledger commands")
+    parser.add_argument("--delivery-mode", choices=sorted(DELIVERY_MODES))
+    parser.add_argument("--yolo", action="store_true", help="Allow green routine delivery for this run")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON where supported")
     parser.add_argument("--worktree", type=Path, help="Dedicated task worktree for launch-exec")
     parser.add_argument("--exit-code", type=int, help="Wrapper exit code for finish-runtime")
@@ -809,7 +826,7 @@ def main() -> None:
     elif args.command == "reserve":
         if not args.run_id:
             raise SystemExit("reserve requires --run-id <id>")
-        command_reserve(repo, args.plan, args.limit, args.run_id)
+        command_reserve(repo, args.plan, args.limit, args.run_id, args.delivery_mode, args.yolo)
     elif args.command == "start":
         command_start(repo, args.plan)
     elif args.command == "done":

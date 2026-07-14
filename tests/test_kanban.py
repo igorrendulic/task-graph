@@ -105,7 +105,9 @@ class KanbanTest(unittest.TestCase):
         write_task(self.repo, self.plan, "todo", "001-one.md", "One")
         write_task(self.repo, self.plan, "todo", "002-two.md", "Two")
 
-        result = self.run_helper("reserve", "--limit", "2", "--run-id", "run-a")
+        result = self.run_helper(
+            "reserve", "--limit", "2", "--run-id", "run-a", "--delivery-mode", "direct-pr"
+        )
 
         self.assertIn("Reserved launch batch (limit 2):", result.stdout)
         self.assertTrue((self.repo / ".agent" / self.plan / "in-progress" / "001-one.md").exists())
@@ -117,6 +119,25 @@ class KanbanTest(unittest.TestCase):
         ledger = (run_dir / "progress.md").read_text(encoding="utf-8")
         self.assertIn("- 001-one.md: in-progress", ledger)
         self.assertIn("- 002-two.md: in-progress", ledger)
+
+    def test_reserve_requires_and_persists_delivery_policy(self) -> None:
+        write_task(self.repo, self.plan, "todo", "001-work.md", "Work")
+
+        with self.assertRaisesRegex(SystemExit, "--delivery-mode"):
+            KANBAN.command_reserve(self.repo, self.plan, 1, "run-a", None, False)
+
+        KANBAN.command_reserve(self.repo, self.plan, 1, "run-a", "direct-pr", True)
+
+        policy = json.loads(
+            (self.repo / ".agent" / self.plan / "runs" / "run-a" / "policy.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual({"mode": "direct-pr", "yolo": True}, policy)
+
+    def test_reserve_rejects_unknown_delivery_policy(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "delivery mode"):
+            KANBAN.validate_run_policy("merge-everything", False)
 
     def test_reserve_does_not_relaunch_tasks_marked_complete_in_ledger(self) -> None:
         write_task(self.repo, self.plan, "todo", "001-done-in-ledger.md", "Already Done")
