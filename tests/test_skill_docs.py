@@ -58,6 +58,18 @@ class SkillDocsTest(unittest.TestCase):
         self.assertIn("Unattended `codex exec`", readme)
         self.assertIn("not laptop-independent", readme)
 
+    def test_docs_require_tmux_launcher_and_status_dashboard_examples(self) -> None:
+        skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        for document in (skill, readme):
+            self.assertIn("launch-exec", document)
+            self.assertIn("tmux", document)
+            self.assertIn("status --repo", document)
+            self.assertIn("--watch", document)
+            self.assertIn("--json", document)
+            self.assertIn("tmux attach -t", document)
+
 
 if __name__ == "__main__":
     unittest.main()

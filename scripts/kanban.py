@@ -7,14 +7,21 @@ import argparse
 import json
 import re
 import shutil
+import shlex
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
 COLUMNS = ("todo", "in-progress", "done")
 PLAN_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+RUNTIME_FIELDS = {
+    "version", "plan", "run_id", "task", "session", "pid", "command", "branch",
+    "worktree", "brief", "report", "log", "started_at", "finished_at", "exit_code",
+}
 
 
 @dataclass(frozen=True)
@@ -115,6 +122,21 @@ def read_tasks(repo: Path, plan: str) -> list[Task]:
                     dependencies=parse_dependencies(path),
                     task_type=parse_task_type(path),
                 )
+            )
+    return tasks
+
+
+def read_tasks_readonly(repo: Path, plan: str) -> list[Task]:
+    """Read task files without creating columns or regenerating the board."""
+    base = plan_dir(repo, plan)
+    tasks: list[Task] = []
+    for column in COLUMNS:
+        directory = base / column
+        if not directory.exists():
+            continue
+        for path in sorted(directory.glob("*.md")):
+            tasks.append(
+                Task(column, path, title_from_file(path), parse_dependencies(path), parse_task_type(path))
             )
     return tasks
 
@@ -299,7 +321,7 @@ def print_schedule_json(schedule: Schedule, limit: int) -> None:
 
 def ensure_run_dirs(repo: Path, plan: str, run_id: str) -> Path:
     directory = run_dir(repo, plan, run_id)
-    for name in ("briefs", "reports", "reviews", "diffs"):
+    for name in ("briefs", "reports", "reviews", "diffs", "logs", "runtime"):
         (directory / name).mkdir(parents=True, exist_ok=True)
     path = directory / "progress.md"
     if not path.exists():
@@ -435,6 +457,261 @@ def write_atomic(path: Path, content: str) -> None:
     temporary.replace(path)
 
 
+def utc_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def tmux_session_name(plan: str, run_id: str, task_name: str) -> str:
+    parts = ("task-graph", plan, run_id, Path(task_name).stem)
+    return "-".join(re.sub(r"[^a-zA-Z0-9_-]+", "-", part).strip("-") for part in parts)
+
+
+def new_runtime_record(
+    *, task: Task, plan: str, run_id: str, branch: str, worktree: Path, brief: Path,
+    report: Path, log: Path, command: list[str], started_at: str | None = None,
+) -> dict[str, object]:
+    return {
+        "version": 1, "plan": plan, "run_id": run_id, "task": task.path.name,
+        "session": tmux_session_name(plan, run_id, task.path.name), "pid": None,
+        "command": command, "branch": branch, "worktree": str(worktree),
+        "brief": str(brief), "report": str(report), "log": str(log),
+        "started_at": started_at or utc_now(), "finished_at": None, "exit_code": None,
+    }
+
+
+def is_valid_runtime_record(record: object) -> bool:
+    if not isinstance(record, dict) or not RUNTIME_FIELDS <= record.keys():
+        return False
+    return (
+        record.get("version") == 1
+        and isinstance(record.get("command"), list)
+        and isinstance(record.get("task"), str)
+        and isinstance(record.get("session"), str)
+    )
+
+
+def runtime_path(repo: Path, plan: str, run_id: str, task_name: str) -> Path:
+    return run_dir(repo, plan, run_id) / "runtime" / f"{Path(task_name).stem}.json"
+
+
+def write_runtime_record(path: Path, record: dict[str, object]) -> None:
+    write_atomic(path, json.dumps(record, indent=2, sort_keys=True) + "\n")
+
+
+def tmux_session_exists(session: str) -> bool:
+    try:
+        return subprocess.run(
+            ["tmux", "has-session", "-t", session], text=True, capture_output=True
+        ).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def command_launch_exec(
+    repo: Path, plan: str, run_id: str, task_name: str, branch: str, worktree: Path
+) -> None:
+    if not shutil.which("tmux"):
+        raise SystemExit("tmux is required for launch-exec")
+    task = task_in_progress(repo, plan, task_name)
+    directory = ensure_run_dirs(repo, plan, run_id)
+    brief = directory / "briefs" / task.path.name
+    report = directory / "reports" / task.path.name
+    log = directory / "logs" / f"{task.path.stem}.log"
+    record_path = runtime_path(repo, plan, run_id, task.path.name)
+    if record_path.exists():
+        raise SystemExit(f"Runtime record already exists: {record_path}")
+    if not brief.exists():
+        raise SystemExit(f"Task brief does not exist: {brief}")
+
+    command = ["codex", "exec", "--sandbox", "workspace-write", "--ask-for-approval", "never"]
+    record = new_runtime_record(
+        task=task, plan=plan, run_id=run_id, branch=branch, worktree=worktree,
+        brief=brief, report=report, log=log, command=command,
+    )
+    write_runtime_record(record_path, record)
+    prompt = f"Read {brief}. Work only on the assigned task and write the final report to {report}."
+    codex_command = " ".join(shlex.quote(item) for item in [*command, prompt])
+    wrapper = (
+        f"set -o pipefail; {codex_command} 2>&1 | tee -a {shlex.quote(str(log))}; "
+        "exit_code=${PIPESTATUS[0]}; "
+        f"{shlex.quote(shutil.which('python3') or 'python3')} {shlex.quote(str(Path(__file__).resolve()))} "
+        f"finish-runtime --repo {shlex.quote(str(repo))} --plan {shlex.quote(plan)} "
+        f"--run-id {shlex.quote(run_id)} --task {shlex.quote(task.path.name)} --exit-code $exit_code; exit $exit_code"
+    )
+    session = str(record["session"])
+    created = subprocess.run(
+        ["tmux", "new-session", "-d", "-s", session, "-c", str(worktree), "bash", "-lc", wrapper],
+        text=True, capture_output=True,
+    )
+    if created.returncode:
+        record_path.unlink(missing_ok=True)
+        detail = created.stderr.strip() or created.stdout.strip()
+        raise SystemExit(detail or "tmux failed to start launch-exec")
+    subprocess.run(["tmux", "set-option", "-t", session, "remain-on-exit", "on"], capture_output=True)
+    pane = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", session, "#{pane_pid}"], text=True, capture_output=True
+    )
+    if pane.returncode == 0 and pane.stdout.strip().isdigit():
+        record["pid"] = int(pane.stdout.strip())
+        write_runtime_record(record_path, record)
+    print(f"Launched: {task.path.name}")
+    print(f"Attach: tmux attach -t {session}")
+    print(f"Log: {log}")
+
+
+def command_finish_runtime(repo: Path, plan: str, run_id: str, task_name: str, exit_code: int) -> None:
+    path = runtime_path(repo, plan, run_id, task_name)
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit(f"Runtime record does not exist: {path}")
+    if not is_valid_runtime_record(record):
+        raise SystemExit(f"Invalid runtime record: {path}")
+    record["finished_at"] = utc_now()
+    record["exit_code"] = exit_code
+    write_runtime_record(path, record)
+
+
+def parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def resolve_artifact(run: Path, value: object) -> Path | None:
+    if not isinstance(value, str):
+        return None
+    path = Path(value)
+    return path if path.is_absolute() else run / path
+
+
+def final_report_status(report: Path | None) -> str | None:
+    if not report or not report.exists():
+        return None
+    match = re.search(r"\b(DONE_WITH_CONCERNS|NEEDS_CONTEXT|BLOCKED|DONE)\b", report.read_text(encoding="utf-8"))
+    return match.group(1) if match else None
+
+
+def status_entry(
+    *, plan: str, run_id: str, task_name: str, run: Path, record: dict[str, object] | None,
+    tmux_alive: callable, stale_after: timedelta, now: datetime,
+) -> dict[str, object]:
+    if record is None or not is_valid_runtime_record(record):
+        return {"plan": plan, "run_id": run_id, "task": task_name, "state": "UNKNOWN", "elapsed": None,
+                "session": None, "last_activity": None,
+                "recovery_hint": "Inspect the legacy run ledger and task artifacts before relaunching manually."}
+    report = resolve_artifact(run, record["report"])
+    log = resolve_artifact(run, record["log"])
+    report_status = final_report_status(report)
+    alive = tmux_alive(str(record["session"]))
+    started = parse_timestamp(record["started_at"])
+    finished = parse_timestamp(record["finished_at"])
+    elapsed_seconds = int(((finished or now) - started).total_seconds()) if started else None
+    activities = [path.stat().st_mtime for path in (report, log) if path and path.exists()]
+    activities.append((run / "runtime" / f"{Path(task_name).stem}.json").stat().st_mtime)
+    last_activity = datetime.fromtimestamp(max(activities), UTC).isoformat() if activities else None
+    if alive:
+        state, hint = "RUNNING", f"Attach: tmux attach -t {record['session']}"
+    elif record["exit_code"] == 0 and report_status == "DONE":
+        state, hint = "SUCCEEDED_AWAITING_REVIEW", f"Open report: {report}"
+    elif record["exit_code"] not in (None, 0) or report_status in {"DONE_WITH_CONCERNS", "NEEDS_CONTEXT", "BLOCKED"}:
+        state, hint = "NEEDS_ATTENTION", f"Inspect log: {log}; investigate or relaunch manually."
+    elif started and now - started > stale_after:
+        state, hint = "STALE", f"Inspect log: {log}; investigate or relaunch manually."
+    else:
+        state, hint = "UNKNOWN", f"Inspect runtime record and log: {log}"
+    return {"plan": plan, "run_id": run_id, "task": task_name, "state": state,
+            "elapsed": elapsed_seconds, "session": record["session"], "last_activity": last_activity,
+            "recovery_hint": hint}
+
+
+def collect_status(
+    repo: Path, plan: str | None = None, run_id: str | None = None, task_name: str | None = None,
+    *, tmux_alive: callable = tmux_session_exists, stale_after: timedelta = timedelta(minutes=30),
+) -> list[dict[str, object]]:
+    root = repo / ".agent"
+    if not root.exists():
+        return []
+    plans = [plan_dir(repo, plan)] if plan else sorted(path for path in root.iterdir() if path.is_dir())
+    now = datetime.now(UTC)
+    entries: list[dict[str, object]] = []
+    for current_plan in plans:
+        runs = current_plan / "runs"
+        if not runs.exists():
+            continue
+        tasks = {
+            task.path.name
+            for task in read_tasks_readonly(repo, current_plan.name)
+            if task.column == "in-progress"
+        }
+        for current_run in sorted(path for path in runs.iterdir() if path.is_dir()):
+            if run_id and current_run.name != run_id:
+                continue
+            records: dict[str, dict[str, object] | None] = {}
+            for path in sorted((current_run / "runtime").glob("*.json")) if (current_run / "runtime").exists() else []:
+                try:
+                    record = json.loads(path.read_text(encoding="utf-8"))
+                    records[str(record.get("task", path.with_suffix(".md").name))] = record
+                except json.JSONDecodeError:
+                    records[path.with_suffix(".md").name] = None
+            names = set(records) | tasks
+            for name in sorted(names):
+                if task_name and name != task_name:
+                    continue
+                entries.append(status_entry(plan=current_plan.name, run_id=current_run.name, task_name=name,
+                                            run=current_run, record=records.get(name), tmux_alive=tmux_alive,
+                                            stale_after=stale_after, now=now))
+    return entries
+
+
+def format_elapsed(seconds: object) -> str:
+    if not isinstance(seconds, int):
+        return "-"
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02}:{minutes:02}:{seconds:02}"
+
+
+def print_status(entries: list[dict[str, object]]) -> None:
+    headers = ("PLAN", "RUN", "TASK", "STATE", "ELAPSED", "TMUX", "LAST ACTIVITY", "NEXT STEP")
+    rows = [headers] + [(
+        str(entry["plan"]), str(entry["run_id"]), str(entry["task"]), str(entry["state"]),
+        format_elapsed(entry["elapsed"]), str(entry["session"] or "-"), str(entry["last_activity"] or "-"),
+        str(entry["recovery_hint"]),
+    ) for entry in entries]
+    widths = [max(len(row[index]) for row in rows) for index in range(len(headers))]
+    for index, row in enumerate(rows):
+        print("  ".join(value.ljust(widths[column]) for column, value in enumerate(row)))
+        if index == 0:
+            print("  ".join("-" * width for width in widths))
+    if not entries:
+        print("No active task executions found.")
+
+
+def command_status(repo: Path, plan: str | None, run_id: str | None, task_name: str | None, as_json: bool, watch: bool, interval: float) -> None:
+    if interval <= 0:
+        raise SystemExit("--interval must be greater than zero")
+    try:
+        while True:
+            entries = collect_status(repo, plan, run_id, task_name)
+            if as_json:
+                print(json.dumps({"tasks": entries}, indent=2, sort_keys=True))
+                return
+            if watch:
+                print("\033[2J\033[H", end="")
+                print("Task Graph status (Ctrl-C to stop)\n")
+            print_status(entries)
+            if not watch:
+                return
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        if watch:
+            print()
+
+
 def command_archive_diff(
     repo: Path,
     plan: str,
@@ -483,9 +760,12 @@ def command_archive_diff(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("archive-diff", "board", "plan", "reserve", "start", "done"))
+    parser.add_argument(
+        "command",
+        choices=("archive-diff", "board", "plan", "reserve", "start", "done", "launch-exec", "finish-runtime", "status"),
+    )
     parser.add_argument("--repo", type=Path, default=Path.cwd())
-    parser.add_argument("--plan", required=True, help="Lowercase kebab-case plan slug")
+    parser.add_argument("--plan", help="Lowercase kebab-case plan slug")
     parser.add_argument("--task", help="Task filename for the done command")
     parser.add_argument("--base", help="Base commit for archive-diff")
     parser.add_argument("--head", help="Head commit for archive-diff")
@@ -494,9 +774,18 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=5, help="Maximum recommended parallel launch count")
     parser.add_argument("--run-id", help="Run identifier for run ledger commands")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON where supported")
+    parser.add_argument("--worktree", type=Path, help="Dedicated task worktree for launch-exec")
+    parser.add_argument("--exit-code", type=int, help="Wrapper exit code for finish-runtime")
+    parser.add_argument("--watch", action="store_true", help="Continuously redraw status")
+    parser.add_argument("--interval", type=float, default=2.0, help="Status refresh interval in seconds")
     args = parser.parse_args()
 
     repo = args.repo.resolve()
+    if args.command == "status":
+        command_status(repo, args.plan, args.run_id, args.task, args.json, args.watch, args.interval)
+        return
+    if not args.plan:
+        raise SystemExit(f"{args.command} requires --plan <plan-slug>")
     if args.command == "board":
         print(f"Board: {rewrite_board(repo, args.plan)}")
     elif args.command == "plan":
@@ -537,6 +826,18 @@ def main() -> None:
             args.branch,
             args.review,
         )
+    elif args.command == "launch-exec":
+        required = {"--run-id": args.run_id, "--task": args.task, "--branch": args.branch, "--worktree": args.worktree}
+        missing = [flag for flag, value in required.items() if not value]
+        if missing:
+            raise SystemExit(f"launch-exec requires {' '.join(missing)}")
+        command_launch_exec(repo, args.plan, args.run_id, args.task, args.branch, args.worktree.resolve())
+    elif args.command == "finish-runtime":
+        required = {"--run-id": args.run_id, "--task": args.task, "--exit-code": args.exit_code}
+        missing = [flag for flag, value in required.items() if value is None or value == ""]
+        if missing:
+            raise SystemExit(f"finish-runtime requires {' '.join(missing)}")
+        command_finish_runtime(repo, args.plan, args.run_id, args.task, args.exit_code)
 
 
 if __name__ == "__main__":

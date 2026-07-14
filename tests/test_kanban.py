@@ -1,13 +1,21 @@
 import json
+import importlib.util
 import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "scripts" / "kanban.py"
+SPEC = importlib.util.spec_from_file_location("kanban", HELPER)
+assert SPEC and SPEC.loader
+KANBAN = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = KANBAN
+SPEC.loader.exec_module(KANBAN)
 
 
 def write_task(
@@ -242,6 +250,105 @@ class KanbanTest(unittest.TestCase):
 
         self.assertNotEqual(0, result.returncode)
         self.assertIn("lowercase kebab-case", result.stderr)
+
+    def test_runtime_record_uses_a_deterministic_tmux_session_and_validates(self) -> None:
+        task = KANBAN.Task("in-progress", Path("001-work.md"), "Work", (), "ship")
+        now = "2026-07-14T12:00:00+00:00"
+
+        record = KANBAN.new_runtime_record(
+            task=task,
+            plan="first-plan",
+            run_id="run-a",
+            branch="task-graph/first-plan/001-work",
+            worktree=Path("/tmp/worktree"),
+            brief=Path("/tmp/brief.md"),
+            report=Path("/tmp/report.md"),
+            log=Path("/tmp/task.log"),
+            command=["codex", "exec"],
+            started_at=now,
+        )
+
+        self.assertEqual("task-graph-first-plan-run-a-001-work", record["session"])
+        self.assertIsNone(record["pid"])
+        self.assertTrue(KANBAN.is_valid_runtime_record(record))
+        record.pop("log")
+        self.assertFalse(KANBAN.is_valid_runtime_record(record))
+
+    def test_launch_exec_refuses_before_writing_when_tmux_is_unavailable(self) -> None:
+        write_task(self.repo, self.plan, "in-progress", "001-work.md", "Work")
+        with patch.object(KANBAN.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(SystemExit, "tmux is required"):
+                KANBAN.command_launch_exec(
+                    self.repo,
+                    self.plan,
+                    "run-a",
+                    "001-work.md",
+                    "branch",
+                    Path("/tmp/worktree"),
+                )
+        self.assertFalse((self.repo / ".agent" / self.plan / "runs" / "run-a" / "runtime").exists())
+
+    def write_runtime(self, run_id: str, task_name: str, **overrides: object) -> Path:
+        directory = self.repo / ".agent" / self.plan / "runs" / run_id / "runtime"
+        directory.mkdir(parents=True, exist_ok=True)
+        started = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+        record: dict[str, object] = {
+            "version": 1,
+            "plan": self.plan,
+            "run_id": run_id,
+            "task": task_name,
+            "session": KANBAN.tmux_session_name(self.plan, run_id, task_name),
+            "pid": 123,
+            "command": ["codex", "exec"],
+            "branch": "branch",
+            "worktree": "/tmp/worktree",
+            "brief": f"briefs/{task_name}",
+            "report": f"reports/{task_name}",
+            "log": f"logs/{Path(task_name).stem}.log",
+            "started_at": started,
+            "finished_at": None,
+            "exit_code": None,
+        }
+        record.update(overrides)
+        path = directory / f"{Path(task_name).stem}.json"
+        path.write_text(json.dumps(record), encoding="utf-8")
+        return path
+
+    def test_status_classifies_runtime_records_and_legacy_runs(self) -> None:
+        for name in ("001-running.md", "002-success.md", "003-failure.md", "004-stale.md", "005-legacy.md"):
+            write_task(self.repo, self.plan, "in-progress", name, name)
+        self.write_runtime("run-a", "001-running.md")
+        self.write_runtime("run-a", "002-success.md", finished_at=datetime.now(UTC).isoformat(), exit_code=0)
+        self.write_runtime("run-a", "003-failure.md", finished_at=datetime.now(UTC).isoformat(), exit_code=2)
+        self.write_runtime("run-a", "004-stale.md", started_at=(datetime.now(UTC) - timedelta(hours=2)).isoformat())
+        (self.repo / ".agent" / self.plan / "runs" / "run-a" / "reports").mkdir(parents=True)
+        (self.repo / ".agent" / self.plan / "runs" / "run-a" / "reports" / "002-success.md").write_text("DONE\n", encoding="utf-8")
+
+        def tmux_alive(session: str) -> bool:
+            return session.endswith("001-running")
+
+        entries = KANBAN.collect_status(self.repo, tmux_alive=tmux_alive, stale_after=timedelta(minutes=30))
+        states = {entry["task"]: entry["state"] for entry in entries}
+
+        self.assertEqual("RUNNING", states["001-running.md"])
+        self.assertEqual("SUCCEEDED_AWAITING_REVIEW", states["002-success.md"])
+        self.assertEqual("NEEDS_ATTENTION", states["003-failure.md"])
+        self.assertEqual("STALE", states["004-stale.md"])
+        self.assertEqual("UNKNOWN", states["005-legacy.md"])
+        success = next(entry for entry in entries if entry["task"] == "002-success.md")
+        self.assertIn("report", success["recovery_hint"])
+
+    def test_status_filters_and_json_are_read_only(self) -> None:
+        write_task(self.repo, self.plan, "in-progress", "001-work.md", "Work")
+        self.write_runtime("run-a", "001-work.md", finished_at=datetime.now(UTC).isoformat(), exit_code=1)
+        before = sorted(path.relative_to(self.repo) for path in self.repo.rglob("*"))
+
+        result = self.run_helper("status", "--run-id", "run-a", "--task", "001-work.md", "--json")
+        payload = json.loads(result.stdout)
+
+        self.assertEqual(1, len(payload["tasks"]))
+        self.assertEqual("001-work.md", payload["tasks"][0]["task"])
+        self.assertEqual(before, sorted(path.relative_to(self.repo) for path in self.repo.rglob("*")))
 
 
 if __name__ == "__main__":

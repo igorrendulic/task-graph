@@ -93,7 +93,7 @@ Use this workflow when the user asks to start implementation.
    - Commit the task's code, tests, and documentation changes on the task branch.
    - Write the full report to `.agent/<plan-slug>/runs/<run-id>/reports/<task-file>`.
    - Reply with only status, task branch, worktree path, commit SHA, one-line test summary, concerns, and report path.
-9. For **Unattended `codex exec`**, launch one non-interactive process per reserved task in its dedicated worktree. Before launch, write its task brief; pass that brief as the prompt, capture the final response in `.agent/<plan-slug>/runs/<run-id>/reports/<task-file>`, and write stdout/stderr to a task-specific log under the same run directory. Use the normal workspace-write sandbox and no-prompt approval policy; never automatically use `--dangerously-bypass-approvals-and-sandbox`. Record the command, process identifier, worktree path, branch, report path, log path, and start time in the run ledger. Require the final response to use one of the task status values below. On resume, inspect the recorded process identifier and report before retrying; do not relaunch a completed task. `codex exec` avoids interactive approval pauses, but it still requires an awake machine or remote host.
+9. For **Unattended `codex exec`**, tmux is required. After writing the task brief, use `launch-exec` for each reserved task in its dedicated worktree; it writes a durable runtime record before execution, captures output in a task-specific log, and preserves the exited tmux pane for diagnosis. It runs `codex exec` with the normal workspace-write sandbox and no-prompt approval policy; never automatically use `--dangerously-bypass-approvals-and-sandbox`. The runtime record contains the tmux session, pane PID (the process identifier), command, worktree, branch, brief/report/log paths, start/finish timestamps, and exit result. Require the final response to use one of the task status values below. On resume, inspect the runtime record, report, and log before retrying; do not relaunch a completed task. `codex exec` avoids interactive approval pauses, but it still requires an awake machine or remote host.
 10. For `Cloud delegation`, launch only when the selected Codex surface and workspace policy support it. Record the cloud task identifier, task branch/worktree or remote checkout reference, and result/report location in the run ledger. Do not fall back from cloud delegation to local execution without asking the operator.
 11. Every worker, exec process, or cloud task must report one of these statuses:
    - `DONE`: implementation is complete and ready for review.
@@ -179,6 +179,21 @@ Archive a completed task branch before integration:
 python3 <skill-dir>/scripts/kanban.py archive-diff --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --base <base-commit> --head <task-head-commit> --branch <task-branch> --review reviews/001-example.md
 ```
 
+Launch a prepared reserved task unattended (tmux is required):
+
+```bash
+python3 <skill-dir>/scripts/kanban.py launch-exec --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --branch task-graph/<plan-slug>/001-example --worktree <task-worktree>
+```
+
+Observe all active task executions without changing state:
+
+```bash
+python3 <skill-dir>/scripts/kanban.py status --repo <repo-root>
+python3 <skill-dir>/scripts/kanban.py status --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --json
+python3 <skill-dir>/scripts/kanban.py status --repo <repo-root> --watch --interval 2
+tmux attach -t task-graph-<plan-slug>-<run-id>-001-example
+```
+
 ## Helper Behavior
 
 The helper is intentionally conservative:
@@ -190,6 +205,8 @@ The helper is intentionally conservative:
 - `start --plan <plan-slug>` selects the first startable todo task by filename, moves it to `in-progress`, rewrites the board, and prints the task path plus possible parallel candidates.
 - `done --plan <plan-slug> --task <file>` moves a matching in-progress task to `done` and rewrites the board.
 - `archive-diff --plan <plan-slug> --run-id <id> --task <file> --base <commit> --head <commit> --branch <branch> --review <relative-path>` validates an in-progress task and commit revisions, then writes a binary-capable patch and metadata summary to `.agent/<plan-slug>/runs/<id>/diffs/` without changing task state.
+- `launch-exec --plan <plan-slug> --run-id <id> --task <file> --branch <branch> --worktree <path>` requires tmux and starts one reserved in-progress task in a deterministic session.
+- `status [--plan <plan-slug>] [--run-id <id>] [--task <file>] [--json]` is read-only. `status --watch [--interval <seconds>]` redraws the same data in place.
 - Dependencies are parsed from the `## Dependencies` section as task filenames when present. `None` means no blocker.
 - Task type is parsed from `## Type`; supported values are `ship` and `scout`, and omitted or unknown values default to `ship`.
 - The `## Parallel` section is human guidance. Dependency parsing is authoritative for helper decisions.

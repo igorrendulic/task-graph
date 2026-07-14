@@ -77,7 +77,7 @@ Subagents use file handoffs rather than long pasted context. The controller writ
 Every `$task-graph start` asks the operator how to launch the reserved batch. If no mode is selected, Task Graph announces and uses **Managed workers (default)**.
 
 - **Managed workers (default):** launch isolated in-session workers in dedicated worktrees and branches.
-- **Unattended `codex exec`:** launch one non-interactive CLI process per task from its dedicated worktree. The ledger records the command, process identifier, branch, paths to the brief, report, and log, and the start time so a later run can inspect it before retrying. It uses workspace-write access and a no-prompt approval policy, never an automatic unsandboxed bypass.
+- **Unattended `codex exec`:** tmux is required. Launch one non-interactive CLI process per task from its dedicated worktree with `launch-exec`; it records a durable per-task runtime JSON record before execution and preserves the exited pane for diagnosis. The record includes the tmux session, pane PID, command, branch, worktree, brief/report/log paths, start/finish timestamps, and exit result. It uses workspace-write access and a no-prompt approval policy, never an automatic unsandboxed bypass.
 - **Cloud delegation:** use a supported delegated cloud-task surface and record its remote task identifier and result location. It never silently falls back to local execution.
 
 `codex exec` removes interactive approval pauses but is not laptop-independent: a local process still needs an awake machine or remote host. Cloud delegation is the mode for work that must continue after the local machine is unavailable.
@@ -211,6 +211,21 @@ Reserve the next launch batch for a run:
 
 ```bash
 python3 <skill-dir>/scripts/kanban.py reserve --repo <repo-root> --plan <plan-slug> --limit 5 --run-id <run-id>
+```
+
+Launch one prepared reserved task unattended (tmux is required):
+
+```bash
+python3 <skill-dir>/scripts/kanban.py launch-exec --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --branch task-graph/<plan-slug>/001-example --worktree <task-worktree>
+```
+
+Use the read-only dashboard from another tmux pane:
+
+```bash
+python3 <skill-dir>/scripts/kanban.py status --repo <repo-root>
+python3 <skill-dir>/scripts/kanban.py status --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --json
+python3 <skill-dir>/scripts/kanban.py status --repo <repo-root> --watch --interval 2
+tmux attach -t task-graph-<plan-slug>-<run-id>-001-example
 ```
 
 Start the next unblocked task:
