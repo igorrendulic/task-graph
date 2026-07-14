@@ -422,8 +422,8 @@ class KanbanTest(unittest.TestCase):
         (self.repo / ".agent" / self.plan / "runs" / "run-a" / "reports").mkdir(parents=True)
         (self.repo / ".agent" / self.plan / "runs" / "run-a" / "reports" / "002-success.md").write_text("DONE\n", encoding="utf-8")
 
-        def tmux_alive(session: str) -> bool:
-            return session.endswith("001-running")
+        def tmux_alive(session: str) -> str:
+            return "RUNNING" if session.endswith("001-running") else "IDLE_OR_DEAD"
 
         entries = KANBAN.collect_status(self.repo, tmux_alive=tmux_alive, stale_after=timedelta(minutes=30))
         states = {entry["task"]: entry["state"] for entry in entries}
@@ -435,6 +435,28 @@ class KanbanTest(unittest.TestCase):
         self.assertEqual("UNKNOWN", states["005-legacy.md"])
         success = next(entry for entry in entries if entry["task"] == "002-success.md")
         self.assertIn("report", success["recovery_hint"])
+
+    def test_tmux_liveness_distinguishes_harness_shell_and_unknown(self) -> None:
+        with patch.object(KANBAN.subprocess, "run") as run:
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0),
+                subprocess.CompletedProcess([], 0, stdout="codex\n"),
+            ]
+            self.assertEqual("RUNNING", KANBAN.tmux_liveness("worker"))
+
+        with patch.object(KANBAN.subprocess, "run") as run:
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0),
+                subprocess.CompletedProcess([], 0, stdout="zsh\n"),
+            ]
+            self.assertEqual("IDLE_OR_DEAD", KANBAN.tmux_liveness("worker"))
+
+        with patch.object(KANBAN.subprocess, "run") as run:
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0),
+                subprocess.CompletedProcess([], 0, stdout="python\n"),
+            ]
+            self.assertEqual("UNKNOWN", KANBAN.tmux_liveness("worker"))
 
     def test_status_filters_and_json_are_read_only(self) -> None:
         write_task(self.repo, self.plan, "in-progress", "001-work.md", "Work")

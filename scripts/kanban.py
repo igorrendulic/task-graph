@@ -524,6 +524,27 @@ def tmux_session_exists(session: str) -> bool:
         return False
 
 
+def tmux_liveness(session: str) -> str:
+    if not tmux_session_exists(session):
+        return "IDLE_OR_DEAD"
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", session, "#{pane_current_command}"],
+            text=True,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        return "UNKNOWN"
+    if result.returncode:
+        return "UNKNOWN"
+    command = Path(result.stdout.strip()).name.lower()
+    if command in {"codex", "claude", "grok", "opencode"}:
+        return "RUNNING"
+    if command in {"zsh", "bash", "sh", "dash", "ash", "ksh", "fish"}:
+        return "IDLE_OR_DEAD"
+    return "UNKNOWN"
+
+
 def verified_worktree(repo: Path, worktree: Path, branch: str) -> tuple[Path, str]:
     root = worktree.resolve()
     if root == repo.resolve():
@@ -655,19 +676,21 @@ def status_entry(
     report = resolve_artifact(run, record["report"])
     log = resolve_artifact(run, record["log"])
     report_status = final_report_status(report)
-    alive = tmux_alive(str(record["session"]))
+    liveness = tmux_alive(str(record["session"]))
     started = parse_timestamp(record["started_at"])
     finished = parse_timestamp(record["finished_at"])
     elapsed_seconds = int(((finished or now) - started).total_seconds()) if started else None
     activities = [path.stat().st_mtime for path in (report, log) if path and path.exists()]
     activities.append((run / "runtime" / f"{Path(task_name).stem}.json").stat().st_mtime)
     last_activity = datetime.fromtimestamp(max(activities), UTC).isoformat() if activities else None
-    if alive:
+    if liveness == "RUNNING":
         state, hint = "RUNNING", f"Attach: tmux attach -t {record['session']}"
     elif record["exit_code"] == 0 and report_status == "DONE":
         state, hint = "SUCCEEDED_AWAITING_REVIEW", f"Open report: {report}"
     elif record["exit_code"] not in (None, 0) or report_status in {"DONE_WITH_CONCERNS", "NEEDS_CONTEXT", "BLOCKED"}:
         state, hint = "NEEDS_ATTENTION", f"Inspect log: {log}; investigate or relaunch manually."
+    elif liveness == "UNKNOWN":
+        state, hint = "UNKNOWN", f"Inspect tmux pane and runtime record: {log}"
     elif started and now - started > stale_after:
         state, hint = "STALE", f"Inspect log: {log}; investigate or relaunch manually."
     else:
@@ -679,7 +702,7 @@ def status_entry(
 
 def collect_status(
     repo: Path, plan: str | None = None, run_id: str | None = None, task_name: str | None = None,
-    *, tmux_alive: callable = tmux_session_exists, stale_after: timedelta = timedelta(minutes=30),
+    *, tmux_alive: callable = tmux_liveness, stale_after: timedelta = timedelta(minutes=30),
 ) -> list[dict[str, object]]:
     root = repo / ".agent"
     if not root.exists():
