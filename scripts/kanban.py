@@ -21,7 +21,7 @@ DELIVERY_MODES = frozenset({"no-mistakes", "direct-pr", "local-only"})
 PLAN_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 RUNTIME_FIELDS = {
     "version", "plan", "run_id", "task", "session", "pid", "command", "branch",
-    "worktree", "brief", "report", "log", "started_at", "finished_at", "exit_code",
+    "worktree", "base_commit", "brief", "report", "log", "started_at", "finished_at", "exit_code",
 }
 
 
@@ -484,11 +484,13 @@ def tmux_session_name(plan: str, run_id: str, task_name: str) -> str:
 def new_runtime_record(
     *, task: Task, plan: str, run_id: str, branch: str, worktree: Path, brief: Path,
     report: Path, log: Path, command: list[str], started_at: str | None = None,
+    base_commit: str,
 ) -> dict[str, object]:
     return {
         "version": 1, "plan": plan, "run_id": run_id, "task": task.path.name,
         "session": tmux_session_name(plan, run_id, task.path.name), "pid": None,
         "command": command, "branch": branch, "worktree": str(worktree),
+        "base_commit": base_commit,
         "brief": str(brief), "report": str(report), "log": str(log),
         "started_at": started_at or utc_now(), "finished_at": None, "exit_code": None,
     }
@@ -522,11 +524,31 @@ def tmux_session_exists(session: str) -> bool:
         return False
 
 
+def verified_worktree(repo: Path, worktree: Path, branch: str) -> tuple[Path, str]:
+    root = worktree.resolve()
+    if root == repo.resolve():
+        raise SystemExit("--worktree must not be the controller checkout")
+    top_level = Path(git_output(root, "rev-parse", "--show-toplevel").strip()).resolve()
+    if top_level != root:
+        raise SystemExit("--worktree must be a Git worktree root")
+    registered = {
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in git_output(repo, "worktree", "list", "--porcelain").splitlines()
+        if line.startswith("worktree ")
+    }
+    if root not in registered:
+        raise SystemExit("--worktree must be a registered Git worktree")
+    if git_output(root, "branch", "--show-current").strip() != branch:
+        raise SystemExit("--worktree branch does not match --branch")
+    return root, resolved_commit(root, "HEAD")
+
+
 def command_launch_exec(
     repo: Path, plan: str, run_id: str, task_name: str, branch: str, worktree: Path
 ) -> None:
     if not shutil.which("tmux"):
         raise SystemExit("tmux is required for launch-exec")
+    worktree, base_commit = verified_worktree(repo, worktree, branch)
     task = task_in_progress(repo, plan, task_name)
     directory = ensure_run_dirs(repo, plan, run_id)
     brief = directory / "briefs" / task.path.name
@@ -548,7 +570,7 @@ def command_launch_exec(
     ]
     record = new_runtime_record(
         task=task, plan=plan, run_id=run_id, branch=branch, worktree=worktree,
-        brief=brief, report=report, log=log, command=command,
+        brief=brief, report=report, log=log, command=command, base_commit=base_commit,
     )
     write_runtime_record(record_path, record)
     prompt = (

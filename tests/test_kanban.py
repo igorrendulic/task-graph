@@ -149,7 +149,7 @@ class KanbanTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        self.run_helper("reserve", "--limit", "2", "--run-id", "run-b")
+        self.run_helper("reserve", "--limit", "2", "--run-id", "run-b", "--delivery-mode", "direct-pr")
 
         self.assertTrue((self.repo / ".agent" / self.plan / "todo" / "001-done-in-ledger.md").exists())
         self.assertTrue((self.repo / ".agent" / self.plan / "in-progress" / "002-next.md").exists())
@@ -225,8 +225,10 @@ class KanbanTest(unittest.TestCase):
         write_task(self.repo, self.plan, "todo", "001-work.md", "First Work")
         write_task(self.repo, second_plan, "todo", "001-work.md", "Second Work")
 
-        self.run_helper("reserve", "--limit", "1", "--run-id", "shared-run")
-        self.run_helper("reserve", "--limit", "1", "--run-id", "shared-run", plan=second_plan)
+        self.run_helper("reserve", "--limit", "1", "--run-id", "shared-run", "--delivery-mode", "direct-pr")
+        self.run_helper(
+            "reserve", "--limit", "1", "--run-id", "shared-run", "--delivery-mode", "direct-pr", plan=second_plan
+        )
         self.run_helper("board")
         self.run_helper("board", plan=second_plan)
 
@@ -287,6 +289,7 @@ class KanbanTest(unittest.TestCase):
             log=Path("/tmp/task.log"),
             command=["codex", "exec"],
             started_at=now,
+            base_commit="a" * 40,
         )
 
         self.assertEqual("task-graph-first-plan-run-a-001-work", record["session"])
@@ -294,6 +297,25 @@ class KanbanTest(unittest.TestCase):
         self.assertTrue(KANBAN.is_valid_runtime_record(record))
         record.pop("log")
         self.assertFalse(KANBAN.is_valid_runtime_record(record))
+
+    def test_runtime_record_includes_verified_base_commit(self) -> None:
+        task = KANBAN.Task("in-progress", Path("001-work.md"), "Work", (), "ship")
+
+        record = KANBAN.new_runtime_record(
+            task=task,
+            plan="first-plan",
+            run_id="run-a",
+            branch="task-graph/first-plan/001-work",
+            worktree=Path("/tmp/worktree"),
+            brief=Path("/tmp/brief.md"),
+            report=Path("/tmp/report.md"),
+            log=Path("/tmp/task.log"),
+            command=["codex", "exec"],
+            base_commit="a" * 40,
+        )
+
+        self.assertEqual("a" * 40, record["base_commit"])
+        self.assertTrue(KANBAN.is_valid_runtime_record(record))
 
     def test_launch_exec_refuses_before_writing_when_tmux_is_unavailable(self) -> None:
         write_task(self.repo, self.plan, "in-progress", "001-work.md", "Work")
@@ -309,6 +331,15 @@ class KanbanTest(unittest.TestCase):
                 )
         self.assertFalse((self.repo / ".agent" / self.plan / "runs" / "run-a" / "runtime").exists())
 
+    def test_launch_exec_rejects_controller_checkout_before_runtime_write(self) -> None:
+        write_task(self.repo, self.plan, "in-progress", "001-work.md", "Work")
+        with patch.object(KANBAN.shutil, "which", return_value="/usr/bin/tmux"):
+            with self.assertRaisesRegex(SystemExit, "controller checkout"):
+                KANBAN.command_launch_exec(
+                    self.repo, self.plan, "run-a", "001-work.md", "main", self.repo
+                )
+        self.assertFalse((self.repo / ".agent" / self.plan / "runs" / "run-a" / "runtime").exists())
+
     def test_launch_exec_captures_the_final_report_without_granting_controller_access(self) -> None:
         task_name = "001-work.md"
         run_id = "run-a"
@@ -319,6 +350,7 @@ class KanbanTest(unittest.TestCase):
 
         with (
             patch.object(KANBAN.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"),
+            patch.object(KANBAN, "verified_worktree", return_value=(Path("/tmp/worktree"), "a" * 40)),
             patch.object(
                 KANBAN.subprocess,
                 "run",
@@ -367,6 +399,7 @@ class KanbanTest(unittest.TestCase):
             "command": ["codex", "exec"],
             "branch": "branch",
             "worktree": "/tmp/worktree",
+            "base_commit": "a" * 40,
             "brief": f"briefs/{task_name}",
             "report": f"reports/{task_name}",
             "log": f"logs/{Path(task_name).stem}.log",
