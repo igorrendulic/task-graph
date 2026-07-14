@@ -503,6 +503,18 @@ class KanbanTest(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "unlanded work"):
             KANBAN.command_teardown(self.repo, self.plan, "run-a", "001-work.md", discard=False)
 
+    def test_record_delivery_marks_landed_work_for_teardown(self) -> None:
+        self.write_runtime("run-a", "001-work.md")
+
+        KANBAN.command_record_delivery(self.repo, self.plan, "run-a", "001-work.md", "landed")
+
+        delivery = json.loads(
+            (self.repo / ".agent" / self.plan / "runs" / "run-a" / "delivery" / "001-work.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual("landed", delivery["result"])
+
 
 if __name__ == "__main__":
     unittest.main()

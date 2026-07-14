@@ -88,7 +88,7 @@ Every run records one delivery mode when it is reserved: `no-mistakes` for the f
 
 Before an unattended worker launches, Task Graph verifies that its directory is a registered Git worktree root on the task branch and must not be the controller checkout. Its runtime record preserves that worktree identity and base commit. Status is conservative: a recognized harness process is running, an idle shell is idle or dead, and an unrecognized process or wrapper-owned `bash` pane is `UNKNOWN` and must be inspected rather than relaunched automatically.
 
-After a successful worker report, approved review, and tests, `delivery-ready` states the permitted controller action. `no-mistakes` runs the validation pipeline, `direct-pr` opens a PR, and `local-only` fast-forwards only a clean integration branch. Worktrees with uncommitted or unlanded work are never removed without an explicit discard confirmation.
+After a successful worker report, approved review, and tests, `delivery-ready` states the permitted controller action. `no-mistakes` runs the validation pipeline, `direct-pr` opens a PR, and `local-only` fast-forwards only a clean integration branch. After confirmed delivery, the controller records `record-delivery --result landed`; guarded teardown then distinguishes landed work from discard. Worktrees with uncommitted or unlanded work are never removed without an explicit discard confirmation.
 
 ## Low-intrusion local-worker monitoring
 

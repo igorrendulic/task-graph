@@ -112,7 +112,7 @@ Use this workflow when the user asks to start implementation.
    - For `DONE_WITH_CONCERNS`, read the concerns and resolve them before integration. If the concerns are implementation-local, decide whether to review, dispatch a focused fix, or escalate. If the concerns come from a failed audit or verification report showing the desired outcome was not reached, follow the outcome improvement checkpoint before creating more work.
    - For `NEEDS_CONTEXT`, provide the missing context and re-dispatch the same task.
     - For `BLOCKED`, either provide context, use a more capable agent, split the task, or escalate to the user.
-    - After a successful report, approved review, and test evidence, run `delivery-ready` to select the permitted controller action. `no-mistakes` requires its full pipeline, `direct-pr` opens a PR, and `local-only` fast-forwards only a clean integration branch. With +yolo, the controller may merge a green PR or fast-forward locally; otherwise it asks for approval.
+    - After a successful report, approved review, and test evidence, run `delivery-ready` to select the permitted controller action. `no-mistakes` requires its full pipeline, `direct-pr` opens a PR, and `local-only` fast-forwards only a clean integration branch. With +yolo, the controller may merge a green PR or fast-forward locally; otherwise it asks for approval. After confirmed delivery, record it with `record-delivery --result landed` before teardown.
 14. If a task's `Type` is `scout`, capture its report in the run directory and mark it done after review; do not integrate code unless the user explicitly converts it into ship work.
 15. If only one task is recommended, prefer the same worktree and task-branch flow unless the user explicitly asks for local in-checkout execution.
 16. Before implementing a task locally, clear working context in practice:
@@ -211,6 +211,7 @@ The helper is intentionally conservative:
 - `plan --json --limit <n>` prints the same scheduling decision as structured JSON.
 - `reserve --plan <plan-slug> --limit <n> --run-id <id>` moves the recommended launch batch to `in-progress`, rewrites the board, and initializes `.agent/<plan-slug>/runs/<id>/progress.md`.
 - `delivery-ready --plan <plan-slug> --run-id <id> --task <file>` refuses incomplete evidence and otherwise reports the policy-authorized controller delivery action.
+- `record-delivery --plan <plan-slug> --run-id <id> --task <file> --result landed` records confirmed delivery so guarded teardown can distinguish landed work from discard.
 - `start --plan <plan-slug>` selects the first startable todo task by filename, moves it to `in-progress`, rewrites the board, and prints the task path plus possible parallel candidates.
 - `done --plan <plan-slug> --task <file>` moves a matching in-progress task to `done` and rewrites the board.
 - `archive-diff --plan <plan-slug> --run-id <id> --task <file> --base <commit> --head <commit> --branch <branch> --review <relative-path>` validates an in-progress task and commit revisions, then writes a binary-capable patch and metadata summary to `.agent/<plan-slug>/runs/<id>/diffs/` without changing task state.

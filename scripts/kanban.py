@@ -708,6 +708,18 @@ def delivery_path(repo: Path, plan: str, run_id: str, task_name: str) -> Path:
     return run_dir(repo, plan, run_id) / "delivery" / f"{Path(task_name).stem}.json"
 
 
+def command_record_delivery(repo: Path, plan: str, run_id: str, task_name: str, result: str) -> None:
+    if result != "landed":
+        raise SystemExit("record-delivery requires --result landed")
+    try:
+        record = json.loads(runtime_path(repo, plan, run_id, task_name).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit("record-delivery requires a runtime record") from None
+    if not is_valid_runtime_record(record):
+        raise SystemExit("record-delivery requires a valid runtime record")
+    write_atomic(delivery_path(repo, plan, run_id, task_name), json.dumps({"result": result, "at": utc_now()}) + "\n")
+
+
 def command_teardown(repo: Path, plan: str, run_id: str, task_name: str, discard: bool) -> None:
     try:
         record = json.loads(runtime_path(repo, plan, run_id, task_name).read_text(encoding="utf-8"))
@@ -899,7 +911,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("archive-diff", "board", "plan", "reserve", "start", "done", "launch-exec", "finish-runtime", "delivery-ready", "teardown", "status"),
+        choices=("archive-diff", "board", "plan", "reserve", "start", "done", "launch-exec", "finish-runtime", "delivery-ready", "record-delivery", "teardown", "status"),
     )
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--plan", help="Lowercase kebab-case plan slug")
@@ -913,6 +925,7 @@ def main() -> None:
     parser.add_argument("--delivery-mode", choices=sorted(DELIVERY_MODES))
     parser.add_argument("--yolo", action="store_true", help="Allow green routine delivery for this run")
     parser.add_argument("--discard", action="store_true", help="Explicitly discard unlanded worker work")
+    parser.add_argument("--result", help="Recorded delivery result")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON where supported")
     parser.add_argument("--worktree", type=Path, help="Dedicated task worktree for launch-exec")
     parser.add_argument("--exit-code", type=int, help="Wrapper exit code for finish-runtime")
@@ -986,6 +999,10 @@ def main() -> None:
         if not args.run_id or not args.task:
             raise SystemExit("teardown requires --run-id <id> --task <filename>")
         command_teardown(repo, args.plan, args.run_id, args.task, args.discard)
+    elif args.command == "record-delivery":
+        if not args.run_id or not args.task or not args.result:
+            raise SystemExit("record-delivery requires --run-id <id> --task <filename> --result landed")
+        command_record_delivery(repo, args.plan, args.run_id, args.task, args.result)
 
 
 if __name__ == "__main__":
