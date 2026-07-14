@@ -288,6 +288,36 @@ class KanbanTest(unittest.TestCase):
                 )
         self.assertFalse((self.repo / ".agent" / self.plan / "runs" / "run-a" / "runtime").exists())
 
+    def test_launch_exec_uses_the_supported_workspace_write_command(self) -> None:
+        task_name = "001-work.md"
+        run_id = "run-a"
+        write_task(self.repo, self.plan, "in-progress", task_name, "Work")
+        brief = self.repo / ".agent" / self.plan / "runs" / run_id / "briefs" / task_name
+        brief.parent.mkdir(parents=True)
+        brief.write_text("# Brief\n", encoding="utf-8")
+
+        with (
+            patch.object(KANBAN.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"),
+            patch.object(
+                KANBAN.subprocess,
+                "run",
+                side_effect=[
+                    subprocess.CompletedProcess([], 0),
+                    subprocess.CompletedProcess([], 0),
+                    subprocess.CompletedProcess([], 0, stdout="123\n"),
+                ],
+            ) as run,
+        ):
+            KANBAN.command_launch_exec(
+                self.repo, self.plan, run_id, task_name, "branch", Path("/tmp/worktree")
+            )
+
+        runtime = self.repo / ".agent" / self.plan / "runs" / run_id / "runtime" / "001-work.json"
+        record = json.loads(runtime.read_text(encoding="utf-8"))
+        self.assertEqual(["codex", "exec", "--sandbox", "workspace-write"], record["command"])
+        wrapper = run.call_args_list[0].args[0][-1]
+        self.assertNotIn("--ask-for-approval", wrapper)
+
     def write_runtime(self, run_id: str, task_name: str, **overrides: object) -> Path:
         directory = self.repo / ".agent" / self.plan / "runs" / run_id / "runtime"
         directory.mkdir(parents=True, exist_ok=True)

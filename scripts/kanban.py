@@ -523,7 +523,7 @@ def command_launch_exec(
     if not brief.exists():
         raise SystemExit(f"Task brief does not exist: {brief}")
 
-    command = ["codex", "exec", "--sandbox", "workspace-write", "--ask-for-approval", "never"]
+    command = ["codex", "exec", "--sandbox", "workspace-write"]
     record = new_runtime_record(
         task=task, plan=plan, run_id=run_id, branch=branch, worktree=worktree,
         brief=brief, report=report, log=log, command=command,
