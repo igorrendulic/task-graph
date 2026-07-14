@@ -126,6 +126,22 @@ class SkillDocsTest(unittest.TestCase):
         self.assertIn("delivery-ready", skill)
         self.assertIn("UNKNOWN", skill)
 
+    def test_readme_is_codex_first_guided_reference(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        headings = (
+            "## What it is",
+            "## Features",
+            "## Quick Start",
+            "## How It Works",
+            "## Guarded Delivery",
+            "## Command Reference",
+        )
+
+        for heading in headings:
+            self.assertIn(heading, readme)
+        self.assertLess(readme.index("## Quick Start"), readme.index("Install for Claude Code"))
+        self.assertLess(readme.index("## Guarded Delivery"), readme.index("## Command Reference"))
+
 
 if __name__ == "__main__":
     unittest.main()
