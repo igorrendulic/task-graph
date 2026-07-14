@@ -74,11 +74,11 @@ Subagents use file handoffs rather than long pasted context. The controller writ
 
 ## Execution Modes
 
-Every `$task-graph start` asks the operator how to launch the reserved batch. If no mode is selected, Task Graph announces and uses **Managed workers (default)**.
+Every `$task-graph start` requires an explicit execution-mode selection before Task Graph reserves or launches a batch. It explains all three choices every time. There is no default mode: if no selection is supplied, Task Graph does not reserve tasks, create worktrees, write launch runtime records, or begin execution. Naming a mode in the start request is an explicit selection.
 
-- **Managed workers (default):** launch isolated in-session workers in dedicated worktrees and branches.
-- **Unattended `codex exec`:** tmux is required. Launch one non-interactive CLI process per task from its dedicated worktree with `launch-exec`; it records a durable per-task runtime JSON record before execution and preserves the exited pane for diagnosis. The record includes the tmux session, pane PID, command, branch, worktree, brief/report/log paths, start/finish timestamps, and exit result. It uses workspace-write access and a no-prompt approval policy, never an automatic unsandboxed bypass.
-- **Cloud delegation:** use a supported delegated cloud-task surface and record its remote task identifier and result location. It never silently falls back to local execution.
+- **Managed workers:** in-session subagents, each in an isolated Git worktree and task branch.
+- **Unattended `codex exec`:** non-interactive local CLI workers, one per reserved task, running in tmux. tmux is required; the local machine or remote host must remain awake. `launch-exec` records a durable per-task runtime JSON record before execution and preserves the exited pane for diagnosis. The record includes the tmux session, pane PID, command, branch, worktree, brief/report/log paths, start/finish timestamps, and exit result. It uses workspace-write access and a no-prompt approval policy, never an automatic unsandboxed bypass.
+- **Cloud delegation:** supported remote task execution. Record its remote task identifier and result location; never silently fall back to local execution.
 
 `codex exec` removes interactive approval pauses but is not laptop-independent: a local process still needs an awake machine or remote host. Cloud delegation is the mode for work that must continue after the local machine is unavailable.
 

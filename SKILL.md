@@ -62,11 +62,11 @@ Use this workflow when the user asks to start implementation.
    - Tasks with dependencies still in `todo` or `in-progress` are sequential or blocked and must not be launched.
    - Use a default parallel launch limit of `5` unless the user gives a different limit.
    - Use `plan --json` when machine-readable output is useful for spawning or bookkeeping.
-4. Select an execution mode before reserving the batch. Ask the operator on every `start`, even when a previous run used a mode; an explicit mode in the request answers the question. Offer:
-   - `Managed workers (default)`: the existing in-session subagent workflow.
-   - **Unattended `codex exec`**: non-interactive local CLI processes for each reserved task.
-   - `Cloud delegation`: a supported delegated cloud-task workflow.
-   If the operator does not choose, announce and use `Managed workers (default)`. Record the selected mode in the run ledger before launching work.
+4. Before reserving the batch, explicitly ask the operator which execution mode they want and explain every option:
+   - `Managed workers`: in-session subagents, each in an isolated Git worktree and task branch.
+   - **Unattended `codex exec`**: non-interactive local CLI workers, one per reserved task, running in tmux; the local machine or remote host must remain awake.
+   - `Cloud delegation`: supported remote task execution; never silently fall back to local execution.
+   The operator must explicitly choose one before continuing. There is no default mode. If no selection is supplied, the controller must not reserve tasks, create worktrees, write launch runtime records, or begin execution. An explicit mode in the start request counts as the selection. Record the selected mode in the run ledger before launching work.
 5. Establish an integration branch for the overall implementation plan before launching work:
    - Use the current branch when it is already the intended feature branch.
    - Otherwise create or switch to a feature branch for the plan, for example `task-graph/<plan-slug>`.
