@@ -540,7 +540,9 @@ def tmux_liveness(session: str) -> str:
     command = Path(result.stdout.strip()).name.lower()
     if command in {"codex", "claude", "grok", "opencode"}:
         return "RUNNING"
-    if command in {"zsh", "bash", "sh", "dash", "ash", "ksh", "fish"}:
+    if command == "bash":
+        return "UNKNOWN"
+    if command in {"zsh", "sh", "dash", "ash", "ksh", "fish"}:
         return "IDLE_OR_DEAD"
     return "UNKNOWN"
 

@@ -454,6 +454,13 @@ class KanbanTest(unittest.TestCase):
         with patch.object(KANBAN.subprocess, "run") as run:
             run.side_effect = [
                 subprocess.CompletedProcess([], 0),
+                subprocess.CompletedProcess([], 0, stdout="bash\n"),
+            ]
+            self.assertEqual("UNKNOWN", KANBAN.tmux_liveness("worker"))
+
+        with patch.object(KANBAN.subprocess, "run") as run:
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0),
                 subprocess.CompletedProcess([], 0, stdout="python\n"),
             ]
             self.assertEqual("UNKNOWN", KANBAN.tmux_liveness("worker"))
