@@ -7,11 +7,14 @@ import argparse
 import json
 import re
 import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 
 COLUMNS = ("todo", "in-progress", "done")
+PLAN_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 
 
 @dataclass(frozen=True)
@@ -86,16 +89,22 @@ def agent_dir(repo: Path) -> Path:
     return directory
 
 
-def ensure_dirs(repo: Path) -> None:
-    base = agent_dir(repo) / "tasks"
+def plan_dir(repo: Path, plan: str) -> Path:
+    if not PLAN_SLUG.fullmatch(plan):
+        raise SystemExit("--plan must be a lowercase kebab-case slug")
+    return agent_dir(repo) / plan
+
+
+def ensure_dirs(repo: Path, plan: str) -> None:
+    base = plan_dir(repo, plan)
     for column in COLUMNS:
         (base / column).mkdir(parents=True, exist_ok=True)
 
 
-def read_tasks(repo: Path) -> list[Task]:
-    ensure_dirs(repo)
+def read_tasks(repo: Path, plan: str) -> list[Task]:
+    ensure_dirs(repo, plan)
     tasks: list[Task] = []
-    base = agent_dir(repo) / "tasks"
+    base = plan_dir(repo, plan)
     for column in COLUMNS:
         for path in sorted((base / column).glob("*.md")):
             tasks.append(
@@ -111,12 +120,12 @@ def read_tasks(repo: Path) -> list[Task]:
 
 
 def board_link(task: Task) -> str:
-    rel = f"tasks/{task.column}/{task.path.name}"
+    rel = f"{task.column}/{task.path.name}"
     return f"- [{task.title}]({rel})"
 
 
-def rewrite_board(repo: Path) -> Path:
-    tasks = read_tasks(repo)
+def rewrite_board(repo: Path, plan: str) -> Path:
+    tasks = read_tasks(repo, plan)
     by_column = {column: [] for column in COLUMNS}
     for task in tasks:
         by_column[task.column].append(task)
@@ -132,7 +141,7 @@ def rewrite_board(repo: Path) -> Path:
             lines.append("_None_")
         lines.append("")
 
-    path = agent_dir(repo) / "kanban.md"
+    path = plan_dir(repo, plan) / "kanban.md"
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return path
 
@@ -155,18 +164,18 @@ def active_names(tasks: list[Task]) -> set[str]:
     return names
 
 
-def run_dir(repo: Path, run_id: str) -> Path:
-    return agent_dir(repo) / "runs" / run_id
+def run_dir(repo: Path, plan: str, run_id: str) -> Path:
+    return plan_dir(repo, plan) / "runs" / run_id
 
 
-def progress_path(repo: Path, run_id: str) -> Path:
-    return run_dir(repo, run_id) / "progress.md"
+def progress_path(repo: Path, plan: str, run_id: str) -> Path:
+    return run_dir(repo, plan, run_id) / "progress.md"
 
 
-def completed_names_from_ledger(repo: Path, run_id: str | None) -> set[str]:
+def completed_names_from_ledger(repo: Path, plan: str, run_id: str | None) -> set[str]:
     if not run_id:
         return set()
-    path = progress_path(repo, run_id)
+    path = progress_path(repo, plan, run_id)
     if not path.exists():
         return set()
 
@@ -218,12 +227,12 @@ def launch_batch(startable: list[Task], limit: int) -> list[Task]:
     return selected
 
 
-def schedule_tasks(repo: Path, limit: int, run_id: str | None = None) -> Schedule:
+def schedule_tasks(repo: Path, plan: str, limit: int, run_id: str | None = None) -> Schedule:
     if limit < 1:
         raise SystemExit("--limit must be at least 1")
 
-    tasks = read_tasks(repo)
-    ledger_completed = completed_names_from_ledger(repo, run_id)
+    tasks = read_tasks(repo, plan)
+    ledger_completed = completed_names_from_ledger(repo, plan, run_id)
     completed = done_names(tasks) | ledger_completed
     available = active_names(tasks) | ledger_completed
     todo = sorted((task for task in tasks if task.column == "todo"), key=lambda task: task.path.name)
@@ -288,9 +297,9 @@ def print_schedule_json(schedule: Schedule, limit: int) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
-def ensure_run_dirs(repo: Path, run_id: str) -> Path:
-    directory = run_dir(repo, run_id)
-    for name in ("briefs", "reports", "reviews"):
+def ensure_run_dirs(repo: Path, plan: str, run_id: str) -> Path:
+    directory = run_dir(repo, plan, run_id)
+    for name in ("briefs", "reports", "reviews", "diffs"):
         (directory / name).mkdir(parents=True, exist_ok=True)
     path = directory / "progress.md"
     if not path.exists():
@@ -298,14 +307,14 @@ def ensure_run_dirs(repo: Path, run_id: str) -> Path:
     return directory
 
 
-def append_progress(repo: Path, run_id: str, task: Task, status: str) -> None:
-    path = progress_path(repo, run_id)
+def append_progress(repo: Path, plan: str, run_id: str, task: Task, status: str) -> None:
+    path = progress_path(repo, plan, run_id)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(f"- {task.path.name}: {status} (type {task.task_type})\n")
 
 
-def move_task(repo: Path, source_column: str, dest_column: str, task_name: str | None = None) -> Path:
-    base = agent_dir(repo) / "tasks"
+def move_task(repo: Path, plan: str, source_column: str, dest_column: str, task_name: str | None = None) -> Path:
+    base = plan_dir(repo, plan)
     source = base / source_column
     dest = base / dest_column
     dest.mkdir(parents=True, exist_ok=True)
@@ -322,12 +331,12 @@ def move_task(repo: Path, source_column: str, dest_column: str, task_name: str |
     if target.exists():
         raise SystemExit(f"Destination already exists: {target}")
     shutil.move(str(matches[0]), str(target))
-    rewrite_board(repo)
+    rewrite_board(repo, plan)
     return target
 
 
-def command_start(repo: Path) -> None:
-    tasks = read_tasks(repo)
+def command_start(repo: Path, plan: str) -> None:
+    tasks = read_tasks(repo, plan)
     completed = done_names(tasks)
     todo = sorted((task for task in tasks if task.column == "todo"), key=lambda task: task.path.name)
     startable = [task for task in todo if is_startable(task, completed)]
@@ -336,7 +345,7 @@ def command_start(repo: Path) -> None:
 
     selected = startable[0]
     parallels = parallel_candidates(todo, completed, selected)
-    moved = move_task(repo, "todo", "in-progress", selected.path.name)
+    moved = move_task(repo, plan, "todo", "in-progress", selected.path.name)
     print(f"Started: {moved}")
     if parallels:
         print("Also startable in parallel:")
@@ -344,14 +353,14 @@ def command_start(repo: Path) -> None:
             print(f"- {task.path.name}: {task.title}")
 
 
-def command_plan(repo: Path, limit: int) -> None:
-    schedule = schedule_tasks(repo, limit)
+def command_plan(repo: Path, plan: str, limit: int) -> None:
+    schedule = schedule_tasks(repo, plan, limit)
     print_schedule(schedule, limit)
 
 
-def command_reserve(repo: Path, limit: int, run_id: str) -> None:
-    ensure_run_dirs(repo, run_id)
-    schedule = schedule_tasks(repo, limit, run_id)
+def command_reserve(repo: Path, plan: str, limit: int, run_id: str) -> None:
+    ensure_run_dirs(repo, plan, run_id)
+    schedule = schedule_tasks(repo, plan, limit, run_id)
 
     print(f"Reserved launch batch (limit {limit}):")
     if not schedule.batch:
@@ -359,21 +368,129 @@ def command_reserve(repo: Path, limit: int, run_id: str) -> None:
         return
 
     for task in schedule.batch:
-        moved = move_task(repo, "todo", "in-progress", task.path.name)
-        append_progress(repo, run_id, task, "in-progress")
+        moved = move_task(repo, plan, "todo", "in-progress", task.path.name)
+        append_progress(repo, plan, run_id, task, "in-progress")
         print(f"- {task.path.name}: {task.title} -> {moved}")
 
 
-def command_done(repo: Path, task_name: str) -> None:
-    moved = move_task(repo, "in-progress", "done", task_name)
+def command_done(repo: Path, plan: str, task_name: str) -> None:
+    moved = move_task(repo, plan, "in-progress", "done", task_name)
     print(f"Done: {moved}")
+
+
+def git_output(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise SystemExit(detail or f"git {' '.join(args)} failed")
+    return result.stdout
+
+
+def resolved_commit(repo: Path, revision: str) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{revision}^{{commit}}"],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode:
+        raise SystemExit(f"unknown revision: {revision}")
+    return result.stdout.strip()
+
+
+def task_in_progress(repo: Path, plan: str, task_name: str) -> Task:
+    matches = [
+        task
+        for task in read_tasks(repo, plan)
+        if task.column == "in-progress" and task.path.name == task_name
+    ]
+    if not matches:
+        raise SystemExit(f"Task is not in progress for plan {plan}: {task_name}")
+    return matches[0]
+
+
+def safe_relative_path(value: str, label: str) -> Path:
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise SystemExit(f"{label} must be a relative path within the run directory")
+    return path
+
+
+def write_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+    ) as handle:
+        handle.write(content)
+        temporary = Path(handle.name)
+    temporary.replace(path)
+
+
+def command_archive_diff(
+    repo: Path,
+    plan: str,
+    run_id: str,
+    task_name: str,
+    base: str,
+    head: str,
+    branch: str,
+    review: str,
+) -> None:
+    task = task_in_progress(repo, plan, task_name)
+    base_commit = resolved_commit(repo, base)
+    head_commit = resolved_commit(repo, head)
+    review_path = safe_relative_path(review, "--review")
+    patch = git_output(repo, "diff", "--binary", "--full-index", f"{base_commit}..{head_commit}")
+    stat = git_output(repo, "diff", "--stat", f"{base_commit}..{head_commit}").rstrip()
+
+    directory = ensure_run_dirs(repo, plan, run_id) / "diffs"
+    patch_path = directory / f"{task.path.stem}.patch"
+    summary_path = directory / f"{task.path.stem}.md"
+    summary = "\n".join(
+        [
+            f"# Diff Package: {task.path.name}",
+            "",
+            f"- Task: `{task.path.name}`",
+            f"- Branch: `{branch}`",
+            f"- Base commit: `{base_commit}`",
+            f"- Head commit: `{head_commit}`",
+            f"- Review: `{review_path.as_posix()}`",
+            "- Review status: `pending`",
+            f"- Patch: `diffs/{patch_path.name}`",
+            "",
+            "## Changed Files",
+            "",
+            "```text",
+            stat or "No changed files.",
+            "```",
+            "",
+        ]
+    )
+    write_atomic(patch_path, patch)
+    write_atomic(summary_path, summary)
+    print(f"Patch: {patch_path}")
+    print(f"Summary: {summary_path}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("board", "plan", "reserve", "start", "done"))
+    parser.add_argument("command", choices=("archive-diff", "board", "plan", "reserve", "start", "done"))
     parser.add_argument("--repo", type=Path, default=Path.cwd())
+    parser.add_argument("--plan", required=True, help="Lowercase kebab-case plan slug")
     parser.add_argument("--task", help="Task filename for the done command")
+    parser.add_argument("--base", help="Base commit for archive-diff")
+    parser.add_argument("--head", help="Head commit for archive-diff")
+    parser.add_argument("--branch", help="Task branch for archive-diff")
+    parser.add_argument("--review", help="Relative review path for archive-diff")
     parser.add_argument("--limit", type=int, default=5, help="Maximum recommended parallel launch count")
     parser.add_argument("--run-id", help="Run identifier for run ledger commands")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON where supported")
@@ -381,9 +498,9 @@ def main() -> None:
 
     repo = args.repo.resolve()
     if args.command == "board":
-        print(f"Board: {rewrite_board(repo)}")
+        print(f"Board: {rewrite_board(repo, args.plan)}")
     elif args.command == "plan":
-        schedule = schedule_tasks(repo, args.limit)
+        schedule = schedule_tasks(repo, args.plan, args.limit)
         if args.json:
             print_schedule_json(schedule, args.limit)
         else:
@@ -391,13 +508,35 @@ def main() -> None:
     elif args.command == "reserve":
         if not args.run_id:
             raise SystemExit("reserve requires --run-id <id>")
-        command_reserve(repo, args.limit, args.run_id)
+        command_reserve(repo, args.plan, args.limit, args.run_id)
     elif args.command == "start":
-        command_start(repo)
+        command_start(repo, args.plan)
     elif args.command == "done":
         if not args.task:
             raise SystemExit("done requires --task <filename>")
-        command_done(repo, args.task)
+        command_done(repo, args.plan, args.task)
+    elif args.command == "archive-diff":
+        required = {
+            "--run-id": args.run_id,
+            "--task": args.task,
+            "--base": args.base,
+            "--head": args.head,
+            "--branch": args.branch,
+            "--review": args.review,
+        }
+        missing = [flag for flag, value in required.items() if not value]
+        if missing:
+            raise SystemExit(f"archive-diff requires {' '.join(missing)}")
+        command_archive_diff(
+            repo,
+            args.plan,
+            args.run_id,
+            args.task,
+            args.base,
+            args.head,
+            args.branch,
+            args.review,
+        )
 
 
 if __name__ == "__main__":

@@ -32,7 +32,7 @@ Task Graph makes the execution boundary explicit: first write or approve the pla
 
 ## What It Does
 
-Task Graph manages project-local agent work inside `.agent/`.
+Task Graph manages project-local agent work in a separate `.agent/<plan-slug>/` directory for each implementation plan.
 
 It helps you:
 
@@ -53,23 +53,48 @@ When Task Graph launches subagents, each subagent should work in its own Git wor
 
 By default, one approved implementation plan integrates into one feature branch. After final review and verification, Task Graph should report the branch, commits, verification results, and review notes, then ask whether you want a GitHub PR created. It should not create a PR unless you explicitly confirm. Task branches are temporary, reviewable artifacts for isolated agent work; they do not each become a GitHub PR unless you explicitly ask for that or the tasks are independently shippable.
 
-The main agent owns `.agent` task state during this flow. It moves launched tasks to `in-progress` before creating task worktrees. Subagents should not move files under `.agent/tasks/` or rewrite `.agent/kanban.md`; they commit only their task's code, tests, and documentation changes. After the main agent integrates and verifies a task branch, it moves that task to `done` and regenerates the board.
+The main agent owns `.agent/<plan-slug>/` task state during this flow. It derives and announces the short lowercase kebab-case plan slug from the approved plan, then passes it to every helper command. It moves launched tasks to `in-progress` before creating task worktrees. Subagents should not move files under the selected plan directory or rewrite its board; they commit only their task's code, tests, and documentation changes. After the main agent integrates and verifies a task branch, it moves that task to `done` and regenerates the board.
 
 ## Durable Runs
 
-Task Graph stores per-run coordination files under `.agent/runs/<run-id>/`:
+Task Graph stores per-run coordination files under `.agent/<plan-slug>/runs/<run-id>/`:
 
 ```text
-.agent/runs/<run-id>/
+.agent/<plan-slug>/runs/<run-id>/
   progress.md
   briefs/
   reports/
   reviews/
+  diffs/
 ```
 
 The run ledger lets the controller recover after compaction or restart. A task marked complete in `progress.md` is treated as done for launch purposes and is not reserved again.
 
 Subagents use file handoffs rather than long pasted context. The controller writes a task brief, the subagent writes a report, and reviews can use the report plus a focused diff package. Subagents report one of `DONE`, `DONE_WITH_CONCERNS`, `NEEDS_CONTEXT`, or `BLOCKED`; the controller reviews and integrates only after the status is resolved.
+
+## Execution Modes
+
+Every `$task-graph start` asks the operator how to launch the reserved batch. If no mode is selected, Task Graph announces and uses **Managed workers (default)**.
+
+- **Managed workers (default):** launch isolated in-session workers in dedicated worktrees and branches.
+- **Unattended `codex exec`:** launch one non-interactive CLI process per task from its dedicated worktree. The ledger records the command, process identifier, branch, paths to the brief, report, and log, and the start time so a later run can inspect it before retrying. It uses workspace-write access and a no-prompt approval policy, never an automatic unsandboxed bypass.
+- **Cloud delegation:** use a supported delegated cloud-task surface and record its remote task identifier and result location. It never silently falls back to local execution.
+
+`codex exec` removes interactive approval pauses but is not laptop-independent: a local process still needs an awake machine or remote host. Cloud delegation is the mode for work that must continue after the local machine is unavailable.
+
+## Faster DAG Batches
+
+Task Graph launches the entire currently unblocked batch, up to the selected limit. It collects, reviews, integrates, and verifies that independent batch before calculating the next one, so dependents start immediately after their prerequisites are proven. During task creation, tightly coupled linear work should be coalesced into one bounded task; use separate task files only for real parallelism or independently reviewable milestones.
+
+## Portable diff packages
+
+Before integrating each completed `ship` task, archive its task-branch delta with the helper:
+
+```bash
+python3 <skill-dir>/scripts/kanban.py archive-diff --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --base <base-commit> --head <task-head-commit> --branch <task-branch> --review reviews/001-example.md
+```
+
+The command writes a binary-capable unified patch and a concise metadata summary under `.agent/<plan-slug>/runs/<run-id>/diffs/`. The controller links both paths from the task review and completion ledger entry after integration verification.
 
 ## Improvement Loop Checkpoints
 
@@ -85,13 +110,15 @@ Each target project uses this layout:
 
 ```text
 .agent/
-  kanban.md
-  runs/
-  tasks/
+  <plan-slug>/
+    kanban.md
     todo/
     in-progress/
     done/
+    runs/
 ```
+
+Plans are intentionally isolated: the helper requires `--plan <plan-slug>` for every command and never reads or updates the legacy shared `.agent/tasks`, `.agent/kanban.md`, or `.agent/runs` layout. This allows independent task groups to use the same task names and run IDs without collision.
 
 The skill includes a helper script:
 
@@ -171,37 +198,37 @@ Optionally you can also call the helper directly.
 Inspect the task graph:
 
 ```bash
-python3 <skill-dir>/scripts/kanban.py plan --repo <repo-root> --limit 5
+python3 <skill-dir>/scripts/kanban.py plan --repo <repo-root> --plan <plan-slug> --limit 5
 ```
 
 Inspect the task graph as JSON:
 
 ```bash
-python3 <skill-dir>/scripts/kanban.py plan --repo <repo-root> --limit 5 --json
+python3 <skill-dir>/scripts/kanban.py plan --repo <repo-root> --plan <plan-slug> --limit 5 --json
 ```
 
 Reserve the next launch batch for a run:
 
 ```bash
-python3 <skill-dir>/scripts/kanban.py reserve --repo <repo-root> --limit 5 --run-id <run-id>
+python3 <skill-dir>/scripts/kanban.py reserve --repo <repo-root> --plan <plan-slug> --limit 5 --run-id <run-id>
 ```
 
 Start the next unblocked task:
 
 ```bash
-python3 <skill-dir>/scripts/kanban.py start --repo <repo-root>
+python3 <skill-dir>/scripts/kanban.py start --repo <repo-root> --plan <plan-slug>
 ```
 
 Mark a verified task as done:
 
 ```bash
-python3 <skill-dir>/scripts/kanban.py done --repo <repo-root> --task 001-example.md
+python3 <skill-dir>/scripts/kanban.py done --repo <repo-root> --plan <plan-slug> --task 001-example.md
 ```
 
 Regenerate the board:
 
 ```bash
-python3 <skill-dir>/scripts/kanban.py board --repo <repo-root>
+python3 <skill-dir>/scripts/kanban.py board --repo <repo-root> --plan <plan-slug>
 ```
 
 ## Task Contract
