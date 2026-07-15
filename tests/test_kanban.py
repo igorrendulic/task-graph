@@ -515,6 +515,35 @@ class KanbanTest(unittest.TestCase):
         )
         self.assertEqual("landed", delivery["result"])
 
+    def test_teardown_kills_recorded_tmux_session(self) -> None:
+        self.write_runtime("run-a", "001-work.md")
+        KANBAN.command_record_delivery(self.repo, self.plan, "run-a", "001-work.md", "landed")
+
+        with patch.object(KANBAN, "git_output", return_value=""), patch.object(
+            KANBAN.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)
+        ) as run:
+            KANBAN.command_teardown(self.repo, self.plan, "run-a", "001-work.md", discard=False)
+
+        calls = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["git", "worktree", "remove", "/tmp/worktree"], calls)
+        self.assertIn(
+            ["tmux", "kill-session", "-t", "task-graph-first-plan-run-a-001-work"], calls
+        )
+
+    def test_teardown_allows_already_absent_tmux_session(self) -> None:
+        self.write_runtime("run-a", "001-work.md")
+        KANBAN.command_record_delivery(self.repo, self.plan, "run-a", "001-work.md", "landed")
+
+        with patch.object(KANBAN, "git_output", return_value=""), patch.object(
+            KANBAN.subprocess,
+            "run",
+            side_effect=[
+                subprocess.CompletedProcess([], 0),
+                subprocess.CompletedProcess([], 1, stderr="can't find session: worker"),
+            ],
+        ):
+            KANBAN.command_teardown(self.repo, self.plan, "run-a", "001-work.md", discard=False)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -59,7 +59,7 @@ The flow is simple:
 2. Let the worker make the change in its own Git worktree.
 3. Review and verify the result.
 4. Deliver the verified change, then record what landed.
-5. Record delivery before cleaning up the task worktree.
+5. Record delivery before cleaning up that task's worktree and tmux session; do so after integration and verification, before marking it done.
 
 ### Choose a delivery mode
 
@@ -75,7 +75,7 @@ Every run chooses one mode before workers start:
 
 Before `launch-exec`, Task Graph confirms that a worker is in its registered Git worktree on the right task branch, never in the controller checkout. It records the worktree, branch, and base commit so the controller can identify exactly what the worker started from. If it cannot recognize a running process, it marks it `UNKNOWN` and asks for inspection instead of guessing that it is safe to relaunch.
 
-After a successful report, approved review, and tests, `delivery-ready` tells the controller which delivery action the chosen mode permits. Once the change is confirmed delivered, `record-delivery --result landed` records that fact. Teardown then refuses to remove dirty or unlanded work unless the controller explicitly chooses to discard it.
+After a successful report, approved review, and tests, `delivery-ready` tells the controller which delivery action the chosen mode permits. `DONE` is review-ready only: retain the task worktree and tmux session through diff inspection, verification, task-commit creation, and integration. Once that task is integrated and verified, `record-delivery --result landed` records the result. Immediately run teardown before marking that task done; it removes both the dedicated worktree and its recorded tmux session. This per-task cleanup does not wait for the plan's final PR. Retain failed or retrying sessions for diagnosis; teardown still refuses dirty or unlanded work unless the controller explicitly chooses to discard it.
 
 ## Low-Intrusion Monitoring
 

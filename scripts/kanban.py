@@ -740,6 +740,14 @@ def command_teardown(repo: Path, plan: str, run_id: str, task_name: str, discard
     result = subprocess.run(["git", "worktree", "remove", str(worktree)], cwd=repo, text=True, capture_output=True)
     if result.returncode:
         raise SystemExit(result.stderr.strip() or "git worktree remove failed")
+    tmux = subprocess.run(
+        ["tmux", "kill-session", "-t", str(record["session"])],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+    )
+    if tmux.returncode and "can't find session" not in tmux.stderr.lower():
+        raise SystemExit(tmux.stderr.strip() or tmux.stdout.strip() or "tmux failed to remove session")
 
 
 def status_entry(
