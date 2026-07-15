@@ -126,6 +126,16 @@ class SkillDocsTest(unittest.TestCase):
         self.assertIn("delivery-ready", skill)
         self.assertIn("UNKNOWN", skill)
 
+    def test_readme_explains_why_guarded_delivery_exists(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "the safe handoff from an isolated task worktree to delivery",
+            readme,
+        )
+        self.assertIn("Choose how the completed work should be delivered", readme)
+        self.assertIn("Record delivery before cleaning up", readme)
+
     def test_readme_is_codex_first_guided_reference(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         headings = (

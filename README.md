@@ -51,17 +51,31 @@ Task Graph keeps one integration branch for a plan. Each worker owns one task in
 
 ## Guarded Delivery
 
-Every run chooses one delivery mode:
+Guarded Delivery is the safe handoff from an isolated task worktree to delivery. It exists because a worker finishing its code is not the same as that code being ready to merge: the controller still needs to know what changed, confirm it was reviewed and tested, and avoid losing work during cleanup.
 
-- `no-mistakes`: complete the project validation pipeline, then deliver a green PR.
-- `direct-pr`: verify and review work, then deliver a PR without that pipeline.
-- `local-only`: verify and review work, then fast-forward a clean local integration branch.
+The flow is simple:
 
-Add `+yolo` only for a run where the controller may complete routine green delivery. It never authorizes failed verification, a security-sensitive or irreversible action, or an explicit discard.
+1. Choose how the completed work should be delivered.
+2. Let the worker make the change in its own Git worktree.
+3. Review and verify the result.
+4. Deliver the verified change, then record what landed.
+5. Record delivery before cleaning up the task worktree.
 
-Before `launch-exec`, Task Graph verifies that the task directory is a registered Git worktree root on the task branch and must not be the controller checkout. Runtime records retain its base commit and identity. A recognized harness process is `RUNNING`; an idle shell is idle or dead; a wrapper-owned `bash` pane or unfamiliar process is `UNKNOWN` and must be inspected rather than relaunched automatically.
+### Choose a delivery mode
 
-After a successful report, approved review, and tests, use `delivery-ready` to select the permitted controller action. After confirmed delivery, record `record-delivery --result landed`. Teardown refuses dirty or unlanded work unless the controller supplies an explicit discard.
+Every run chooses one mode before workers start:
+
+- `no-mistakes`: choose this when the task must complete the project's full validation pipeline before Task Graph delivers a green PR.
+- `direct-pr`: choose this when normal review and verification are sufficient, and Task Graph should deliver a PR without the extra pipeline.
+- `local-only`: choose this when the work should stay local; Task Graph verifies and reviews it, then fast-forwards a clean local integration branch.
+
+`+yolo` is optional. It lets the controller complete a routine green delivery after the required checks pass, so you do not need to approve that last ordinary step. It never skips failed verification or authorizes a security-sensitive action, an irreversible action, or an explicit discard.
+
+### What Task Graph protects
+
+Before `launch-exec`, Task Graph confirms that a worker is in its registered Git worktree on the right task branch, never in the controller checkout. It records the worktree, branch, and base commit so the controller can identify exactly what the worker started from. If it cannot recognize a running process, it marks it `UNKNOWN` and asks for inspection instead of guessing that it is safe to relaunch.
+
+After a successful report, approved review, and tests, `delivery-ready` tells the controller which delivery action the chosen mode permits. Once the change is confirmed delivered, `record-delivery --result landed` records that fact. Teardown then refuses to remove dirty or unlanded work unless the controller explicitly chooses to discard it.
 
 ## Low-Intrusion Monitoring
 
