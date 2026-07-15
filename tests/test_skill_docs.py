@@ -25,6 +25,19 @@ class SkillDocsTest(unittest.TestCase):
         self.assertIn("`Stop`", skill)
         self.assertIn("`Continue`", skill)
 
+    def test_continue_launches_one_linked_improvement_attempt(self) -> None:
+        skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("Continue authorizes exactly one focused improvement-and-audit loop", skill)
+        self.assertIn("must not end the turn after only creating retry artifacts", skill)
+        self.assertIn("<run-id>-task<task-prefix>-retry<N>", skill)
+        self.assertIn("inherits the parent execution mode, delivery mode, and `+yolo` setting", skill)
+        self.assertIn("fresh child worktree and child branch from the failed task branch's verified HEAD", skill)
+        self.assertIn("return to this Stop/Continue checkpoint", skill)
+        self.assertIn("Continue immediately launches exactly one focused repair-and-audit attempt", readme)
+        self.assertIn("A later failed audit requires another Stop or Continue decision", readme)
+
     def test_readme_documents_improvement_loop_checkpoint(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
 

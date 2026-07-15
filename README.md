@@ -129,7 +129,7 @@ Diff packages preserve the reviewed task delta and its metadata under `.agent/<p
 
 ## Improvement Loop Checkpoints
 
-After each failed audit, the controller reports the remaining gap and asks whether to stop with the current unresolved result or continue into another focused improvement-and-audit loop. It never launches another improvement loop without that decision.
+After each failed audit, the controller reports the remaining gap and asks whether to stop with the current unresolved result or continue into another focused improvement-and-audit loop. It never launches another improvement loop without that decision. Continue immediately launches exactly one focused repair-and-audit attempt: it creates a linked child attempt, inherits the selected execution and delivery policy, prepares a focused brief, and starts a fresh isolated worker from the failed task branch's verified HEAD. A later failed audit requires another Stop or Continue decision.
 
 ## Installation and Other Harnesses
 

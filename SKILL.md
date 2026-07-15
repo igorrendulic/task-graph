@@ -147,7 +147,15 @@ Do not create, reserve, dispatch, or run another improvement loop until the user
 Ask the user to choose between:
 
 - `Stop`: stop chasing the outcome for now, report the current unresolved state, and leave remaining work unresolved.
-- `Continue`: create or run the next focused improvement-and-audit loop aimed only at the remaining gap.
+- `Continue`: authorize exactly one focused improvement-and-audit loop aimed only at the remaining gap.
+
+Continue authorizes exactly one focused improvement-and-audit loop. After an explicit `Continue`, complete the following before ending the current controller turn:
+
+1. Derive the child attempt id `<run-id>-task<task-prefix>-retry<N>`, where `N` is one greater than the visible prior attempts for that parent run and task. Create its run artifacts and append a `progress.md` entry naming the parent run and task, remaining gap, retry number, and inherited policy.
+2. The child attempt inherits the parent execution mode, delivery mode, and `+yolo` setting. Write a focused retry brief containing only the remaining gap and the failed audit evidence.
+3. Create a fresh child worktree and child branch from the failed task branch's verified HEAD; retain the failed worktree unless normal delivery or an explicit discard permits teardown.
+4. Launch the inherited worker mode for the same in-progress task: dispatch the managed worker, run `launch-exec`, or launch the supported cloud task. The controller must not end the turn after only creating retry artifacts.
+5. Review and audit that one repair attempt using the normal task lifecycle. If it still returns `DONE_WITH_CONCERNS`, return to this Stop/Continue checkpoint; do not create another attempt without a new explicit `Continue`.
 
 Apply this checkpoint after each failed audit, including the first failed audit. Do not wait for repeated failures. If an audit returns `DONE` and the target outcome is met, continue the normal review, integration, and verification flow without asking for another loop.
 
