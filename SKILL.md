@@ -97,10 +97,10 @@ Use this workflow when the user asks to start implementation.
    - Reply with only status, task branch, worktree path, commit SHA, one-line test summary, concerns, and report path.
 9. For **Unattended `codex exec`**, tmux is required. After writing the task brief, use `launch-exec` for each reserved task in its dedicated worktree; it writes a durable runtime record before execution, captures output in a task-specific log, and preserves the exited pane for diagnosis. It runs `codex exec` with the normal workspace-write sandbox and the installed CLI's execution policy; never automatically use `--dangerously-bypass-approvals-and-sandbox`. The launcher persists the worker's final response to the controller-owned report path with `--output-last-message`; require that response to include one of the task status values below, a summary, tests, concerns, and a suggested commit message. The worker must edit and test only in its task worktree, and must not write run artifacts or commit. `DONE` means the task is ready for review, not cleanup: retain its worktree and tmux session through diff inspection, verification, task-commit creation, and integration. The runtime record contains the tmux session, pane PID (the process identifier), command, worktree, branch, brief/report/log paths, start/finish timestamps, and exit result. On resume, inspect the runtime record, report, and log before retrying; do not relaunch a completed task. Local `codex exec` still requires an awake machine or remote host.
 10. Monitor each unattended local worker with low intrusion:
-   - Run one standalone `python3 <skill-dir>/scripts/kanban.py status --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task <task-file> --json` probe immediately after launch. This is a standalone `status --json` check.
-   - Before every later probe, use the platform-native wait mechanism for 60 seconds. Do not schedule automatic checks more often than once per minute.
-   - Stop automatic polling as soon as the status is `SUCCEEDED_AWAITING_REVIEW`, `NEEDS_ATTENTION`, `STALE`, or `UNKNOWN`.
-   - The controller must never use shell `sleep`, compound commands, or `status --watch` for controller monitoring. Each automatic status probe must remain a standalone read-only command.
+   - Run a standalone bounded checkpoint immediately after launch: `python3 <skill-dir>/scripts/kanban.py watch-exec --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task <task-file> --seconds 60`.
+   - Repeat bounded `watch-exec` checkpoints while work is expected. Do not manually poll `status --json`; `watch-exec` probes immediately, then polls every five seconds and returns early for `SUCCEEDED_AWAITING_REVIEW`, `NEEDS_ATTENTION`, `STALE`, or `UNKNOWN`.
+   - A quiet checkpoint exits `124` after its `--seconds` bound. It is read-only and must not reserve, relaunch, move, deliver, or clean up work.
+   - The controller must never use shell `sleep`, compound commands, or `status --watch` for controller monitoring. `status` and `status --watch` remain explicit human dashboards.
 11. For `Cloud delegation`, launch only when the selected Codex surface and workspace policy support it. Record the cloud task identifier, task branch/worktree or remote checkout reference, and result/report location in the run ledger. Do not fall back from cloud delegation to local execution without asking the operator.
 12. Every worker, exec process, or cloud task must report one of these statuses:
    - `DONE`: implementation is complete and ready for review.
@@ -109,7 +109,8 @@ Use this workflow when the user asks to start implementation.
    - `BLOCKED`: the task cannot be completed as scoped.
 13. Handle every result from the entire currently unblocked batch before launching its dependents:
    - For each `DONE`, ensure the task branch has a verified task commit. For unattended workers, the controller creates this commit from the dedicated worktree before continuing. Run `archive-diff` with the recorded task base and head commits, then run a task-scoped review for spec compliance and code quality. Link the patch and summary paths from the review note and final ledger entry.
-   - For `DONE_WITH_CONCERNS`, read the concerns and resolve them before integration. If the concerns are implementation-local, decide whether to review, dispatch a focused fix, or escalate. If the concerns come from a failed audit or verification report showing the desired outcome was not reached, follow the outcome improvement checkpoint before creating more work.
+   - For `DONE_WITH_CONCERNS`, `watch-exec` exposes the final report status at its wake-up boundary. The controller must read the persisted report and automatically launch exactly one focused repair-and-audit attempt before integration. It must not end the controller turn before launching that repair. Do not ask the user to nudge the controller or choose whether to run this first repair. The attempt inherits the execution mode, delivery mode, and `+yolo` setting; uses a fresh child worktree and branch from the failed task branch's verified HEAD; and receives a brief restricted to the reported concerns and failed evidence. Review and audit the repair through the normal task lifecycle.
+   - After that repair attempt, always report the retry outcome to the user: repaired and ready for normal integration, still unresolved with the report path and remaining gap, or blocked/needs context. If it again returns `DONE_WITH_CONCERNS`, the controller must not automatically retry again; use the post-retry improvement checkpoint.
    - For `NEEDS_CONTEXT`, provide the missing context and re-dispatch the same task.
     - For `BLOCKED`, either provide context, use a more capable agent, split the task, or escalate to the user.
     - After a successful report, approved review, and test evidence, run `delivery-ready` to select the permitted controller action. `no-mistakes` requires its full pipeline, `direct-pr` opens a PR, and `local-only` fast-forwards only a clean integration branch. With +yolo, the controller may merge a green PR or fast-forward locally; otherwise it asks for approval. After the task commit is integrated and verification passes, record it with `record-delivery --result landed`, then immediately run teardown before marking that task done. Teardown removes both the dedicated worktree and recorded tmux session; it happens per task and does not wait for the plan's final PR. Retain failed or retrying sessions for diagnosis, and use `--discard` only after explicitly abandoning unlanded work.
@@ -132,9 +133,9 @@ Use this workflow when the user asks to start implementation.
 22. Stop before creating any GitHub PR. Report the integration branch, commits, verification results, and review notes, then ask the user whether they want a PR created.
 23. Create a GitHub PR only after the user explicitly confirms. Create separate PRs per task branch only when the user explicitly asks or the tasks are independently shippable.
 
-### Outcome improvement checkpoints
+### Post-retry improvement checkpoints
 
-Use this checkpoint when a failed audit or verification report returns `DONE_WITH_CONCERNS` because the target outcome is still not met. An improvement loop is a focused implementation attempt followed by an audit or verification task for the same outcome.
+Use this checkpoint only after the automatic focused repair-and-audit attempt returns `DONE_WITH_CONCERNS` because the target outcome is still not met. An improvement loop is a focused implementation attempt followed by an audit or verification task for the same outcome.
 
 Do not create, reserve, dispatch, or run another improvement loop until the user chooses what to do next. First read the audit report and present a concise checkpoint with:
 
@@ -157,7 +158,7 @@ Continue authorizes exactly one focused improvement-and-audit loop. After an exp
 4. Launch the inherited worker mode for the same in-progress task: dispatch the managed worker, run `launch-exec`, or launch the supported cloud task. The controller must not end the turn after only creating retry artifacts.
 5. Review and audit that one repair attempt using the normal task lifecycle. If it still returns `DONE_WITH_CONCERNS`, return to this Stop/Continue checkpoint; do not create another attempt without a new explicit `Continue`.
 
-Apply this checkpoint after each failed audit, including the first failed audit. Do not wait for repeated failures. If an audit returns `DONE` and the target outcome is met, continue the normal review, integration, and verification flow without asking for another loop.
+Apply this checkpoint after each failed retry audit. Do not wait for repeated failures. If an audit returns `DONE` and the target outcome is met, continue the normal review, integration, verification flow, and required outcome update without asking for another loop.
 
 Use the helper to plan parallel work without moving files:
 
@@ -204,6 +205,8 @@ python3 <skill-dir>/scripts/kanban.py launch-exec --repo <repo-root> --plan <pla
 Observe all active task executions without changing state:
 
 ```bash
+python3 <skill-dir>/scripts/kanban.py watch-exec --repo <repo-root> --seconds 180
+python3 <skill-dir>/scripts/kanban.py watch-exec --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --seconds 60
 python3 <skill-dir>/scripts/kanban.py status --repo <repo-root>
 python3 <skill-dir>/scripts/kanban.py status --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --json
 python3 <skill-dir>/scripts/kanban.py status --repo <repo-root> --watch --interval 2
@@ -224,6 +227,7 @@ The helper is intentionally conservative:
 - `done --plan <plan-slug> --task <file>` moves a matching in-progress task to `done` and rewrites the board.
 - `archive-diff --plan <plan-slug> --run-id <id> --task <file> --base <commit> --head <commit> --branch <branch> --review <relative-path>` validates an in-progress task and commit revisions, then writes a binary-capable patch and metadata summary to `.agent/<plan-slug>/runs/<id>/diffs/` without changing task state.
 - `launch-exec --plan <plan-slug> --run-id <id> --task <file> --branch <branch> --worktree <path>` requires tmux and starts one reserved in-progress task in a deterministic session.
+- `watch-exec [--plan <plan-slug>] [--run-id <id>] [--task <file>] --seconds <positive-int>` is a foreground-only, read-only controller checkpoint. It polls every five seconds, exits early on an actionable worker status, displays the persisted final report status, exits successfully when no active worker remains, and exits `124` on a quiet timeout.
 - `status [--plan <plan-slug>] [--run-id <id>] [--task <file>] [--json]` is read-only. `status --watch [--interval <seconds>]` redraws the same data in place.
 - Dependencies are parsed from the `## Dependencies` section as task filenames when present. `None` means no blocker.
 - Task type is parsed from `## Type`; supported values are `ship` and `scout`, and omitted or unknown values default to `ship`.

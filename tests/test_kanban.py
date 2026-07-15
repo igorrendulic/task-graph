@@ -1,5 +1,6 @@
 import json
 import importlib.util
+import io
 import subprocess
 import sys
 import tempfile
@@ -476,6 +477,89 @@ class KanbanTest(unittest.TestCase):
         self.assertEqual(1, len(payload["tasks"]))
         self.assertEqual("001-work.md", payload["tasks"][0]["task"])
         self.assertEqual(before, sorted(path.relative_to(self.repo) for path in self.repo.rglob("*")))
+
+    def test_status_exposes_done_with_concerns_for_controller_recovery(self) -> None:
+        write_task(self.repo, self.plan, "in-progress", "001-work.md", "Work")
+        self.write_runtime("run-a", "001-work.md", finished_at=datetime.now(UTC).isoformat(), exit_code=0)
+        report = self.repo / ".agent" / self.plan / "runs" / "run-a" / "reports" / "001-work.md"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text("DONE_WITH_CONCERNS\nConcern: missing edge-case coverage\n", encoding="utf-8")
+
+        entries = KANBAN.collect_status(self.repo, tmux_alive=lambda _session: "IDLE_OR_DEAD")
+
+        self.assertEqual(1, len(entries))
+        self.assertEqual("NEEDS_ATTENTION", entries[0]["state"])
+        self.assertEqual("DONE_WITH_CONCERNS", entries[0]["report_status"])
+        self.assertIn("report", entries[0]["recovery_hint"])
+
+    def test_watch_exec_signals_each_actionable_status_without_changing_artifacts(self) -> None:
+        before = sorted(path.relative_to(self.repo) for path in self.repo.rglob("*"))
+        for state in ("SUCCEEDED_AWAITING_REVIEW", "NEEDS_ATTENTION", "STALE", "UNKNOWN"):
+            with self.subTest(state=state), patch.object(
+                KANBAN,
+                "collect_status",
+                return_value=[{
+                    "plan": self.plan,
+                    "run_id": "run-a",
+                    "task": "001-work.md",
+                    "state": state,
+                    "elapsed": 1,
+                    "session": "worker",
+                    "last_activity": None,
+                    "recovery_hint": "Inspect.",
+                }],
+            ) as collect, patch("sys.stdout", new_callable=io.StringIO) as output:
+                self.assertEqual(
+                    0,
+                    KANBAN.command_watch_exec(self.repo, self.plan, "run-a", "001-work.md", 5),
+                )
+
+            self.assertIn(f"signal: {state}", output.getvalue())
+            self.assertIn("001-work.md", output.getvalue())
+            collect.assert_called_once_with(self.repo, self.plan, "run-a", "001-work.md")
+        self.assertEqual(before, sorted(path.relative_to(self.repo) for path in self.repo.rglob("*")))
+
+    def test_watch_exec_times_out_while_workers_are_running(self) -> None:
+        running = [{
+            "plan": self.plan,
+            "run_id": "run-a",
+            "task": "001-work.md",
+            "state": "RUNNING",
+            "elapsed": 1,
+            "session": "worker",
+            "last_activity": None,
+            "recovery_hint": "Attach.",
+        }]
+        with patch.object(KANBAN, "collect_status", return_value=running), patch.object(
+            KANBAN.time, "monotonic", side_effect=(0.0, 0.0, 5.0)
+        ), patch.object(KANBAN.time, "sleep") as sleep, patch(
+            "sys.stdout", new_callable=io.StringIO
+        ) as output:
+            self.assertEqual(124, KANBAN.command_watch_exec(self.repo, self.plan, "run-a", "001-work.md", 5))
+
+        sleep.assert_called_once_with(5)
+        self.assertEqual("checkpoint: no actionable wake within 5s\n", output.getvalue())
+
+    def test_watch_exec_exits_when_no_active_workers_remain_and_honors_filters(self) -> None:
+        before = sorted(path.relative_to(self.repo) for path in self.repo.rglob("*"))
+        with patch.object(KANBAN, "collect_status", return_value=[]) as collect, patch(
+            "sys.stdout", new_callable=io.StringIO
+        ) as output:
+            self.assertEqual(0, KANBAN.command_watch_exec(self.repo, self.plan, "run-a", "001-work.md", 5))
+
+        collect.assert_called_once_with(self.repo, self.plan, "run-a", "001-work.md")
+        self.assertEqual("checkpoint: no active exec workers\n", output.getvalue())
+        self.assertEqual(before, sorted(path.relative_to(self.repo) for path in self.repo.rglob("*")))
+
+    def test_watch_exec_rejects_nonpositive_seconds(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(HELPER), "watch-exec", "--repo", str(self.repo), "--seconds", "0"],
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("--seconds must be greater than zero", result.stderr)
 
     def test_delivery_readiness_requires_green_evidence_even_when_yolo(self) -> None:
         run = self.repo / ".agent" / self.plan / "runs" / "run-a"

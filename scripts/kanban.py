@@ -18,6 +18,8 @@ from pathlib import Path
 
 COLUMNS = ("todo", "in-progress", "done")
 DELIVERY_MODES = frozenset({"no-mistakes", "direct-pr", "local-only"})
+EXEC_ACTIONABLE_STATES = frozenset({"SUCCEEDED_AWAITING_REVIEW", "NEEDS_ATTENTION", "STALE", "UNKNOWN"})
+EXEC_WATCH_INTERVAL_SECONDS = 5
 PLAN_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 RUNTIME_FIELDS = {
     "version", "plan", "run_id", "task", "session", "pid", "command", "branch",
@@ -756,7 +758,7 @@ def status_entry(
 ) -> dict[str, object]:
     if record is None or not is_valid_runtime_record(record):
         return {"plan": plan, "run_id": run_id, "task": task_name, "state": "UNKNOWN", "elapsed": None,
-                "session": None, "last_activity": None,
+                "session": None, "report_status": None, "last_activity": None,
                 "recovery_hint": "Inspect the legacy run ledger and task artifacts before relaunching manually."}
     report = resolve_artifact(run, record["report"])
     log = resolve_artifact(run, record["log"])
@@ -772,7 +774,9 @@ def status_entry(
         state, hint = "RUNNING", f"Attach: tmux attach -t {record['session']}"
     elif record["exit_code"] == 0 and report_status == "DONE":
         state, hint = "SUCCEEDED_AWAITING_REVIEW", f"Open report: {report}"
-    elif record["exit_code"] not in (None, 0) or report_status in {"DONE_WITH_CONCERNS", "NEEDS_CONTEXT", "BLOCKED"}:
+    elif report_status == "DONE_WITH_CONCERNS":
+        state, hint = "NEEDS_ATTENTION", f"Read report: {report}; launch the one focused repair attempt."
+    elif record["exit_code"] not in (None, 0) or report_status in {"NEEDS_CONTEXT", "BLOCKED"}:
         state, hint = "NEEDS_ATTENTION", f"Inspect log: {log}; investigate or relaunch manually."
     elif liveness == "UNKNOWN":
         state, hint = "UNKNOWN", f"Inspect tmux pane and runtime record: {log}"
@@ -781,7 +785,8 @@ def status_entry(
     else:
         state, hint = "UNKNOWN", f"Inspect runtime record and log: {log}"
     return {"plan": plan, "run_id": run_id, "task": task_name, "state": state,
-            "elapsed": elapsed_seconds, "session": record["session"], "last_activity": last_activity,
+            "elapsed": elapsed_seconds, "session": record["session"], "report_status": report_status,
+            "last_activity": last_activity,
             "recovery_hint": hint}
 
 
@@ -833,10 +838,11 @@ def format_elapsed(seconds: object) -> str:
 
 
 def print_status(entries: list[dict[str, object]]) -> None:
-    headers = ("PLAN", "RUN", "TASK", "STATE", "ELAPSED", "TMUX", "LAST ACTIVITY", "NEXT STEP")
+    headers = ("PLAN", "RUN", "TASK", "STATE", "REPORT", "ELAPSED", "TMUX", "LAST ACTIVITY", "NEXT STEP")
     rows = [headers] + [(
         str(entry["plan"]), str(entry["run_id"]), str(entry["task"]), str(entry["state"]),
-        format_elapsed(entry["elapsed"]), str(entry["session"] or "-"), str(entry["last_activity"] or "-"),
+        str(entry.get("report_status") or "-"), format_elapsed(entry["elapsed"]),
+        str(entry["session"] or "-"), str(entry["last_activity"] or "-"),
         str(entry["recovery_hint"]),
     ) for entry in entries]
     widths = [max(len(row[index]) for row in rows) for index in range(len(headers))]
@@ -867,6 +873,31 @@ def command_status(repo: Path, plan: str | None, run_id: str | None, task_name: 
     except KeyboardInterrupt:
         if watch:
             print()
+
+
+def command_watch_exec(
+    repo: Path, plan: str | None, run_id: str | None, task_name: str | None, seconds: int,
+) -> int:
+    """Wait for an exec worker status that needs controller attention."""
+    if seconds <= 0:
+        raise SystemExit("--seconds must be greater than zero")
+    deadline = time.monotonic() + seconds
+    while True:
+        entries = collect_status(repo, plan, run_id, task_name)
+        actionable = [entry for entry in entries if entry["state"] in EXEC_ACTIONABLE_STATES]
+        if actionable:
+            states = ", ".join(sorted({str(entry["state"]) for entry in actionable}))
+            print(f"signal: {states}")
+            print_status(actionable)
+            return 0
+        if not entries:
+            print("checkpoint: no active exec workers")
+            return 0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print(f"checkpoint: no actionable wake within {seconds}s")
+            return 124
+        time.sleep(min(EXEC_WATCH_INTERVAL_SECONDS, remaining))
 
 
 def command_archive_diff(
@@ -919,7 +950,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("archive-diff", "board", "plan", "reserve", "start", "done", "launch-exec", "finish-runtime", "delivery-ready", "record-delivery", "teardown", "status"),
+        choices=("archive-diff", "board", "plan", "reserve", "start", "done", "launch-exec", "finish-runtime", "delivery-ready", "record-delivery", "teardown", "status", "watch-exec"),
     )
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--plan", help="Lowercase kebab-case plan slug")
@@ -939,12 +970,17 @@ def main() -> None:
     parser.add_argument("--exit-code", type=int, help="Wrapper exit code for finish-runtime")
     parser.add_argument("--watch", action="store_true", help="Continuously redraw status")
     parser.add_argument("--interval", type=float, default=2.0, help="Status refresh interval in seconds")
+    parser.add_argument("--seconds", type=int, help="Maximum watch-exec checkpoint duration in seconds")
     args = parser.parse_args()
 
     repo = args.repo.resolve()
     if args.command == "status":
         command_status(repo, args.plan, args.run_id, args.task, args.json, args.watch, args.interval)
         return
+    if args.command == "watch-exec":
+        if args.seconds is None:
+            raise SystemExit("watch-exec requires --seconds <positive-int>")
+        raise SystemExit(command_watch_exec(repo, args.plan, args.run_id, args.task, args.seconds))
     if not args.plan:
         raise SystemExit(f"{args.command} requires --plan <plan-slug>")
     if args.command == "board":

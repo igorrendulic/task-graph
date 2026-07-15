@@ -16,11 +16,11 @@ class SkillDocsTest(unittest.TestCase):
         self.assertIn(".agent/<plan-slug>/", readme)
         self.assertIn("--plan <plan-slug>", readme)
 
-    def test_failed_audit_requires_user_checkpoint_before_another_loop(self) -> None:
+    def test_post_retry_failed_audit_requires_user_checkpoint_before_another_loop(self) -> None:
         skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
 
-        self.assertIn("Outcome improvement checkpoints", skill)
-        self.assertIn("failed audit or verification report", skill)
+        self.assertIn("Post-retry improvement checkpoints", skill)
+        self.assertIn("automatic focused repair-and-audit attempt", skill)
         self.assertIn("Do not create, reserve, dispatch, or run another improvement loop", skill)
         self.assertIn("`Stop`", skill)
         self.assertIn("`Continue`", skill)
@@ -35,16 +35,27 @@ class SkillDocsTest(unittest.TestCase):
         self.assertIn("inherits the parent execution mode, delivery mode, and `+yolo` setting", skill)
         self.assertIn("fresh child worktree and child branch from the failed task branch's verified HEAD", skill)
         self.assertIn("return to this Stop/Continue checkpoint", skill)
-        self.assertIn("Continue immediately launches exactly one focused repair-and-audit attempt", readme)
-        self.assertIn("A later failed audit requires another Stop or Continue decision", readme)
+        self.assertIn("Continue immediately launches exactly one linked repair-and-audit attempt", readme)
+        self.assertIn("a later failed audit requires another Stop or Continue decision", readme)
 
     def test_readme_documents_improvement_loop_checkpoint(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
         self.assertIn("Improvement Loop Checkpoints", readme)
-        self.assertIn("After each failed audit", readme)
+        self.assertIn("Only after that automatic retry", readme)
         self.assertIn("stop with the current unresolved result", readme)
         self.assertIn("continue into another focused improvement-and-audit loop", readme)
+
+    def test_done_with_concerns_requires_one_automatic_retry_and_outcome_update(self) -> None:
+        skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("automatically launch exactly one focused repair-and-audit attempt", skill)
+        self.assertIn("must not end the controller turn", skill)
+        self.assertIn("always report the retry outcome to the user", skill)
+        self.assertIn("must not automatically retry again", skill)
+        self.assertIn("automatic focused repair-and-audit attempt", readme)
+        self.assertIn("always reports the retry outcome", readme)
 
     def test_docs_require_batch_execution_and_diff_packages(self) -> None:
         skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -92,10 +103,10 @@ class SkillDocsTest(unittest.TestCase):
 
         for document in (skill, readme):
             self.assertIn("immediately after launch", document)
-            self.assertIn("platform-native wait", document)
-            self.assertIn("60 seconds", document)
             self.assertIn("standalone", document)
-            self.assertIn("status --json", document)
+            self.assertIn("watch-exec", document)
+            self.assertIn("--seconds 60", document)
+            self.assertIn("five seconds", document)
             self.assertIn("never use shell `sleep`", document)
             self.assertIn("compound commands", document)
             self.assertIn("status --watch", document)
@@ -113,16 +124,18 @@ class SkillDocsTest(unittest.TestCase):
         ):
             self.assertIn(terminal_status, readme)
 
-        self.assertIn("Approval is needed only for the standalone status-command prefix", readme)
-        self.assertIn("never for an artificial delay command", readme)
-        self.assertLess(
-            readme.index("immediately after launch"),
-            readme.index("platform-native wait of 60 seconds"),
-        )
-        self.assertLess(
-            readme.index("platform-native wait of 60 seconds"),
-            readme.index("before every later probe"),
-        )
+        self.assertIn("manual `status --json` polling", readme)
+        self.assertIn("read-only", readme)
+
+    def test_docs_require_bounded_watch_exec_checkpoints_for_controllers(self) -> None:
+        skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        for document in (skill, readme):
+            self.assertIn("watch-exec", document)
+            self.assertIn("--seconds", document)
+            self.assertIn("checkpoint", document)
+            self.assertIn("status --watch", document)
 
     def test_docs_define_guarded_delivery_policy(self) -> None:
         skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")

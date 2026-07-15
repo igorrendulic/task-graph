@@ -79,9 +79,9 @@ After a successful report, approved review, and tests, `delivery-ready` tells th
 
 ## Low-Intrusion Monitoring
 
-The controller makes one standalone `kanban.py status --json` probe immediately after launch, then uses a platform-native wait of 60 seconds before every later probe. It stops automatic polling at `SUCCEEDED_AWAITING_REVIEW`, `NEEDS_ATTENTION`, `STALE`, or `UNKNOWN`.
+The controller runs a bounded `kanban.py watch-exec --seconds 60` checkpoint immediately after launch, then repeats bounded checkpoints while work is expected. `watch-exec` probes immediately, polls every five seconds, and returns early at `SUCCEEDED_AWAITING_REVIEW`, `NEEDS_ATTENTION`, `STALE`, or `UNKNOWN`. A quiet checkpoint prints its outcome and exits `124` after its bound.
 
-Automatic monitoring must never use shell `sleep`, compound commands, or `status --watch`. Approval is needed only for the standalone status-command prefix, never for an artificial delay command. Each probe is a standalone read-only command. Users may still request the dashboard command below.
+Automatic monitoring must never use shell `sleep`, compound commands, manual `status --json` polling, or `status --watch`. Each checkpoint is a standalone read-only command; it never relaunches workers or changes task, runtime, report, delivery, or session state. Users may still request the status dashboards below.
 
 ## Command Reference
 
@@ -99,9 +99,11 @@ python3 <skill-dir>/scripts/kanban.py launch-exec --repo <repo-root> --plan <pla
 tmux attach -t task-graph-<plan-slug>-<run-id>-001-example
 ```
 
-Read status from another pane. `--watch` is a user-requested dashboard, not controller automation:
+Run a bounded controller checkpoint, or read status from another pane. `status --watch` is a user-requested dashboard, not controller automation:
 
 ```bash
+python3 <skill-dir>/scripts/kanban.py watch-exec --repo <repo-root> --seconds 180
+python3 <skill-dir>/scripts/kanban.py watch-exec --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --seconds 60
 python3 <skill-dir>/scripts/kanban.py status --repo <repo-root>
 python3 <skill-dir>/scripts/kanban.py status --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --json
 python3 <skill-dir>/scripts/kanban.py status --repo <repo-root> --watch --interval 2
@@ -129,7 +131,9 @@ Diff packages preserve the reviewed task delta and its metadata under `.agent/<p
 
 ## Improvement Loop Checkpoints
 
-After each failed audit, the controller reports the remaining gap and asks whether to stop with the current unresolved result or continue into another focused improvement-and-audit loop. It never launches another improvement loop without that decision. Continue immediately launches exactly one focused repair-and-audit attempt: it creates a linked child attempt, inherits the selected execution and delivery policy, prepares a focused brief, and starts a fresh isolated worker from the failed task branch's verified HEAD. A later failed audit requires another Stop or Continue decision.
+When a `codex exec` worker reports `DONE_WITH_CONCERNS`, the controller reads the persisted report and begins one automatic focused repair-and-audit attempt. The retry uses a fresh isolated worker from the failed task branch's verified HEAD, inherits the selected execution and delivery policy, and receives a brief limited to the reported gap. The controller always reports the retry outcome to the user, whether the repair is ready for normal integration or remains unresolved.
+
+Only after that automatic retry still reports concerns does the controller stop and ask whether to stop with the current unresolved result or continue into another focused improvement-and-audit loop. Continue immediately launches exactly one linked repair-and-audit attempt; a later failed audit requires another Stop or Continue decision.
 
 ## Installation and Other Harnesses
 
