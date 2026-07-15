@@ -79,7 +79,7 @@ After a successful report, approved review, and tests, `delivery-ready` tells th
 
 ## Low-Intrusion Monitoring
 
-The controller runs a bounded `kanban.py watch-exec --seconds 60` checkpoint immediately after launch, then repeats bounded checkpoints while work is expected. `watch-exec` probes immediately, polls every five seconds, and returns early at `SUCCEEDED_AWAITING_REVIEW`, `NEEDS_ATTENTION`, `STALE`, or `UNKNOWN`. A quiet checkpoint prints its outcome and exits `124` after its bound.
+The controller runs a bounded `kanban.py watch-exec --checkpoint --seconds 60` checkpoint immediately after launch, then repeats bounded checkpoints while work is expected. Checkpoint mode probes immediately, polls every five seconds, and returns early at `SUCCEEDED_AWAITING_REVIEW`, `NEEDS_ATTENTION`, `STALE`, or `UNKNOWN`. A quiet checkpoint prints its outcome and exits `124` after its bound.
 
 Automatic monitoring must never use shell `sleep`, compound commands, manual `status --json` polling, or `status --watch`. Each checkpoint is a standalone read-only command; it never relaunches workers or changes task, runtime, report, delivery, or session state. Users may still request the status dashboards below.
 
@@ -99,11 +99,11 @@ python3 <skill-dir>/scripts/kanban.py launch-exec --repo <repo-root> --plan <pla
 tmux attach -t task-graph-<plan-slug>-<run-id>-001-example
 ```
 
-Run a bounded controller checkpoint, or read status from another pane. `status --watch` is a user-requested dashboard, not controller automation:
+Run the compact persistent monitor, or run an explicit bounded controller checkpoint. `status --watch` is a user-requested dashboard, not controller automation:
 
 ```bash
 python3 <skill-dir>/scripts/kanban.py watch-exec --repo <repo-root> --seconds 180
-python3 <skill-dir>/scripts/kanban.py watch-exec --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --seconds 60
+python3 <skill-dir>/scripts/kanban.py watch-exec --checkpoint --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --seconds 60
 python3 <skill-dir>/scripts/kanban.py status --repo <repo-root>
 python3 <skill-dir>/scripts/kanban.py status --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --json
 python3 <skill-dir>/scripts/kanban.py status --repo <repo-root> --watch --interval 2

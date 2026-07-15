@@ -9,6 +9,7 @@ import re
 import shutil
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -854,6 +855,70 @@ def print_status(entries: list[dict[str, object]]) -> None:
         print("No active task executions found.")
 
 
+def truncate_text(value: object, width: int) -> str:
+    text = str(value)
+    return text if len(text) <= width else f"{text[:width - 1]}…"
+
+
+def select_watch_entries(entries: list[dict[str, object]]) -> tuple[list[dict[str, object]], int]:
+    """Keep each task's newest run, while retaining every still-running worker."""
+    latest: dict[tuple[str, str], dict[str, object]] = {}
+    for entry in entries:
+        key = (str(entry["plan"]), str(entry["task"]))
+        current = latest.get(key)
+        candidate_key = (str(entry.get("last_activity") or ""), str(entry["run_id"]))
+        current_key = (
+            str(current.get("last_activity") or ""), str(current["run_id"])
+        ) if current else None
+        if current is None or candidate_key > current_key:
+            latest[key] = entry
+
+    selected = [
+        entry for entry in entries
+        if entry["state"] == "RUNNING" or latest[(str(entry["plan"]), str(entry["task"]))] is entry
+    ]
+    visible = [entry for entry in selected if entry["state"] == "RUNNING" or entry["state"] in EXEC_ACTIONABLE_STATES]
+    return visible, len(entries) - len(visible)
+
+
+def watch_next_action(entry: dict[str, object]) -> str:
+    state = entry["state"]
+    if state == "RUNNING":
+        return "Attach in tmux"
+    if state == "SUCCEEDED_AWAITING_REVIEW":
+        return "Open report"
+    if state == "NEEDS_ATTENTION":
+        return "Read report"
+    return "Inspect runtime"
+
+
+def render_watch_exec(entries: list[dict[str, object]], hidden: int, elapsed: int, remaining: int) -> str:
+    counts: dict[str, int] = {}
+    for entry in entries:
+        state = str(entry["state"])
+        counts[state] = counts.get(state, 0) + 1
+    state_summary = ", ".join(f"{state.lower()}={count}" for state, count in sorted(counts.items())) or "none"
+    lines = [
+        f"Task Graph exec monitor | elapsed {format_elapsed(elapsed)} | remaining {format_elapsed(remaining)}",
+        f"States: {state_summary}",
+        f"Showing {len(entries)} current item(s); {hidden} older run(s) hidden.",
+    ]
+    if not entries:
+        return "\n".join(lines + ["No active or actionable workers."])
+    lines.append("STATE                    TASK                      PLAN / RUN                 REPORT  ELAPSED   NEXT")
+    for entry in entries:
+        plan_run = f"{truncate_text(entry['plan'], 16)} / {truncate_text(entry['run_id'], 18)}"
+        lines.append(
+            f"{truncate_text(entry['state'], 24).ljust(24)} "
+            f"{truncate_text(entry['task'], 25).ljust(25)} "
+            f"{plan_run.ljust(26)} "
+            f"{truncate_text(entry.get('report_status') or '-', 7).ljust(7)} "
+            f"{format_elapsed(entry.get('elapsed')).ljust(9)} "
+            f"{watch_next_action(entry)}"
+        )
+    return "\n".join(lines)
+
+
 def command_status(repo: Path, plan: str | None, run_id: str | None, task_name: str | None, as_json: bool, watch: bool, interval: float) -> None:
     if interval <= 0:
         raise SystemExit("--interval must be greater than zero")
@@ -876,26 +941,37 @@ def command_status(repo: Path, plan: str | None, run_id: str | None, task_name: 
 
 
 def command_watch_exec(
-    repo: Path, plan: str | None, run_id: str | None, task_name: str | None, seconds: int,
+    repo: Path, plan: str | None, run_id: str | None, task_name: str | None, seconds: int, *, checkpoint: bool = False,
 ) -> int:
-    """Wait for an exec worker status that needs controller attention."""
+    """Monitor exec workers, or run one bounded controller checkpoint."""
     if seconds <= 0:
         raise SystemExit("--seconds must be greater than zero")
-    deadline = time.monotonic() + seconds
+    started = time.monotonic()
+    deadline = started + seconds
     while True:
         entries = collect_status(repo, plan, run_id, task_name)
         actionable = [entry for entry in entries if entry["state"] in EXEC_ACTIONABLE_STATES]
-        if actionable:
-            states = ", ".join(sorted({str(entry["state"]) for entry in actionable}))
-            print(f"signal: {states}")
-            print_status(actionable)
-            return 0
-        if not entries:
-            print("checkpoint: no active exec workers")
-            return 0
-        remaining = deadline - time.monotonic()
+        if checkpoint:
+            if actionable:
+                states = ", ".join(sorted({str(entry["state"]) for entry in actionable}))
+                print(f"signal: {states}")
+                print_status(actionable)
+                return 0
+            if not entries:
+                print("checkpoint: no active exec workers")
+                return 0
+        now = time.monotonic()
+        remaining = deadline - now
+        if not checkpoint:
+            visible, hidden = select_watch_entries(entries)
+            if sys.stdout.isatty():
+                print("\033[2J\033[H", end="")
+            print(render_watch_exec(visible, hidden, int(now - started), max(0, int(remaining))))
         if remaining <= 0:
-            print(f"checkpoint: no actionable wake within {seconds}s")
+            if checkpoint:
+                print(f"checkpoint: no actionable wake within {seconds}s")
+            else:
+                print(f"monitor: finished after {seconds}s")
             return 124
         time.sleep(min(EXEC_WATCH_INTERVAL_SECONDS, remaining))
 
@@ -969,8 +1045,9 @@ def main() -> None:
     parser.add_argument("--worktree", type=Path, help="Dedicated task worktree for launch-exec")
     parser.add_argument("--exit-code", type=int, help="Wrapper exit code for finish-runtime")
     parser.add_argument("--watch", action="store_true", help="Continuously redraw status")
+    parser.add_argument("--checkpoint", action="store_true", help="Exit watch-exec when controller attention is needed")
     parser.add_argument("--interval", type=float, default=2.0, help="Status refresh interval in seconds")
-    parser.add_argument("--seconds", type=int, help="Maximum watch-exec checkpoint duration in seconds")
+    parser.add_argument("--seconds", type=int, help="Maximum watch-exec monitor duration in seconds")
     args = parser.parse_args()
 
     repo = args.repo.resolve()
@@ -980,7 +1057,7 @@ def main() -> None:
     if args.command == "watch-exec":
         if args.seconds is None:
             raise SystemExit("watch-exec requires --seconds <positive-int>")
-        raise SystemExit(command_watch_exec(repo, args.plan, args.run_id, args.task, args.seconds))
+        raise SystemExit(command_watch_exec(repo, args.plan, args.run_id, args.task, args.seconds, checkpoint=args.checkpoint))
     if not args.plan:
         raise SystemExit(f"{args.command} requires --plan <plan-slug>")
     if args.command == "board":

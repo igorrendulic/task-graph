@@ -511,7 +511,7 @@ class KanbanTest(unittest.TestCase):
             ) as collect, patch("sys.stdout", new_callable=io.StringIO) as output:
                 self.assertEqual(
                     0,
-                    KANBAN.command_watch_exec(self.repo, self.plan, "run-a", "001-work.md", 5),
+                    KANBAN.command_watch_exec(self.repo, self.plan, "run-a", "001-work.md", 5, checkpoint=True),
                 )
 
             self.assertIn(f"signal: {state}", output.getvalue())
@@ -535,7 +535,10 @@ class KanbanTest(unittest.TestCase):
         ), patch.object(KANBAN.time, "sleep") as sleep, patch(
             "sys.stdout", new_callable=io.StringIO
         ) as output:
-            self.assertEqual(124, KANBAN.command_watch_exec(self.repo, self.plan, "run-a", "001-work.md", 5))
+            self.assertEqual(
+                124,
+                KANBAN.command_watch_exec(self.repo, self.plan, "run-a", "001-work.md", 5, checkpoint=True),
+            )
 
         sleep.assert_called_once_with(5)
         self.assertEqual("checkpoint: no actionable wake within 5s\n", output.getvalue())
@@ -545,11 +548,52 @@ class KanbanTest(unittest.TestCase):
         with patch.object(KANBAN, "collect_status", return_value=[]) as collect, patch(
             "sys.stdout", new_callable=io.StringIO
         ) as output:
-            self.assertEqual(0, KANBAN.command_watch_exec(self.repo, self.plan, "run-a", "001-work.md", 5))
+            self.assertEqual(
+                0,
+                KANBAN.command_watch_exec(self.repo, self.plan, "run-a", "001-work.md", 5, checkpoint=True),
+            )
 
         collect.assert_called_once_with(self.repo, self.plan, "run-a", "001-work.md")
         self.assertEqual("checkpoint: no active exec workers\n", output.getvalue())
         self.assertEqual(before, sorted(path.relative_to(self.repo) for path in self.repo.rglob("*")))
+
+    def test_watch_exec_default_continues_after_an_actionable_status(self) -> None:
+        actionable = [{
+            "plan": self.plan,
+            "run_id": "run-a",
+            "task": "001-work.md",
+            "state": "SUCCEEDED_AWAITING_REVIEW",
+            "report_status": "DONE",
+            "elapsed": 1,
+            "session": "very-long-session-name",
+            "last_activity": "2026-07-15T17:00:00+00:00",
+            "recovery_hint": "Open report: /very/long/path/reports/001-work.md",
+        }]
+        with patch.object(KANBAN, "collect_status", return_value=actionable) as collect, patch.object(
+            KANBAN.time, "monotonic", side_effect=(0.0, 0.0, 5.0)
+        ), patch.object(KANBAN.time, "sleep") as sleep, patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.assertEqual(124, KANBAN.command_watch_exec(self.repo, self.plan, None, None, 5))
+
+        self.assertEqual(2, collect.call_count)
+        sleep.assert_called_once_with(5)
+        rendered = output.getvalue()
+        self.assertIn("Task Graph exec monitor", rendered)
+        self.assertNotIn("signal:", rendered)
+        self.assertNotIn("/very/long/path", rendered)
+        self.assertNotIn("very-long-session-name", rendered)
+
+    def test_watch_exec_selects_latest_run_and_retains_running_history(self) -> None:
+        entries = [
+            {"plan": "plan-a", "run_id": "old", "task": "001-work.md", "state": "RUNNING", "last_activity": "2026-07-15T10:00:00+00:00"},
+            {"plan": "plan-a", "run_id": "new", "task": "001-work.md", "state": "SUCCEEDED_AWAITING_REVIEW", "last_activity": "2026-07-15T11:00:00+00:00"},
+            {"plan": "plan-a", "run_id": "older", "task": "002-work.md", "state": "STALE", "last_activity": "2026-07-15T09:00:00+00:00"},
+            {"plan": "plan-a", "run_id": "newest", "task": "002-work.md", "state": "NEEDS_ATTENTION", "last_activity": "2026-07-15T12:00:00+00:00"},
+        ]
+
+        selected, hidden = KANBAN.select_watch_entries(entries)
+
+        self.assertEqual(["old", "new", "newest"], [entry["run_id"] for entry in selected])
+        self.assertEqual(1, hidden)
 
     def test_watch_exec_rejects_nonpositive_seconds(self) -> None:
         result = subprocess.run(
