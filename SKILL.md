@@ -12,7 +12,7 @@ Assume the repository root is the current working directory unless the user give
 - Board: `.agent/<plan-slug>/kanban.md`
 - Task folders: `.agent/<plan-slug>/todo`, `.agent/<plan-slug>/in-progress`, `.agent/<plan-slug>/done`
 - Run artifacts: `.agent/<plan-slug>/runs/<run-id>/`
-- Helper: `scripts/kanban.py`
+- State helper: `scripts/kanban.py`; read-only watcher: `scripts/watcher.py`
 
 For every plan, read the supplied implementation plan, derive and announce a concise lowercase kebab-case `<plan-slug>` from its goal, then pass `--plan <plan-slug>` to every helper command. Reuse that slug when resuming the same plan. Run helper commands from any directory, passing `--repo <repo-root>` when the current directory is not the target repo. The target repo must contain `.agent/`; if it does not, ask before creating project workflow files. The helper never reads or updates the legacy shared `.agent/tasks`, `.agent/kanban.md`, or `.agent/runs` layout.
 
@@ -97,10 +97,16 @@ Use this workflow when the user asks to start implementation.
    - Reply with only status, task branch, worktree path, commit SHA, one-line test summary, concerns, and report path.
 9. For **Unattended `codex exec`**, tmux is required. After writing the task brief, use `launch-exec` for each reserved task in its dedicated worktree; it writes a durable runtime record before execution, captures output in a task-specific log, and preserves the exited pane for diagnosis. It runs `codex exec` with the normal workspace-write sandbox and the installed CLI's execution policy; never automatically use `--dangerously-bypass-approvals-and-sandbox`. The launcher persists the worker's final response to the controller-owned report path with `--output-last-message`; require that response to include one of the task status values below, a summary, tests, concerns, and a suggested commit message. The worker must edit and test only in its task worktree, and must not write run artifacts or commit. `DONE` means the task is ready for review, not cleanup: retain its worktree and tmux session through diff inspection, verification, task-commit creation, and integration. The runtime record contains the tmux session, pane PID (the process identifier), command, worktree, branch, brief/report/log paths, start/finish timestamps, and exit result. On resume, inspect the runtime record, report, and log before retrying; do not relaunch a completed task. Local `codex exec` still requires an awake machine or remote host.
 10. Monitor each unattended local worker with low intrusion:
-   - Run a standalone bounded checkpoint immediately after launch: `python3 <skill-dir>/scripts/kanban.py watch-exec --checkpoint --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task <task-file> --seconds 60`.
+   - Run a standalone bounded checkpoint immediately after launch: `python3 <skill-dir>/scripts/watcher.py watch-exec --checkpoint --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task <task-file> --seconds 60`.
    - Repeat bounded `watch-exec --checkpoint` checkpoints while work is expected. Do not manually poll `status --json`; checkpoint mode probes immediately, then polls every five seconds and returns early for `SUCCEEDED_AWAITING_REVIEW`, `NEEDS_ATTENTION`, `STALE`, or `UNKNOWN`.
    - A quiet checkpoint exits `124` after its `--seconds` bound. It is read-only and must not reserve, relaunch, move, deliver, or clean up work.
-   - The controller must never use shell `sleep`, compound commands, or `status --watch` for controller monitoring. `status` and `status --watch` remain explicit human dashboards.
+    - The controller must never use shell `sleep`, compound commands, or `status --watch` for controller monitoring. `status` and `status --watch` remain explicit human dashboards.
+    - Reconcile before reporting status, after every wake, and before ending a controller turn. Run `reconcile --json`; immediately dispatch every safe `REVIEW_REQUIRED` or `REPAIR_REQUIRED` action. `No change` is valid only when reconciliation returns no autonomous controller action.
+    - Claim each returned durable wake with `claim-wake`, launch its required safe action, then `ack-wake` only after the reviewer or repair worker has actually been dispatched. A claimed but unacknowledged wake must be resumed, never ignored.
+    - `REVIEW_REQUIRED` is not a reminder: create and launch a dedicated fresh-context reviewer for that task, persist `Review status: pending` before launch, and wait for its `approved` or `changes_requested` verdict. Launch independent reviewers in parallel.
+    - `REPAIR_REQUIRED` is not a reminder: record the repair attempt and immediately launch the inherited worker mode with a brief limited to the reviewer findings. Only `RETRY_DECISION_REQUIRED`, `USER_CONTEXT_REQUIRED`, and delivery approval may pause the controller.
+    - Run `supervise --seconds 60` as the Codex foreground checkpoint when work remains in flight. It persists actionable wakes under `.agent/<plan-slug>/state/` before returning control.
+    - On explicit operator authorization, install the scoped Codex Stop hook once with `install-stop-hook`; it blocks one blind turn end and lets the forced follow-up drain reconciliation work.
 11. For `Cloud delegation`, launch only when the selected Codex surface and workspace policy support it. Record the cloud task identifier, task branch/worktree or remote checkout reference, and result/report location in the run ledger. Do not fall back from cloud delegation to local execution without asking the operator.
 12. Every worker, exec process, or cloud task must report one of these statuses:
    - `DONE`: implementation is complete and ready for review.
@@ -205,11 +211,18 @@ python3 <skill-dir>/scripts/kanban.py launch-exec --repo <repo-root> --plan <pla
 Observe all active task executions without changing state:
 
 ```bash
-python3 <skill-dir>/scripts/kanban.py watch-exec --repo <repo-root> --seconds 180
-python3 <skill-dir>/scripts/kanban.py watch-exec --checkpoint --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --seconds 60
+python3 <skill-dir>/scripts/controller.py start --repo <repo-root> --plan <plan-slug>
+python3 <skill-dir>/scripts/controller.py status --repo <repo-root> --plan <plan-slug>
+python3 <skill-dir>/scripts/controller.py stop --repo <repo-root> --plan <plan-slug>
+python3 <skill-dir>/scripts/watcher.py watch-exec --repo <repo-root> --seconds 180
+python3 <skill-dir>/scripts/kanban.py reconcile --repo <repo-root> --plan <plan-slug> --json
+python3 <skill-dir>/scripts/kanban.py supervise --repo <repo-root> --plan <plan-slug> --seconds 60
+python3 <skill-dir>/scripts/kanban.py install-stop-hook --repo <repo-root> --plan <plan-slug>
+python3 <skill-dir>/scripts/kanban.py uninstall-stop-hook --repo <repo-root> --plan <plan-slug>
+python3 <skill-dir>/scripts/watcher.py watch-exec --checkpoint --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --seconds 60
 python3 <skill-dir>/scripts/kanban.py status --repo <repo-root>
 python3 <skill-dir>/scripts/kanban.py status --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --json
-python3 <skill-dir>/scripts/kanban.py status --repo <repo-root> --watch --interval 2
+python3 <skill-dir>/scripts/watcher.py status --repo <repo-root> --interval 2
 tmux attach -t task-graph-<plan-slug>-<run-id>-001-example
 ```
 
@@ -227,8 +240,14 @@ The helper is intentionally conservative:
 - `done --plan <plan-slug> --task <file>` moves a matching in-progress task to `done` and rewrites the board.
 - `archive-diff --plan <plan-slug> --run-id <id> --task <file> --base <commit> --head <commit> --branch <branch> --review <relative-path>` validates an in-progress task and commit revisions, then writes a binary-capable patch and metadata summary to `.agent/<plan-slug>/runs/<id>/diffs/` without changing task state.
 - `launch-exec --plan <plan-slug> --run-id <id> --task <file> --branch <branch> --worktree <path>` requires tmux and starts one reserved in-progress task in a deterministic session.
+- `controller.py start --plan <plan-slug> [--no-mistakes-command <command>]` starts the one tmux-resident local controller for a plan. It persists its lease, heartbeat, session, PID, lifecycle, configuration, alert, and wake dispatch state under `.agent/<plan-slug>/state/controller.json`; it only reclaims a lease after the prior tmux session is absent, and a second live controller is refused. It never auto-restarts.
+- `controller.py run --plan <plan-slug>` is the tmux child. It drains claimed wakes before new wakes, starts fresh read-only reviews or the single focused repair, and acknowledges a wake only once the session starts. Human-required and delivery/tooling outcomes become durable `escalated` wakes and pause the controller until the underlying task condition is resolved.
+- `controller.py status --plan <plan-slug>` reports `live`, `healthy`, pending alerts, and durable `CONTROLLER_RECOVERY_REQUIRED` state for dead or stale controllers with in-progress work; it never launches a replacement. `controller.py stop --plan <plan-slug>` is the explicit operator stop and releases the lease only after terminating the session; the Stop hook is a blind-end backstop and never dispatches work.
+- `reconcile --plan <plan-slug> [--json]` derives one required controller action for each in-progress task from canonical board, runtime, report, review, and retry evidence; completed task runtimes are history.
+- `supervise --plan <plan-slug> --seconds <positive-int>` writes durable wake records before signaling required controller work, or returns `124` after a quiet bounded checkpoint. Queue index, enqueue, claim, acknowledgement, and escalation transitions are lock-protected; `acknowledged` and `escalated` wakes are terminal.
+- `install-stop-hook --plan <plan-slug>` merges a scoped `Stop` hook into the target repository's `.codex/hooks.json`; `uninstall-stop-hook` removes only that entry. The guard fails open on malformed hook payloads and blocks at most once per turn.
 - `watch-exec [--plan <plan-slug>] [--run-id <id>] [--task <file>] --seconds <positive-int>` is a foreground-only, read-only monitor. It redraws a compact current view every five seconds through its duration and exits `124` at the time bound. Add `--checkpoint` for controller automation: it exits early on an actionable worker status or when no active worker remains, and exits `124` on a quiet timeout.
-- `status [--plan <plan-slug>] [--run-id <id>] [--task <file>] [--json]` is read-only. `status --watch [--interval <seconds>]` redraws the same data in place.
+- `status [--plan <plan-slug>] [--run-id <id>] [--task <file>] [--json]` in `kanban.py` is read-only. `watcher.py status [--interval <seconds>]` redraws the same data in place and never supervises or mutates the wake queue. Legacy `kanban.py status --watch` and `kanban.py watch-exec` forward to `watcher.py`.
 - Dependencies are parsed from the `## Dependencies` section as task filenames when present. `None` means no blocker.
 - Task type is parsed from `## Type`; supported values are `ship` and `scout`, and omitted or unknown values default to `ship`.
 - The `## Parallel` section is human guidance. Dependency parsing is authoritative for helper decisions.

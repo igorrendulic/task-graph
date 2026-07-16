@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
+import os
 import re
 import shutil
 import shlex
@@ -15,6 +18,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from contextlib import contextmanager
 
 
 COLUMNS = ("todo", "in-progress", "done")
@@ -471,8 +475,15 @@ def write_atomic(path: Path, content: str) -> None:
         delete=False,
     ) as handle:
         handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
         temporary = Path(handle.name)
     temporary.replace(path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def utc_now() -> str:
@@ -647,6 +658,58 @@ def command_finish_runtime(repo: Path, plan: str, run_id: str, task_name: str, e
     write_runtime_record(path, record)
 
 
+def prepare_completed_task(repo: Path, plan: str, run_id: str, task_name: str) -> dict[str, object]:
+    """Commit a successful worker worktree and return verified diff inputs.
+
+    This intentionally does not integrate or clean up the task.  Those remain
+    controller policy decisions after a separate review.
+    """
+    task_in_progress(repo, plan, task_name)
+    try:
+        record = json.loads(runtime_path(repo, plan, run_id, task_name).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit("prepare-completed-task requires a runtime record") from None
+    if not is_valid_runtime_record(record) or record.get("exit_code") != 0:
+        raise SystemExit("prepare-completed-task requires a successful valid runtime record")
+    worktree = Path(str(record["worktree"]))
+    if git_output(worktree, "status", "--porcelain").strip():
+        staged = subprocess.run(["git", "add", "-A"], cwd=worktree, text=True, capture_output=True)
+        if staged.returncode:
+            raise SystemExit(staged.stderr.strip() or "git add failed")
+        committed = subprocess.run(
+            ["git", "commit", "-m", f"task-graph: complete {task_name}"],
+            cwd=worktree,
+            text=True,
+            capture_output=True,
+        )
+        if committed.returncode:
+            raise SystemExit(committed.stderr.strip() or "git commit failed")
+    return {
+        "record": record,
+        "branch": str(record["branch"]),
+        "base_commit": str(record["base_commit"]),
+        "head_commit": resolved_commit(worktree, "HEAD"),
+    }
+
+
+def create_child_worktree(repo: Path, parent_branch: str, branch: str, worktree: Path) -> Path:
+    """Create one controller-owned child worktree from a verified parent branch."""
+    root = worktree.resolve()
+    if root == repo.resolve() or root.exists():
+        raise SystemExit("child worktree path must be new and distinct from the controller checkout")
+    parent_head = resolved_commit(repo, parent_branch)
+    result = subprocess.run(
+        ["git", "worktree", "add", "-b", branch, str(root), parent_head],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode:
+        raise SystemExit(result.stderr.strip() or "git worktree add failed")
+    verified_worktree(repo, root, branch)
+    return root
+
+
 def parse_timestamp(value: object) -> datetime | None:
     if not isinstance(value, str):
         return None
@@ -668,6 +731,320 @@ def final_report_status(report: Path | None) -> str | None:
         return None
     match = re.search(r"\b(DONE_WITH_CONCERNS|NEEDS_CONTEXT|BLOCKED|DONE)\b", report.read_text(encoding="utf-8"))
     return match.group(1) if match else None
+
+
+def review_status(review: Path) -> str | None:
+    if not review.exists():
+        return None
+    match = re.search(r"Review status:\s*(approved|pending|changes_requested)\b", review.read_text(encoding="utf-8"), re.I)
+    return match.group(1).lower() if match else None
+
+
+def supervision_state_path(repo: Path, plan: str, task_name: str) -> Path:
+    return plan_dir(repo, plan) / "state" / "tasks" / f"{Path(task_name).stem}.json"
+
+
+def repair_attempts(repo: Path, plan: str, task_name: str) -> int:
+    path = supervision_state_path(repo, plan, task_name)
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return 0
+    except json.JSONDecodeError:
+        return 0
+    return state.get("repair_attempts", 0) if isinstance(state.get("repair_attempts", 0), int) else 0
+
+
+def record_repair_attempt(repo: Path, plan: str, task_name: str) -> None:
+    attempts = repair_attempts(repo, plan, task_name) + 1
+    write_atomic(
+        supervision_state_path(repo, plan, task_name),
+        json.dumps({"task": task_name, "repair_attempts": attempts, "updated_at": utc_now()}, indent=2) + "\n",
+    )
+
+
+def supervision_dir(repo: Path, plan: str) -> Path:
+    return plan_dir(repo, plan) / "state"
+
+
+def supervision_queue_path(repo: Path, plan: str) -> Path:
+    return supervision_dir(repo, plan) / "wake-queue.jsonl"
+
+
+def supervision_index_path(repo: Path, plan: str) -> Path:
+    return supervision_dir(repo, plan) / "wake-index.json"
+
+
+def wake_claims_path(repo: Path, plan: str) -> Path:
+    return supervision_dir(repo, plan) / "wake-claims.json"
+
+
+def wake_lock_path(repo: Path, plan: str) -> Path:
+    return supervision_dir(repo, plan) / "wake-queue.lock"
+
+
+@contextmanager
+def wake_queue_lock(repo: Path, plan: str):
+    """Serialize queue/index/claim mutations across watcher and controller processes."""
+    path = wake_lock_path(repo, plan)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def load_json_object(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def append_jsonl_durable(path: Path, entries: list[dict[str, object]]) -> None:
+    """Append JSONL records and confirm their contents are durable before returning."""
+    if not entries:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        for entry in entries:
+            handle.write(json.dumps(entry, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    directory = path.parent
+    while True:
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        if directory.parent == directory:
+            break
+        directory = directory.parent
+
+
+def _queued_wakes(repo: Path, plan: str) -> list[dict[str, object]]:
+    path = supervision_queue_path(repo, plan)
+    if not path.exists():
+        return []
+    wakes: list[dict[str, object]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            raise SystemExit(f"Malformed wake queue entry at {path}:{line_number}")
+        try:
+            wake = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise SystemExit(f"Malformed wake queue entry at {path}:{line_number}: {error.msg}") from error
+        if not isinstance(wake, dict) or any(
+            not isinstance(wake.get(field), str) or not wake[field].strip()
+            for field in ("id", "task", "action")
+        ):
+            raise SystemExit(f"Malformed wake queue entry at {path}:{line_number}")
+        wakes.append(wake)
+    return wakes
+
+
+def queued_wakes(repo: Path, plan: str) -> list[dict[str, object]]:
+    with wake_queue_lock(repo, plan):
+        return _queued_wakes(repo, plan)
+
+
+def claim_wake(repo: Path, plan: str, wake_id: str) -> dict[str, object]:
+    with wake_queue_lock(repo, plan):
+        wakes = {str(wake["id"]): wake for wake in _queued_wakes(repo, plan) if "id" in wake}
+        if wake_id not in wakes:
+            raise SystemExit(f"Unknown wake: {wake_id}")
+        claims = load_json_object(wake_claims_path(repo, plan))
+        if claims.get(wake_id) in {"acknowledged", "escalated"}:
+            raise SystemExit(f"Wake already {claims[wake_id]}: {wake_id}")
+        if claims.get(wake_id) == "claimed":
+            raise SystemExit(f"Wake already claimed: {wake_id}")
+        claims[wake_id] = "claimed"
+        write_atomic(wake_claims_path(repo, plan), json.dumps(claims, indent=2, sort_keys=True) + "\n")
+        return wakes[wake_id]
+
+
+def acknowledge_wake(repo: Path, plan: str, wake_id: str) -> None:
+    with wake_queue_lock(repo, plan):
+        claims = load_json_object(wake_claims_path(repo, plan))
+        if claims.get(wake_id) != "claimed":
+            raise SystemExit(f"Wake must be claimed before acknowledgement: {wake_id}")
+        claims[wake_id] = "acknowledged"
+        write_atomic(wake_claims_path(repo, plan), json.dumps(claims, indent=2, sort_keys=True) + "\n")
+
+
+def escalate_wake(repo: Path, plan: str, wake_id: str) -> None:
+    with wake_queue_lock(repo, plan):
+        claims = load_json_object(wake_claims_path(repo, plan))
+        if claims.get(wake_id) != "claimed":
+            raise SystemExit(f"Wake must be claimed before escalation: {wake_id}")
+        claims[wake_id] = "escalated"
+        write_atomic(wake_claims_path(repo, plan), json.dumps(claims, indent=2, sort_keys=True) + "\n")
+
+
+def supervise_once(repo: Path, plan: str) -> list[dict[str, object]]:
+    """Persist newly actionable controller work before returning it to a watcher."""
+    actions = reconcile_actions(repo, plan)
+    with wake_queue_lock(repo, plan):
+        index_path = supervision_index_path(repo, plan)
+        seen = load_json_object(index_path)
+        queued_ids = {str(wake.get("id")) for wake in _queued_wakes(repo, plan) if wake.get("id")}
+        new_wakes: list[dict[str, object]] = []
+        durable_fingerprints: dict[str, str] = {}
+        for action in actions:
+            fingerprint = f"{action['task']}:{action.get('run_id', '-') }:{action['action']}"
+            wake_id = hashlib.sha256(fingerprint.encode()).hexdigest()[:16]
+            if wake_id not in queued_ids:
+                new_wakes.append({**action, "id": wake_id})
+            durable_fingerprints[str(action["task"])] = fingerprint
+        if new_wakes:
+            append_jsonl_durable(supervision_queue_path(repo, plan), new_wakes)
+        seen.update(durable_fingerprints)
+        write_atomic(index_path, json.dumps(seen, indent=2, sort_keys=True) + "\n")
+        write_atomic(supervision_dir(repo, plan) / "watcher.json", json.dumps({"updated_at": utc_now()}) + "\n")
+        return new_wakes
+
+
+def command_supervise(repo: Path, plan: str, seconds: int) -> int:
+    if seconds <= 0:
+        raise SystemExit("--seconds must be greater than zero")
+    started = time.monotonic()
+    while True:
+        wakes = supervise_once(repo, plan)
+        if wakes:
+            print("signal: controller action required")
+            for wake in wakes:
+                print(f"{wake['task']}: {wake['action']}")
+            return 0
+        remaining = seconds - (time.monotonic() - started)
+        if remaining <= 0:
+            print(f"checkpoint: no actionable wake within {seconds}s")
+            return 124
+        time.sleep(min(EXEC_WATCH_INTERVAL_SECONDS, remaining))
+
+
+def command_stop_guard(repo: Path, plan: str) -> int:
+    """Codex Stop-hook predicate; block once when actionable work remains."""
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError:
+        return 0
+    if payload.get("stop_hook_active") is True:
+        return 0
+    actions = reconcile_actions(repo, plan)
+    if not actions:
+        return 0
+    print("TURN WOULD END BLIND: drain Task Graph reconciliation actions before stopping.", file=sys.stderr)
+    for action in actions:
+        print(f"- {action['task']}: {action['action']}", file=sys.stderr)
+    return 2
+
+
+def command_install_stop_hook(repo: Path, plan: str) -> None:
+    """Merge a scoped Stop hook into a target repository without replacing hooks."""
+    config_path = repo / ".codex" / "hooks.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        config = {"hooks": {}}
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"Invalid Codex hooks file: {config_path}: {error}") from None
+    hooks = config.setdefault("hooks", {})
+    stop = hooks.setdefault("Stop", [])
+    command = " ".join(
+        shlex.quote(value)
+        for value in ("python3", str(Path(__file__).resolve()), "stop-guard", "--repo", str(repo), "--plan", plan)
+    )
+    if not any(command in str(item) for item in stop):
+        stop.append({"hooks": [{"type": "command", "command": command, "timeout": 30}]})
+    write_atomic(config_path, json.dumps(config, indent=2) + "\n")
+    print(f"Installed Task Graph Stop hook: {config_path}")
+
+
+def command_uninstall_stop_hook(repo: Path, plan: str) -> None:
+    config_path = repo / ".codex" / "hooks.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        print(f"Task Graph Stop hook is not installed: {config_path}")
+        return
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"Invalid Codex hooks file: {config_path}: {error}") from None
+    stop = config.get("hooks", {}).get("Stop", [])
+    if not isinstance(stop, list):
+        raise SystemExit(f"Invalid Codex Stop hooks: {config_path}")
+    retained = [item for item in stop if "kanban.py stop-guard" not in json.dumps(item, sort_keys=True)]
+    config["hooks"]["Stop"] = retained
+    write_atomic(config_path, json.dumps(config, indent=2) + "\n")
+    print(f"Uninstalled Task Graph Stop hook: {config_path}")
+
+
+def latest_runtime_record(repo: Path, plan: str, task_name: str) -> tuple[str, Path, dict[str, object]] | None:
+    candidates: list[tuple[str, Path, dict[str, object]]] = []
+    runs = plan_dir(repo, plan) / "runs"
+    if not runs.exists():
+        return None
+    for run in runs.iterdir():
+        path = run / "runtime" / f"{Path(task_name).stem}.json"
+        if not path.exists():
+            continue
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if is_valid_runtime_record(record) and record.get("task") == task_name:
+            candidates.append((str(record.get("finished_at") or record.get("started_at") or ""), run, record))
+    return max(candidates, key=lambda candidate: (candidate[0], candidate[1].name), default=None)
+
+
+def reconcile_actions(repo: Path, plan: str) -> list[dict[str, object]]:
+    """Return each active task's single required controller action.
+
+    Runtime files are evidence only; the board's in-progress column selects live tasks.
+    """
+    actions: list[dict[str, object]] = []
+    for task in read_tasks_readonly(repo, plan):
+        if task.column != "in-progress":
+            continue
+        current = latest_runtime_record(repo, plan, task.path.name)
+        if current is None:
+            actions.append({"task": task.path.name, "action": "INSPECTION_REQUIRED", "reason": "No active runtime record."})
+            continue
+        _, run, record = current
+        health, _ = runtime_health(
+            run, task.path.name, record, tmux_alive=tmux_liveness,
+            stale_after=timedelta(minutes=30), now=datetime.now(UTC),
+        )
+        if health == "RUNNING":
+            continue
+        report = resolve_artifact(run, record.get("report"))
+        result = final_report_status(report)
+        review = run / "reviews" / task.path.name
+        verdict = review_status(review)
+        if result == "DONE" and record.get("exit_code") == 0:
+            if verdict in {None, "pending"}:
+                action, reason = "REVIEW_REQUIRED", "Completed worker has no approved review."
+            elif verdict == "changes_requested":
+                if repair_attempts(repo, plan, task.path.name) < 1:
+                    action, reason = "REPAIR_REQUIRED", "Review requested changes."
+                else:
+                    action, reason = "RETRY_DECISION_REQUIRED", "Focused repair already attempted."
+            else:
+                action, reason = "DELIVERY_REQUIRED", "Review approved; await delivery policy."
+        elif result == "DONE_WITH_CONCERNS":
+            if repair_attempts(repo, plan, task.path.name) < 1:
+                action, reason = "REPAIR_REQUIRED", "Worker reported concerns."
+            else:
+                action, reason = "RETRY_DECISION_REQUIRED", "Focused repair already attempted."
+        elif result in {"NEEDS_CONTEXT", "BLOCKED"}:
+            action, reason = "USER_CONTEXT_REQUIRED", f"Worker reported {result}."
+        else:
+            action, reason = "INSPECTION_REQUIRED", "Runtime is incomplete, failed, stale, or lacks a valid final report."
+        actions.append({"task": task.path.name, "run_id": run.name, "action": action, "reason": reason})
+    return actions
 
 
 def read_run_policy(repo: Path, plan: str, run_id: str) -> dict[str, object]:
@@ -753,6 +1130,33 @@ def command_teardown(repo: Path, plan: str, run_id: str, task_name: str, discard
         raise SystemExit(tmux.stderr.strip() or tmux.stdout.strip() or "tmux failed to remove session")
 
 
+def runtime_activity_at(run: Path, task_name: str, record: dict[str, object]) -> datetime | None:
+    """Return the most recent durable worker artifact update."""
+    report = resolve_artifact(run, record["report"])
+    log = resolve_artifact(run, record["log"])
+    runtime = run / "runtime" / f"{Path(task_name).stem}.json"
+    activities = [path.stat().st_mtime for path in (report, log, runtime) if path and path.exists()]
+    return datetime.fromtimestamp(max(activities), UTC) if activities else None
+
+
+def runtime_health(
+    run: Path, task_name: str, record: dict[str, object], *, tmux_alive: callable,
+    stale_after: timedelta, now: datetime,
+) -> tuple[str, datetime | None]:
+    """Classify active worker health from tmux liveness and durable activity."""
+    activity = runtime_activity_at(run, task_name, record)
+    liveness = tmux_alive(str(record["session"]))
+    if liveness == "RUNNING":
+        if activity is not None and now - activity <= stale_after:
+            return "RUNNING", activity
+        return "STALE", activity
+    if liveness == "UNKNOWN":
+        return "UNKNOWN", activity
+    if activity is not None and now - activity > stale_after:
+        return "STALE", activity
+    return "UNKNOWN", activity
+
+
 def status_entry(
     *, plan: str, run_id: str, task_name: str, run: Path, record: dict[str, object] | None,
     tmux_alive: callable, stale_after: timedelta, now: datetime,
@@ -764,14 +1168,14 @@ def status_entry(
     report = resolve_artifact(run, record["report"])
     log = resolve_artifact(run, record["log"])
     report_status = final_report_status(report)
-    liveness = tmux_alive(str(record["session"]))
     started = parse_timestamp(record["started_at"])
     finished = parse_timestamp(record["finished_at"])
     elapsed_seconds = int(((finished or now) - started).total_seconds()) if started else None
-    activities = [path.stat().st_mtime for path in (report, log) if path and path.exists()]
-    activities.append((run / "runtime" / f"{Path(task_name).stem}.json").stat().st_mtime)
-    last_activity = datetime.fromtimestamp(max(activities), UTC).isoformat() if activities else None
-    if liveness == "RUNNING":
+    health, activity = runtime_health(
+        run, task_name, record, tmux_alive=tmux_alive, stale_after=stale_after, now=now,
+    )
+    last_activity = activity.isoformat() if activity else None
+    if health == "RUNNING":
         state, hint = "RUNNING", f"Attach: tmux attach -t {record['session']}"
     elif record["exit_code"] == 0 and report_status == "DONE":
         state, hint = "SUCCEEDED_AWAITING_REVIEW", f"Open report: {report}"
@@ -779,10 +1183,10 @@ def status_entry(
         state, hint = "NEEDS_ATTENTION", f"Read report: {report}; launch the one focused repair attempt."
     elif record["exit_code"] not in (None, 0) or report_status in {"NEEDS_CONTEXT", "BLOCKED"}:
         state, hint = "NEEDS_ATTENTION", f"Inspect log: {log}; investigate or relaunch manually."
-    elif liveness == "UNKNOWN":
-        state, hint = "UNKNOWN", f"Inspect tmux pane and runtime record: {log}"
-    elif started and now - started > stale_after:
+    elif health == "STALE":
         state, hint = "STALE", f"Inspect log: {log}; investigate or relaunch manually."
+    elif health == "UNKNOWN":
+        state, hint = "UNKNOWN", f"Inspect tmux pane and runtime record: {log}"
     else:
         state, hint = "UNKNOWN", f"Inspect runtime record and log: {log}"
     return {"plan": plan, "run_id": run_id, "task": task_name, "state": state,
@@ -820,7 +1224,8 @@ def collect_status(
                     records[str(record.get("task", path.with_suffix(".md").name))] = record
                 except json.JSONDecodeError:
                     records[path.with_suffix(".md").name] = None
-            names = set(records) | tasks
+            # Completed task runtime records are archival history, not active work.
+            names = tasks
             for name in sorted(names):
                 if task_name and name != task_name:
                     continue
@@ -860,120 +1265,12 @@ def truncate_text(value: object, width: int) -> str:
     return text if len(text) <= width else f"{text[:width - 1]}…"
 
 
-def select_watch_entries(entries: list[dict[str, object]]) -> tuple[list[dict[str, object]], int]:
-    """Keep each task's newest run, while retaining every still-running worker."""
-    latest: dict[tuple[str, str], dict[str, object]] = {}
-    for entry in entries:
-        key = (str(entry["plan"]), str(entry["task"]))
-        current = latest.get(key)
-        candidate_key = (str(entry.get("last_activity") or ""), str(entry["run_id"]))
-        current_key = (
-            str(current.get("last_activity") or ""), str(current["run_id"])
-        ) if current else None
-        if current is None or candidate_key > current_key:
-            latest[key] = entry
-
-    selected = [
-        entry for entry in entries
-        if entry["state"] == "RUNNING" or latest[(str(entry["plan"]), str(entry["task"]))] is entry
-    ]
-    visible = [entry for entry in selected if entry["state"] == "RUNNING" or entry["state"] in EXEC_ACTIONABLE_STATES]
-    return visible, len(entries) - len(visible)
-
-
-def watch_next_action(entry: dict[str, object]) -> str:
-    state = entry["state"]
-    if state == "RUNNING":
-        return "Attach in tmux"
-    if state == "SUCCEEDED_AWAITING_REVIEW":
-        return "Open report"
-    if state == "NEEDS_ATTENTION":
-        return "Read report"
-    return "Inspect runtime"
-
-
-def render_watch_exec(entries: list[dict[str, object]], hidden: int, elapsed: int, remaining: int) -> str:
-    counts: dict[str, int] = {}
-    for entry in entries:
-        state = str(entry["state"])
-        counts[state] = counts.get(state, 0) + 1
-    state_summary = ", ".join(f"{state.lower()}={count}" for state, count in sorted(counts.items())) or "none"
-    lines = [
-        f"Task Graph exec monitor | elapsed {format_elapsed(elapsed)} | remaining {format_elapsed(remaining)}",
-        f"States: {state_summary}",
-        f"Showing {len(entries)} current item(s); {hidden} older run(s) hidden.",
-    ]
-    if not entries:
-        return "\n".join(lines + ["No active or actionable workers."])
-    lines.append("STATE                    TASK                      PLAN / RUN                 REPORT  ELAPSED   NEXT")
-    for entry in entries:
-        plan_run = f"{truncate_text(entry['plan'], 16)} / {truncate_text(entry['run_id'], 18)}"
-        lines.append(
-            f"{truncate_text(entry['state'], 24).ljust(24)} "
-            f"{truncate_text(entry['task'], 25).ljust(25)} "
-            f"{plan_run.ljust(26)} "
-            f"{truncate_text(entry.get('report_status') or '-', 7).ljust(7)} "
-            f"{format_elapsed(entry.get('elapsed')).ljust(9)} "
-            f"{watch_next_action(entry)}"
-        )
-    return "\n".join(lines)
-
-
-def command_status(repo: Path, plan: str | None, run_id: str | None, task_name: str | None, as_json: bool, watch: bool, interval: float) -> None:
-    if interval <= 0:
-        raise SystemExit("--interval must be greater than zero")
-    try:
-        while True:
-            entries = collect_status(repo, plan, run_id, task_name)
-            if as_json:
-                print(json.dumps({"tasks": entries}, indent=2, sort_keys=True))
-                return
-            if watch:
-                print("\033[2J\033[H", end="")
-                print("Task Graph status (Ctrl-C to stop)\n")
-            print_status(entries)
-            if not watch:
-                return
-            time.sleep(interval)
-    except KeyboardInterrupt:
-        if watch:
-            print()
-
-
-def command_watch_exec(
-    repo: Path, plan: str | None, run_id: str | None, task_name: str | None, seconds: int, *, checkpoint: bool = False,
-) -> int:
-    """Monitor exec workers, or run one bounded controller checkpoint."""
-    if seconds <= 0:
-        raise SystemExit("--seconds must be greater than zero")
-    started = time.monotonic()
-    deadline = started + seconds
-    while True:
-        entries = collect_status(repo, plan, run_id, task_name)
-        actionable = [entry for entry in entries if entry["state"] in EXEC_ACTIONABLE_STATES]
-        if checkpoint:
-            if actionable:
-                states = ", ".join(sorted({str(entry["state"]) for entry in actionable}))
-                print(f"signal: {states}")
-                print_status(actionable)
-                return 0
-            if not entries:
-                print("checkpoint: no active exec workers")
-                return 0
-        now = time.monotonic()
-        remaining = deadline - now
-        if not checkpoint:
-            visible, hidden = select_watch_entries(entries)
-            if sys.stdout.isatty():
-                print("\033[2J\033[H", end="")
-            print(render_watch_exec(visible, hidden, int(now - started), max(0, int(remaining))))
-        if remaining <= 0:
-            if checkpoint:
-                print(f"checkpoint: no actionable wake within {seconds}s")
-            else:
-                print(f"monitor: finished after {seconds}s")
-            return 124
-        time.sleep(min(EXEC_WATCH_INTERVAL_SECONDS, remaining))
+def command_status(repo: Path, plan: str | None, run_id: str | None, task_name: str | None, as_json: bool) -> None:
+    entries = collect_status(repo, plan, run_id, task_name)
+    if as_json:
+        print(json.dumps({"tasks": entries}, indent=2, sort_keys=True))
+    else:
+        print_status(entries)
 
 
 def command_archive_diff(
@@ -1026,7 +1323,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("archive-diff", "board", "plan", "reserve", "start", "done", "launch-exec", "finish-runtime", "delivery-ready", "record-delivery", "teardown", "status", "watch-exec"),
+        choices=("archive-diff", "board", "plan", "reserve", "start", "done", "launch-exec", "finish-runtime", "delivery-ready", "record-delivery", "teardown", "status", "watch-exec", "reconcile", "record-repair", "supervise", "stop-guard", "install-stop-hook", "uninstall-stop-hook", "claim-wake", "ack-wake"),
     )
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--plan", help="Lowercase kebab-case plan slug")
@@ -1048,18 +1345,49 @@ def main() -> None:
     parser.add_argument("--checkpoint", action="store_true", help="Exit watch-exec when controller attention is needed")
     parser.add_argument("--interval", type=float, default=2.0, help="Status refresh interval in seconds")
     parser.add_argument("--seconds", type=int, help="Maximum watch-exec monitor duration in seconds")
+    parser.add_argument("--wake-id", help="Durable wake identifier")
     args = parser.parse_args()
 
     repo = args.repo.resolve()
     if args.command == "status":
-        command_status(repo, args.plan, args.run_id, args.task, args.json, args.watch, args.interval)
+        if args.watch:
+            import watcher
+
+            watcher.watch_status(repo, args.plan, args.run_id, args.task, args.interval, as_json=args.json)
+        else:
+            command_status(repo, args.plan, args.run_id, args.task, args.json)
         return
     if args.command == "watch-exec":
+        import watcher
+
         if args.seconds is None:
             raise SystemExit("watch-exec requires --seconds <positive-int>")
-        raise SystemExit(command_watch_exec(repo, args.plan, args.run_id, args.task, args.seconds, checkpoint=args.checkpoint))
+        raise SystemExit(watcher.watch_exec(repo, args.plan, args.run_id, args.task, args.seconds, checkpoint=args.checkpoint))
     if not args.plan:
         raise SystemExit(f"{args.command} requires --plan <plan-slug>")
+    if args.command == "stop-guard":
+        raise SystemExit(command_stop_guard(repo, args.plan))
+    if args.command == "install-stop-hook":
+        command_install_stop_hook(repo, args.plan)
+        return
+    if args.command == "uninstall-stop-hook":
+        command_uninstall_stop_hook(repo, args.plan)
+        return
+    if args.command == "claim-wake":
+        if not args.wake_id:
+            raise SystemExit("claim-wake requires --wake-id <id>")
+        print(json.dumps(claim_wake(repo, args.plan, args.wake_id), sort_keys=True))
+        return
+    if args.command == "ack-wake":
+        if not args.wake_id:
+            raise SystemExit("ack-wake requires --wake-id <id>")
+        acknowledge_wake(repo, args.plan, args.wake_id)
+        print(f"Acknowledged wake: {args.wake_id}")
+        return
+    if args.command == "supervise":
+        if args.seconds is None:
+            raise SystemExit("supervise requires --seconds <positive-int>")
+        raise SystemExit(command_supervise(repo, args.plan, args.seconds))
     if args.command == "board":
         print(f"Board: {rewrite_board(repo, args.plan)}")
     elif args.command == "plan":
@@ -1068,6 +1396,21 @@ def main() -> None:
             print_schedule_json(schedule, args.limit)
         else:
             print_schedule(schedule, args.limit)
+    elif args.command == "reconcile":
+        actions = reconcile_actions(repo, args.plan)
+        if args.json:
+            print(json.dumps({"actions": actions}, indent=2, sort_keys=True))
+        elif actions:
+            for action in actions:
+                print(f"{action['task']}: {action['action']} - {action['reason']}")
+        else:
+            print("No autonomous controller action required.")
+    elif args.command == "record-repair":
+        if not args.task:
+            raise SystemExit("record-repair requires --task <filename>")
+        task_in_progress(repo, args.plan, args.task)
+        record_repair_attempt(repo, args.plan, args.task)
+        print(f"Recorded repair attempt: {args.task}")
     elif args.command == "reserve":
         if not args.run_id:
             raise SystemExit("reserve requires --run-id <id>")

@@ -79,9 +79,35 @@ After a successful report, approved review, and tests, `delivery-ready` tells th
 
 ## Low-Intrusion Monitoring
 
-The controller runs a bounded `kanban.py watch-exec --checkpoint --seconds 60` checkpoint immediately after launch, then repeats bounded checkpoints while work is expected. Checkpoint mode probes immediately, polls every five seconds, and returns early at `SUCCEEDED_AWAITING_REVIEW`, `NEEDS_ATTENTION`, `STALE`, or `UNKNOWN`. A quiet checkpoint prints its outcome and exits `124` after its bound.
+The controller runs a bounded `watcher.py watch-exec --checkpoint --seconds 60` checkpoint immediately after launch, then repeats bounded checkpoints while work is expected. Checkpoint mode probes immediately, polls every five seconds, and returns early at `SUCCEEDED_AWAITING_REVIEW`, `NEEDS_ATTENTION`, `STALE`, or `UNKNOWN`. A quiet checkpoint prints its outcome and exits `124` after its bound.
 
 Automatic monitoring must never use shell `sleep`, compound commands, manual `status --json` polling, or `status --watch`. Each checkpoint is a standalone read-only command; it never relaunches workers or changes task, runtime, report, delivery, or session state. Users may still request the status dashboards below.
+
+## Controller reconciliation
+
+Task Graph uses the board as the source of current work and treats old runtime records as history. Before reporting status or ending a controller turn, run `reconcile`; dispatch every safe review or first focused repair it returns. `No change` is valid only when the reconciliation queue has no autonomous work. While tasks are in flight, Codex controllers run bounded foreground `supervise` checkpoints; each checkpoint writes durable wakes under `.agent/<plan>/state/` before it signals the controller.
+
+For FirstMate-style protection against a blind end, explicitly install the scoped Stop hook in a target project. It preserves existing hooks and blocks one turn only when reconciliation has actionable work:
+
+```bash
+python3 <skill-dir>/scripts/kanban.py install-stop-hook --repo <repo-root> --plan <plan-slug>
+python3 <skill-dir>/scripts/kanban.py uninstall-stop-hook --repo <repo-root> --plan <plan-slug>
+```
+
+## Local controller
+
+For unattended local workers, start one controller per plan. It requires tmux, records its lease, heartbeat, session, and every wake dispatch in `.agent/<plan-slug>/state/controller.json`. A second live controller for the same plan is refused; `start` is the explicit safe recovery action only after the prior tmux session is absent. It never auto-restarts a controller.
+
+```bash
+python3 <skill-dir>/scripts/controller.py start --repo <repo-root> --plan <plan-slug>
+python3 <skill-dir>/scripts/controller.py start --repo <repo-root> --plan <plan-slug> --no-mistakes-command '<project gate command>'
+python3 <skill-dir>/scripts/controller.py status --repo <repo-root> --plan <plan-slug>
+python3 <skill-dir>/scripts/controller.py stop --repo <repo-root> --plan <plan-slug>
+```
+
+The controller claims durable wakes before it launches a reviewer or focused repair, then acknowledges them only after that session starts. Human-required wakes (`INSPECTION_REQUIRED`, `USER_CONTEXT_REQUIRED`, `RETRY_DECISION_REQUIRED`) and delivery approval or tooling failures are persisted as a pending alert, marked `escalated`, and pause the controller without discarding queued autonomous work. Resolve the underlying task condition, then use `start` to reconcile and resume. `status` reports `live`, `healthy`, pending alerts, and a durable `CONTROLLER_RECOVERY_REQUIRED` alert when in-progress work has a dead or stale controller; it only reports, never restarts. `stop` is an explicit operator action; Stop hooks remain a backstop, not a dispatcher.
+
+Delivery is policy-gated. With `+yolo`, `local-only` fast-forwards only a clean integration branch; `direct-pr` pushes through the PR/check/merge path; and `no-mistakes` first runs the command supplied at controller start, then follows the PR path. Without `+yolo`, the state records `DELIVERY_APPROVAL_REQUIRED` instead of landing work.
 
 ## Command Reference
 
@@ -99,14 +125,19 @@ python3 <skill-dir>/scripts/kanban.py launch-exec --repo <repo-root> --plan <pla
 tmux attach -t task-graph-<plan-slug>-<run-id>-001-example
 ```
 
-Run the compact persistent monitor, or run an explicit bounded controller checkpoint. `status --watch` is a user-requested dashboard, not controller automation:
+Run the compact persistent monitor, or run an explicit bounded controller checkpoint. The watcher dashboard is read-only; controller supervision alone owns wake queue transitions. `status --watch` is a user-requested dashboard, not controller automation:
 
 ```bash
-python3 <skill-dir>/scripts/kanban.py watch-exec --repo <repo-root> --seconds 180
-python3 <skill-dir>/scripts/kanban.py watch-exec --checkpoint --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --seconds 60
+python3 <skill-dir>/scripts/watcher.py watch-exec --repo <repo-root> --seconds 180
+python3 <skill-dir>/scripts/controller.py start --repo <repo-root> --plan <plan-slug>
+python3 <skill-dir>/scripts/controller.py status --repo <repo-root> --plan <plan-slug>
+python3 <skill-dir>/scripts/controller.py stop --repo <repo-root> --plan <plan-slug>
+python3 <skill-dir>/scripts/kanban.py reconcile --repo <repo-root> --plan <plan-slug> --json
+python3 <skill-dir>/scripts/kanban.py supervise --repo <repo-root> --plan <plan-slug> --seconds 60
+python3 <skill-dir>/scripts/watcher.py watch-exec --checkpoint --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --seconds 60
 python3 <skill-dir>/scripts/kanban.py status --repo <repo-root>
 python3 <skill-dir>/scripts/kanban.py status --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --json
-python3 <skill-dir>/scripts/kanban.py status --repo <repo-root> --watch --interval 2
+python3 <skill-dir>/scripts/watcher.py status --repo <repo-root> --interval 2
 ```
 
 Complete the post-worker lifecycle:

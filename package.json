@@ -12,7 +12,9 @@
     "install.sh",
     "agents/openai.yaml",
     "bin/task-graph-skill.js",
-    "scripts/kanban.py"
+    "scripts/kanban.py",
+    "scripts/watcher.py",
+    "scripts/controller.py"
   ],
   "engines": {
     "node": ">=18"

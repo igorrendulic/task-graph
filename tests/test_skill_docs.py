@@ -137,6 +137,15 @@ class SkillDocsTest(unittest.TestCase):
             self.assertIn("checkpoint", document)
             self.assertIn("status --watch", document)
 
+    def test_docs_require_reconciliation_before_a_controller_can_go_idle(self) -> None:
+        skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        for document in (skill, readme):
+            self.assertIn("reconcile", document)
+            self.assertIn("supervise", document)
+            self.assertIn("No change", document)
+
     def test_docs_define_guarded_delivery_policy(self) -> None:
         skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -177,6 +186,18 @@ class SkillDocsTest(unittest.TestCase):
             self.assertIn(heading, readme)
         self.assertLess(readme.index("## Quick Start"), readme.index("Install for Claude Code"))
         self.assertLess(readme.index("## Guarded Delivery"), readme.index("## Command Reference"))
+
+    def test_docs_describe_the_tmux_resident_local_controller_boundary(self) -> None:
+        skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        for document in (skill, readme):
+            self.assertIn("controller.py start", document)
+            self.assertIn("controller.py status", document)
+            self.assertIn("controller.py stop", document)
+            self.assertIn("controller.json", document)
+        self.assertIn("tmux-resident", skill)
+        self.assertIn("Stop hook is a blind-end backstop", skill)
 
 
 if __name__ == "__main__":
