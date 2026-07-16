@@ -16,8 +16,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -32,6 +34,19 @@ STATE_VERSION = 2
 CHECKPOINT_SECONDS = 60
 HEARTBEAT_MAX_AGE_SECONDS = CHECKPOINT_SECONDS * 2
 HUMAN_REQUIRED_ACTIONS = frozenset({"INSPECTION_REQUIRED", "USER_CONTEXT_REQUIRED", "RETRY_DECISION_REQUIRED"})
+EXTERNAL_POLL_SECONDS = 1
+NO_MISTAKES_TIMEOUT_SECONDS = 30 * 60
+PUSH_TIMEOUT_SECONDS = 5 * 60
+PR_LOOKUP_TIMEOUT_SECONDS = 60
+PR_CHECKS_TIMEOUT_SECONDS = 30 * 60
+MERGE_TIMEOUT_SECONDS = 5 * 60
+
+
+@dataclass(frozen=True)
+class ExternalRun:
+    completed: subprocess.CompletedProcess[str] | None
+    timed_out: bool = False
+    missing: bool = False
 
 
 def controller_state_path(repo: Path, plan: str) -> Path:
@@ -93,6 +108,7 @@ def normalize_state(state: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("recovery_alert", None)
     state.setdefault("recovery_required", False)
     state.setdefault("dispatches", {})
+    state.setdefault("delivery_attempt", None)
     state.setdefault("revision", 0)
     return state
 
@@ -314,16 +330,87 @@ def finalize_landed(repo: Path, plan: str, run_id: str, task: str) -> None:
     KANBAN.command_done(repo, plan, task)
 
 
-def run_external(command: list[str], *, cwd: Path, **kwargs: Any) -> subprocess.CompletedProcess[str] | None:
-    """Run an integration tool without turning a missing binary into lost work."""
+def run_external(
+    command: list[str] | str, *, cwd: Path, timeout_seconds: int, heartbeat: Callable[[], None] | None = None,
+    shell: bool = False,
+) -> ExternalRun:
+    """Poll a bounded external command while allowing the controller to stay healthy."""
     try:
-        return subprocess.run(command, cwd=cwd, text=True, capture_output=True, **kwargs)
+        process = subprocess.Popen(command, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=shell)
     except FileNotFoundError:
-        return None
+        return ExternalRun(None, missing=True)
+    deadline = time.monotonic() + timeout_seconds
+    while process.poll() is None:
+        if heartbeat is not None:
+            heartbeat()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            process.terminate()
+            try:
+                process.communicate(timeout=EXTERNAL_POLL_SECONDS)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+            return ExternalRun(None, timed_out=True)
+        time.sleep(min(EXTERNAL_POLL_SECONDS, remaining))
+    stdout, stderr = process.communicate()
+    return ExternalRun(subprocess.CompletedProcess(command, process.returncode, stdout, stderr))
+
+
+def delivery_heartbeat(repo: Path, plan: str, state: dict[str, Any]) -> Callable[[], None]:
+    return lambda: refresh_heartbeat(repo, plan, state)
+
+
+def record_merge_submission(
+    repo: Path, plan: str, state: dict[str, Any], *, task: str, run_id: str, branch: str, expected_head: str,
+) -> None:
+    def record(latest: dict[str, Any]) -> None:
+        latest["delivery_attempt"] = {
+            "task": task, "run_id": run_id, "branch": branch, "expected_head": expected_head,
+            "state": "submitted", "submitted_at": KANBAN.utc_now(),
+        }
+
+    replace_state(state, mutate_state(repo, plan, record))
+
+
+def reconcile_delivery_outcome(repo: Path, plan: str, state: dict[str, Any]) -> bool:
+    """Finalize only a durably recorded submission that GitHub confirms as merged."""
+    attempt = state.get("delivery_attempt")
+    if not isinstance(attempt, dict) or attempt.get("state") == "finalized":
+        return True
+    branch, expected_head = attempt.get("branch"), attempt.get("expected_head")
+    if not isinstance(branch, str) or not isinstance(expected_head, str) or not expected_head:
+        return False
+    result = run_external(
+        ["gh", "pr", "view", branch, "--json", "state,headRefOid"], cwd=repo,
+        timeout_seconds=PR_LOOKUP_TIMEOUT_SECONDS, heartbeat=delivery_heartbeat(repo, plan, state),
+    )
+    if result.timed_out or result.missing or result.completed is None or result.completed.returncode:
+        return False
+    try:
+        outcome = json.loads(result.completed.stdout)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(outcome, dict) or outcome.get("state") != "MERGED" or outcome.get("headRefOid") != expected_head:
+        return False
+    finalize_landed(repo, plan, str(attempt["run_id"]), str(attempt["task"]))
+
+    def finalized(latest: dict[str, Any]) -> None:
+        current = latest.get("delivery_attempt")
+        if isinstance(current, dict):
+            current["state"] = "finalized"
+            current["finalized_at"] = KANBAN.utc_now()
+        latest["pending_alert"] = None
+
+    replace_state(state, mutate_state(repo, plan, finalized))
+    return True
 
 
 def deliver(repo: Path, plan: str, wake: dict[str, object], state: dict[str, Any]) -> str:
     task, run_id = str(wake["task"]), str(wake["run_id"])
+    attempt = state.get("delivery_attempt")
+    if isinstance(attempt, dict) and attempt.get("state") == "submitted":
+        return "DELIVERY_OUTCOME_UNKNOWN"
     action = KANBAN.command_delivery_ready(repo, plan, run_id, task)
     _, _, record = latest_runtime(repo, plan, task)
     policy = KANBAN.read_run_policy(repo, plan, run_id)
@@ -333,11 +420,15 @@ def deliver(repo: Path, plan: str, wake: dict[str, object], state: dict[str, Any
         command = state.get("no_mistakes_command")
         if not isinstance(command, str) or not command.strip():
             return "NO_MISTAKES_COMMAND_REQUIRED"
-        try:
-            gate = subprocess.run(command, shell=True, cwd=Path(str(record["worktree"])))
-        except FileNotFoundError:
+        gate = run_external(
+            command, cwd=Path(str(record["worktree"])), timeout_seconds=NO_MISTAKES_TIMEOUT_SECONDS,
+            heartbeat=delivery_heartbeat(repo, plan, state), shell=True,
+        )
+        if gate.missing:
             return "TOOLING_REQUIRED"
-        if gate.returncode:
+        if gate.timed_out:
+            return "NO_MISTAKES_TIMEOUT"
+        if gate.completed is None or gate.completed.returncode:
             return "NO_MISTAKES_FAILED"
         action = "MERGE_GREEN_PR"
     if action == "FAST_FORWARD_LOCAL":
@@ -350,27 +441,53 @@ def deliver(repo: Path, plan: str, wake: dict[str, object], state: dict[str, Any
         return "LANDED"
     if action == "MERGE_GREEN_PR":
         branch = str(record["branch"])
-        pushed = run_external(["git", "push", "-u", "origin", branch], cwd=repo)
-        if pushed is None:
+        heartbeat = delivery_heartbeat(repo, plan, state)
+        pushed = run_external(["git", "push", "-u", "origin", branch], cwd=repo, timeout_seconds=PUSH_TIMEOUT_SECONDS, heartbeat=heartbeat)
+        if pushed.missing:
             return "TOOLING_REQUIRED"
-        if pushed.returncode:
+        if pushed.timed_out:
+            return "PUSH_TIMEOUT"
+        if pushed.completed is None or pushed.completed.returncode:
             return "PR_DELIVERY_FAILED"
-        existing = run_external(["gh", "pr", "view", branch, "--json", "number"], cwd=repo)
-        if existing is None:
+        existing = run_external(["gh", "pr", "view", branch, "--json", "number"], cwd=repo, timeout_seconds=PR_LOOKUP_TIMEOUT_SECONDS, heartbeat=heartbeat)
+        if existing.missing:
             return "TOOLING_REQUIRED"
-        if existing.returncode:
-            created = run_external(["gh", "pr", "create", "--head", branch, "--fill"], cwd=repo)
-            if created is None:
+        if existing.timed_out:
+            return "PR_LOOKUP_TIMEOUT"
+        if existing.completed is None or existing.completed.returncode:
+            created = run_external(["gh", "pr", "create", "--head", branch, "--fill"], cwd=repo, timeout_seconds=PUSH_TIMEOUT_SECONDS, heartbeat=heartbeat)
+            if created.missing:
                 return "TOOLING_REQUIRED"
-            if created.returncode:
+            if created.timed_out:
+                return "PR_CREATE_TIMEOUT"
+            if created.completed is None or created.completed.returncode:
                 return "PR_DELIVERY_FAILED"
-        for command in (["gh", "pr", "checks", branch, "--watch", "--fail-fast"], ["gh", "pr", "merge", branch, "--merge", "--delete-branch"]):
-            result = run_external(command, cwd=repo)
-            if result is None:
-                return "TOOLING_REQUIRED"
-            if result.returncode:
-                return "PR_DELIVERY_FAILED"
+        checks = run_external(["gh", "pr", "checks", branch, "--watch", "--fail-fast"], cwd=repo, timeout_seconds=PR_CHECKS_TIMEOUT_SECONDS, heartbeat=heartbeat)
+        if checks.missing:
+            return "TOOLING_REQUIRED"
+        if checks.timed_out:
+            return "PR_CHECKS_TIMEOUT"
+        if checks.completed is None or checks.completed.returncode:
+            return "PR_DELIVERY_FAILED"
+        expected_head = str(record.get("head_commit", ""))
+        if not expected_head:
+            return "DELIVERY_HEAD_REQUIRED"
+        record_merge_submission(repo, plan, state, task=task, run_id=run_id, branch=branch, expected_head=expected_head)
+        try:
+            merged = run_external(
+                ["gh", "pr", "merge", branch, "--merge", "--delete-branch"], cwd=repo,
+                timeout_seconds=MERGE_TIMEOUT_SECONDS, heartbeat=heartbeat,
+            )
+        except (OSError, RuntimeError):
+            return "DELIVERY_OUTCOME_UNKNOWN"
+        if merged.missing:
+            return "DELIVERY_OUTCOME_UNKNOWN"
+        if merged.timed_out:
+            return "DELIVERY_OUTCOME_UNKNOWN"
+        if merged.completed is None or merged.completed.returncode:
+            return "DELIVERY_OUTCOME_UNKNOWN"
         finalize_landed(repo, plan, run_id, task)
+        replace_state(state, mutate_state(repo, plan, lambda latest: latest.__setitem__("delivery_attempt", None)))
         return "LANDED"
     return "DELIVERY_APPROVAL_REQUIRED"
 
@@ -523,6 +640,8 @@ def start_controller(repo: Path, plan: str, no_mistakes_command: str | None) -> 
         if state and KANBAN.tmux_session_exists(str(state.get("session"))):
             raise SystemExit("A live controller already exists for this plan")
         state = create_state(repo, plan, no_mistakes_command) if state is None else state
+        if not reconcile_delivery_outcome(repo, plan, state):
+            raise SystemExit("Pending controller alert: DELIVERY_OUTCOME_UNKNOWN")
         if not reconcile_pending_alert(repo, plan, state):
             alert = state.get("pending_alert") or {}
             raise SystemExit(f"Pending controller alert: {alert.get('reason', 'human action required')}")

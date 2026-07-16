@@ -258,12 +258,128 @@ class ControllerStateTest(unittest.TestCase):
         with patch.object(CONTROLLER.KANBAN, "command_delivery_ready", return_value="RUN_NO_MISTAKES"), patch.object(
             CONTROLLER.KANBAN, "latest_runtime_record", return_value=("", Path("/run"), {"worktree": "/work"})
         ), patch.object(CONTROLLER.KANBAN, "read_run_policy", return_value={"mode": "no-mistakes", "yolo": True}), patch.object(
-            CONTROLLER.subprocess, "run", return_value=completed([], 1)
+            CONTROLLER, "run_external", return_value=CONTROLLER.ExternalRun(completed([], 1))
         ), patch.object(CONTROLLER, "finalize_landed") as finalize:
             result = CONTROLLER.deliver(self.repo, self.plan, wake, {"no_mistakes_command": "make check"})
 
         self.assertEqual("NO_MISTAKES_FAILED", result)
         finalize.assert_not_called()
+
+    def test_hung_no_mistakes_times_out_and_refreshes_heartbeat(self) -> None:
+        wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "DELIVERY_REQUIRED"}
+        state = CONTROLLER.create_state(self.repo, self.plan, "make check")
+        record = {"worktree": "/work", "branch": "task-branch"}
+        completed = __import__("subprocess").CompletedProcess
+        heartbeats: list[None] = []
+        def timeout_with_heartbeat(*_args: object, **kwargs: object) -> object:
+            kwargs["heartbeat"]()
+            return CONTROLLER.ExternalRun(None, timed_out=True)
+
+        with patch.object(CONTROLLER.KANBAN, "command_delivery_ready", return_value="RUN_NO_MISTAKES"), patch.object(
+            CONTROLLER.KANBAN, "latest_runtime_record", return_value=("", Path("/run"), record)
+        ), patch.object(CONTROLLER.KANBAN, "read_run_policy", return_value={"mode": "no-mistakes", "yolo": True}), patch.object(
+            CONTROLLER, "run_external", side_effect=timeout_with_heartbeat
+        ), patch.object(CONTROLLER, "refresh_heartbeat", side_effect=lambda *_: heartbeats.append(None)), patch.object(
+            CONTROLLER, "finalize_landed"
+        ) as finalize:
+            result = CONTROLLER.deliver(self.repo, self.plan, wake, state)
+
+        self.assertEqual("NO_MISTAKES_TIMEOUT", result)
+        self.assertTrue(heartbeats)
+        finalize.assert_not_called()
+
+    def test_polling_runner_terminates_a_hung_command_after_refreshing_heartbeat(self) -> None:
+        class HungProcess:
+            returncode = None
+
+            def __init__(self) -> None:
+                self.terminated = False
+
+            def poll(self) -> None:
+                return None
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def communicate(self, **_kwargs: object) -> tuple[str, str]:
+                return "", ""
+
+        process = HungProcess()
+        heartbeats: list[None] = []
+        with patch.object(CONTROLLER.subprocess, "Popen", return_value=process), patch.object(
+            CONTROLLER.time, "monotonic", side_effect=[0, 0, 2]
+        ), patch.object(CONTROLLER.time, "sleep"):
+            result = CONTROLLER.run_external(
+                ["hung-command"], cwd=self.repo, timeout_seconds=1, heartbeat=lambda: heartbeats.append(None)
+            )
+
+        self.assertTrue(result.timed_out)
+        self.assertTrue(process.terminated)
+        self.assertGreaterEqual(len(heartbeats), 2)
+
+    def test_pr_check_timeout_pauses_without_recording_delivery(self) -> None:
+        wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "DELIVERY_REQUIRED"}
+        state = CONTROLLER.create_state(self.repo, self.plan, None)
+        record = {"worktree": "/work", "branch": "task-branch", "head_commit": "expected-head"}
+        completed = __import__("subprocess").CompletedProcess
+        with patch.object(CONTROLLER.KANBAN, "command_delivery_ready", return_value="MERGE_GREEN_PR"), patch.object(
+            CONTROLLER.KANBAN, "latest_runtime_record", return_value=("", Path("/run"), record)
+        ), patch.object(CONTROLLER.KANBAN, "read_run_policy", return_value={"mode": "direct-pr", "yolo": True}), patch.object(
+            CONTROLLER, "run_external", side_effect=[
+                CONTROLLER.ExternalRun(completed([], 0)), CONTROLLER.ExternalRun(completed([], 0)),
+                CONTROLLER.ExternalRun(None, timed_out=True),
+            ]
+        ), patch.object(CONTROLLER.KANBAN, "escalate_wake"), patch.object(
+            CONTROLLER.KANBAN, "command_record_delivery"
+        ) as record_delivery:
+            result = CONTROLLER.dispatch_wake(self.repo, self.plan, wake, state, claimed=True)
+
+        self.assertEqual("PR_CHECKS_TIMEOUT", result)
+        self.assertEqual("paused", state["lifecycle"])
+        record_delivery.assert_not_called()
+
+    def test_merge_timeout_records_unknown_outcome_and_never_retries_merge(self) -> None:
+        wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "DELIVERY_REQUIRED"}
+        state = CONTROLLER.create_state(self.repo, self.plan, None)
+        record = {"worktree": "/work", "branch": "task-branch", "head_commit": "expected-head"}
+        completed = __import__("subprocess").CompletedProcess
+        with patch.object(CONTROLLER.KANBAN, "command_delivery_ready", return_value="MERGE_GREEN_PR"), patch.object(
+            CONTROLLER.KANBAN, "latest_runtime_record", return_value=("", Path("/run"), record)
+        ), patch.object(CONTROLLER.KANBAN, "read_run_policy", return_value={"mode": "direct-pr", "yolo": True}), patch.object(
+            CONTROLLER, "run_external", side_effect=[
+                CONTROLLER.ExternalRun(completed([], 0)), CONTROLLER.ExternalRun(completed([], 0)),
+                CONTROLLER.ExternalRun(completed([], 0)), CONTROLLER.ExternalRun(None, timed_out=True),
+            ]
+        ) as runner, patch.object(CONTROLLER.KANBAN, "escalate_wake"):
+            self.assertEqual("DELIVERY_OUTCOME_UNKNOWN", CONTROLLER.dispatch_wake(self.repo, self.plan, wake, state, claimed=True))
+            self.assertEqual("DELIVERY_OUTCOME_UNKNOWN", CONTROLLER.dispatch_wake(self.repo, self.plan, wake, state, claimed=True))
+
+        merge_commands = [call.args[0] for call in runner.call_args_list if call.args[0][:3] == ["gh", "pr", "merge"]]
+        self.assertEqual(1, len(merge_commands))
+        self.assertEqual("expected-head", state["delivery_attempt"]["expected_head"])
+
+    def test_resume_finalizes_a_confirmed_expected_merge_once(self) -> None:
+        wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "DELIVERY_REQUIRED"}
+        state = CONTROLLER.create_state(self.repo, self.plan, None)
+        state.update({
+            "lifecycle": "paused",
+            "pending_alert": {"task": "001-work.md", "run_id": "run-a", "reason": "DELIVERY_OUTCOME_UNKNOWN"},
+            "delivery_attempt": {"task": "001-work.md", "run_id": "run-a", "branch": "task-branch", "expected_head": "expected-head", "state": "submitted"},
+        })
+        CONTROLLER.write_state(self.repo, self.plan, state)
+        confirmed = CONTROLLER.ExternalRun(__import__("subprocess").CompletedProcess([], 0, stdout=json.dumps({
+            "state": "MERGED", "headRefOid": "expected-head"
+        })))
+        with patch.object(CONTROLLER, "require_tmux"), patch.object(
+            CONTROLLER.KANBAN, "tmux_session_exists", return_value=False
+        ), patch.object(CONTROLLER, "tmux_start", return_value=123), patch.object(
+            CONTROLLER, "run_external", return_value=confirmed
+        ), patch.object(CONTROLLER, "finalize_landed"
+        ) as finalize:
+            CONTROLLER.start_controller(self.repo, self.plan, None)
+            CONTROLLER.start_controller(self.repo, self.plan, None)
+
+        finalize.assert_called_once_with(self.repo, self.plan, "run-a", "001-work.md")
 
     def test_start_refuses_a_second_live_controller(self) -> None:
         state = CONTROLLER.create_state(self.repo, self.plan, None)
@@ -319,14 +435,15 @@ class ControllerStateTest(unittest.TestCase):
 
     def test_direct_pr_pushes_then_creates_checks_and_merges(self) -> None:
         wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "DELIVERY_REQUIRED"}
-        record = {"worktree": "/work", "branch": "task-branch"}
+        state = CONTROLLER.create_state(self.repo, self.plan, None)
+        record = {"worktree": "/work", "branch": "task-branch", "head_commit": "expected-head"}
         completed = __import__("subprocess").CompletedProcess
         with patch.object(CONTROLLER.KANBAN, "command_delivery_ready", return_value="MERGE_GREEN_PR"), patch.object(
             CONTROLLER.KANBAN, "latest_runtime_record", return_value=("", Path("/run"), record)
         ), patch.object(CONTROLLER.KANBAN, "read_run_policy", return_value={"mode": "direct-pr", "yolo": True}), patch.object(
-            CONTROLLER.subprocess, "run", return_value=completed([], 0)
+            CONTROLLER, "run_external", return_value=CONTROLLER.ExternalRun(completed([], 0))
         ) as run, patch.object(CONTROLLER, "finalize_landed") as finalize:
-            result = CONTROLLER.deliver(self.repo, self.plan, wake, {})
+            result = CONTROLLER.deliver(self.repo, self.plan, wake, state)
 
         self.assertEqual("LANDED", result)
         commands = [call.args[0] for call in run.call_args_list]
@@ -336,11 +453,11 @@ class ControllerStateTest(unittest.TestCase):
 
     def test_missing_delivery_tool_retains_work_at_tooling_checkpoint(self) -> None:
         wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "DELIVERY_REQUIRED"}
-        record = {"worktree": "/work", "branch": "task-branch"}
+        record = {"worktree": "/work", "branch": "task-branch", "head_commit": "expected-head"}
         with patch.object(CONTROLLER.KANBAN, "command_delivery_ready", return_value="MERGE_GREEN_PR"), patch.object(
             CONTROLLER.KANBAN, "latest_runtime_record", return_value=("", Path("/run"), record)
         ), patch.object(CONTROLLER.KANBAN, "read_run_policy", return_value={"mode": "direct-pr", "yolo": True}), patch.object(
-            CONTROLLER.subprocess, "run", side_effect=FileNotFoundError("gh")
+            CONTROLLER, "run_external", return_value=CONTROLLER.ExternalRun(None, missing=True)
         ), patch.object(CONTROLLER, "finalize_landed") as finalize:
             result = CONTROLLER.deliver(self.repo, self.plan, wake, {})
 
@@ -349,12 +466,15 @@ class ControllerStateTest(unittest.TestCase):
 
     def test_failed_pr_checks_retain_work(self) -> None:
         wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "DELIVERY_REQUIRED"}
-        record = {"worktree": "/work", "branch": "task-branch"}
+        record = {"worktree": "/work", "branch": "task-branch", "head_commit": "expected-head"}
         completed = __import__("subprocess").CompletedProcess
         with patch.object(CONTROLLER.KANBAN, "command_delivery_ready", return_value="MERGE_GREEN_PR"), patch.object(
             CONTROLLER.KANBAN, "latest_runtime_record", return_value=("", Path("/run"), record)
         ), patch.object(CONTROLLER.KANBAN, "read_run_policy", return_value={"mode": "direct-pr", "yolo": True}), patch.object(
-            CONTROLLER.subprocess, "run", side_effect=[completed([], 0), completed([], 0), completed([], 1)]
+            CONTROLLER, "run_external", side_effect=[
+                CONTROLLER.ExternalRun(completed([], 0)), CONTROLLER.ExternalRun(completed([], 0)),
+                CONTROLLER.ExternalRun(completed([], 1)),
+            ]
         ), patch.object(CONTROLLER, "finalize_landed") as finalize:
             result = CONTROLLER.deliver(self.repo, self.plan, wake, {})
 
