@@ -1054,6 +1054,20 @@ class FleetControllerTest(unittest.TestCase):
         self.assertEqual("stopped", saved["lifecycle"])
         self.assertIsNone(saved["pending_alert"])
 
+    def test_repair_wake_queue_accepts_a_stopped_controller_with_the_same_corruption_alert(self) -> None:
+        state = CONTROLLER.create_state(self.repo, self.plan, None)
+        queue = CONTROLLER.KANBAN.supervision_queue_path(self.repo, self.plan)
+        queue.parent.mkdir(parents=True, exist_ok=True)
+        queue.write_text('{"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REVIEW_REQUIRED"}\n', encoding="utf-8")
+        state.update({"lifecycle": "stopped", "lease": None, "pending_alert": {"reason": "SUPERVISION_STATE_CORRUPTION", "artifact": str(queue)}})
+        CONTROLLER.write_state(self.repo, self.plan, state)
+
+        with patch.object(CONTROLLER.KANBAN, "tmux_session_exists", return_value=False):
+            repaired = CONTROLLER.repair_wake_queue(self.repo, self.plan)
+
+        self.assertEqual(1, repaired["retained"])
+        self.assertIsNone(CONTROLLER.load_state(self.repo, self.plan)["pending_alert"])
+
     def test_board_request_rewrites_a_stale_existing_board(self) -> None:
         board = self.repo / ".agent" / self.plan / "kanban.md"
         board.write_text("stale\n", encoding="utf-8")

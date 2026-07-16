@@ -932,6 +932,47 @@ def tmux_create_window(
     return int(pane.stdout.strip()) if pane.returncode == 0 and pane.stdout.strip().isdigit() else None
 
 
+def worker_launch_wrapper(
+    repo: Path,
+    plan: str,
+    run_id: str,
+    task_name: str,
+    brief: Path,
+    log: Path,
+    command: list[str],
+) -> str:
+    """Build the worker command shared by new and recovered launches."""
+    prompt = (
+        f"Read {brief}. Work only on the assigned task in the current worktree. "
+        "Do not write outside that worktree and do not run git commit. "
+        "Return the complete final report in your final response, including status, summary, "
+        "tests, concerns, and a suggested commit message."
+    )
+    codex_command = " ".join(shlex.quote(item) for item in [*command, prompt])
+    finish_runtime = " ".join(
+        shlex.quote(value)
+        for value in (
+            shutil.which("python3") or "python3",
+            str(Path(__file__).resolve()),
+            "finish-runtime",
+            "--repo",
+            str(repo),
+            "--plan",
+            plan,
+            "--run-id",
+            run_id,
+            "--task",
+            task_name,
+            "--exit-code",
+        )
+    )
+    return (
+        f"set -o pipefail; {codex_command} 2>&1 | tee -a {shlex.quote(str(log))}; "
+        "exit_code=${PIPESTATUS[0]}; "
+        f"{finish_runtime} $exit_code; exit $exit_code"
+    )
+
+
 def verified_worktree(repo: Path, worktree: Path, branch: str) -> tuple[Path, str]:
     root = worktree.resolve()
     if root == repo.resolve():
@@ -990,20 +1031,7 @@ def command_launch_exec(
         if tmux_target_exists(target):
             raise SystemExit(f"tmux target already exists: {tmux_target(record)}")
         write_runtime_record(record_path, record)
-        prompt = (
-            f"Read {brief}. Work only on the assigned task in the current worktree. "
-            "Do not write outside that worktree and do not run git commit. "
-            "Return the complete final report in your final response, including status, summary, "
-            "tests, concerns, and a suggested commit message."
-        )
-        codex_command = " ".join(shlex.quote(item) for item in [*command, prompt])
-        wrapper = (
-            f"set -o pipefail; {codex_command} 2>&1 | tee -a {shlex.quote(str(log))}; "
-            "exit_code=${PIPESTATUS[0]}; "
-            f"{shlex.quote(shutil.which('python3') or 'python3')} {shlex.quote(str(Path(__file__).resolve()))} "
-            f"finish-runtime --repo {shlex.quote(str(repo))} --plan {shlex.quote(plan)} "
-            f"--run-id {shlex.quote(run_id)} --task {shlex.quote(task.path.name)} --exit-code $exit_code; exit $exit_code"
-        )
+        wrapper = worker_launch_wrapper(repo, plan, run_id, task.path.name, brief, log, command)
         session = str(record["session"])
         window = str(record["window"])
         try:
@@ -1065,19 +1093,7 @@ def resume_runtime_launch(repo: Path, plan: str, run_id: str, task_name: str) ->
     log = Path(str(record["log"]))
     report = Path(str(record["report"]))
     command = [str(value) for value in record["command"]]
-    prompt = (
-        f"Read {brief}. Work only on the assigned task in the current worktree. "
-        "Do not write outside that worktree and do not run git commit. "
-        "Return the complete final report in your final response, including status, summary, tests, concerns, and a suggested commit message."
-    )
-    codex_command = " ".join(shlex.quote(item) for item in [*command, prompt])
-    wrapper = (
-        f"set -o pipefail; {codex_command} 2>&1 | tee -a {shlex.quote(str(log))}; "
-        "exit_code=${PIPESTATUS[0]}; "
-        f"{shlex.quote(shutil.which('python3') or 'python3')} {shlex.quote(str(Path(__file__).resolve()))} "
-        f"finish-runtime --repo {shlex.quote(str(repo))} --plan {shlex.quote(plan)} --run-id {shlex.quote(run_id)} "
-        f"--task {shlex.quote(task_name)} --exit-code $exit_code; exit $exit_code"
-    )
+    wrapper = worker_launch_wrapper(repo, plan, run_id, task_name, brief, log, command)
     try:
         pane_pid = tmux_create_window(repo, plan, str(record["session"]), str(record["window"]), worktree, wrapper)
     except TmuxTargetConflict as error:
@@ -1580,12 +1596,18 @@ def reconcile_actions(repo: Path, plan: str) -> list[dict[str, object]]:
     Runtime files are evidence only; the board's in-progress column selects live tasks.
     """
     actions: list[dict[str, object]] = []
+    execution = load_execution(repo, plan)
     for task in read_tasks_readonly(repo, plan):
         if task.column != "in-progress":
             continue
         current = latest_runtime_record(repo, plan, task.path.name)
         if current is None:
-            actions.append({"task": task.path.name, "action": "INSPECTION_REQUIRED", "reason": "No active runtime record."})
+            run_id = (
+                str(execution["run_id"])
+                if execution is not None and task.path.name in execution["tasks"]
+                else "unknown"
+            )
+            actions.append({"task": task.path.name, "run_id": run_id, "action": "INSPECTION_REQUIRED", "reason": "No active runtime record."})
             continue
         _, run, record = current
         health, _ = runtime_health(

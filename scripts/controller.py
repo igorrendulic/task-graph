@@ -1033,12 +1033,12 @@ def repair_wake_queue(repo: Path, plan: str) -> dict[str, object]:
     alert = state.get("pending_alert")
     queue = KANBAN.supervision_queue_path(repo, plan)
     if not (
-        state.get("lifecycle") == "paused"
+        state.get("lifecycle") in {"paused", "stopped"}
         and isinstance(alert, dict)
         and alert.get("reason") == "SUPERVISION_STATE_CORRUPTION"
         and alert.get("artifact") == str(queue)
     ):
-        raise SystemExit("repair-wake-queue requires a paused controller for wake-queue corruption")
+        raise SystemExit("repair-wake-queue requires a paused or stopped controller for wake-queue corruption")
     if KANBAN.tmux_session_exists(str(state.get("session", ""))):
         raise SystemExit("repair-wake-queue requires a stopped/non-live controller")
     repaired = KANBAN.repair_wake_queue(repo, plan)

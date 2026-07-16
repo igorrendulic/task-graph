@@ -626,6 +626,15 @@ class KanbanTest(unittest.TestCase):
         self.assertEqual("STALE", entries[0]["state"])
         self.assertEqual("INSPECTION_REQUIRED", actions[0]["action"])
 
+    def test_missing_runtime_inspection_wake_uses_the_active_execution_run(self) -> None:
+        write_task(self.repo, self.plan, "in-progress", "001-work.md", "Work")
+        KANBAN.write_execution(self.repo, self.plan, "run-a", ["001-work.md"])
+
+        action = KANBAN.reconcile_actions(self.repo, self.plan)[0]
+
+        self.assertEqual("INSPECTION_REQUIRED", action["action"])
+        self.assertEqual("run-a", action["run_id"])
+
     def test_fresh_activity_returns_a_live_worker_from_stale_to_running(self) -> None:
         runtime = self.write_runtime("run-a", "001-work.md")
         log = self.repo / ".agent" / self.plan / "runs" / "run-a" / "logs" / "001-work.log"
