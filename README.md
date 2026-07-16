@@ -1,25 +1,26 @@
 # Task Graph
 
-> Turn an approved implementation plan into a safe, dependency-aware crew of coding workers.
+> Turn an approved implementation plan into small, dependency-aware coding tasks that can be run, reviewed, and recovered safely.
 
 ## What it is
 
-Task Graph is a Codex skill for breaking an approved plan into small, explicit task files, then running only the work whose dependencies are satisfied. It keeps scope, ownership, review evidence, and recovery state on disk instead of in a long-lived chat.
+Task Graph is a Codex skill for turning an approved plan into explicit task files, then starting only the work whose dependencies are complete. It keeps task scope, ownership, review evidence, and recovery state in the repository rather than in a long-lived chat.
+
+Use it when a change is large enough to benefit from isolated worktrees, parallel workers, or a durable record of how work was reviewed and delivered.
 
 ## Features
 
-- Dependency-safe task batches and explicit task ownership.
-- Dedicated Git worktrees and task branches for workers.
-- Durable run records, reports, reviews, and portable diffs.
+- Dependency-safe batches with one task owner at a time.
+- Separate Git worktrees and branches for worker changes.
+- Durable run records, reviews, and portable diff packages.
 - Managed workers, unattended `codex exec`, or cloud delegation.
-- Per-run delivery modes: `no-mistakes`, `direct-pr`, and `local-only`.
-- Guarded delivery, teardown, and low-intrusion local-worker monitoring.
+- Guarded delivery with `no-mistakes`, `direct-pr`, and `local-only` modes.
 
 ## Quick Start
 
 ### Requirements
 
-Use Codex with Git. Unattended local workers also require tmux; PR delivery requires an authenticated GitHub CLI.
+Use Codex with Git. Unattended local workers require tmux; PR delivery also requires an authenticated GitHub CLI.
 
 ### Install for Codex
 
@@ -27,119 +28,125 @@ Use Codex with Git. Unattended local workers also require tmux; PR delivery requ
 npx task-graph-skill@latest install --codex-only
 ```
 
-### Create and run a task graph
+### Turn a plan into tasks, then start work
+
+In Codex, after your implementation plan is approved:
 
 ```text
 $task-graph tasks
 $task-graph start
 ```
 
-Task Graph derives a plan slug, writes task files under `.agent/<plan-slug>/`, and requires an explicit execution-mode selection before reserving work. There is no default mode: managed workers are in-session subagents, unattended `codex exec` uses non-interactive local CLI workers, and cloud delegation uses supported remote task execution. The controller records a run policy before workers launch, for example:
+Task Graph derives a plan slug and writes the board and task files below `.agent/<plan-slug>/`. Before any work is reserved, it requires an explicit execution-mode selection. There is no default mode:
+
+- Managed workers run as in-session subagents.
+- Unattended `codex exec` workers are non-interactive local CLI workers.
+- Cloud delegation uses supported remote task execution.
+
+The run also chooses a delivery mode. For example, the controller records `direct-pr` before workers launch:
 
 ```bash
-python3 <skill-dir>/scripts/kanban.py reserve --repo <repo-root> --plan <plan-slug> --limit 5 --run-id <run-id> --delivery-mode direct-pr
+python3 <skill-dir>/scripts/kanban.py reserve \
+  --repo <repo-root> --plan <plan-slug> --limit 5 \
+  --run-id <run-id> --delivery-mode direct-pr
 ```
 
 ## How It Works
 
 ```text
-Approved plan → task files → dependency-safe batch → dedicated worktrees
-→ worker reports → review and verification → delivery policy → durable record
+Approved plan → task files → dependency-safe batch → isolated worktrees
+→ review and verification → delivery policy → durable record
 ```
 
-Task Graph keeps one integration branch for a plan. Each worker owns one task in a separate worktree; the controller owns board state, review, delivery, and recovery.
+One integration branch represents the plan. Each worker changes one task in its own worktree; the controller owns the board, review, delivery, and recovery.
+
+### What happens after `$task-graph start`
+
+1. Task Graph chooses the next unblocked task or batch.
+2. Workers receive focused task files and report their outcome.
+3. The controller reviews and verifies completed changes.
+4. Verified work is delivered according to the run policy and recorded before cleanup.
+
+## Monitor a Run
+
+For unattended local work, start the repository controller. It prints the exact session name to attach to:
+
+```bash
+python3 <skill-dir>/scripts/controller.py start \
+  --repo <repo-root> --plan <plan-slug>
+
+# Output: Connect: tmux attach -t task-graph-controller-<plan-slug>
+tmux attach -t task-graph-controller-<plan-slug>
+```
+
+Use the watcher for a live, read-only dashboard immediately after launch. It polls every five seconds and checkpoint mode returns early at `SUCCEEDED_AWAITING_REVIEW`, `NEEDS_ATTENTION`, `STALE`, or `UNKNOWN`. Separately, the controller runs bounded `supervise` checkpoints to persist and dispatch its own recovery work.
+
+```bash
+python3 <skill-dir>/scripts/watcher.py watch-exec \
+  --checkpoint --repo <repo-root> --plan <plan-slug> \
+  --run-id <run-id> --task 001-example.md --seconds 60
+
+python3 <skill-dir>/scripts/watcher.py status \
+  --repo <repo-root> --interval 2
+```
+
+Automatic monitoring must never use shell `sleep`, compound commands, manual `status --json` polling, or `status --watch`. Each checkpoint is standalone and read-only: it does not relaunch workers or mutate task, runtime, report, delivery, or session state.
+
+## Core Concepts
+
+### Task files and dependencies
+
+Task files declare their goal, scope, dependencies, parallelism, acceptance criteria, and test notes. Dependencies are authoritative; Task Graph will not start a task until its prerequisites are done. The board lives at `.agent/<plan-slug>/kanban.md`.
+
+### Isolated worktrees
+
+Workers never edit the controller checkout. Before `launch-exec`, Task Graph records the worker worktree, branch, and base commit so it can verify that the task is running in its registered location.
 
 ## Guarded Delivery
 
-Guarded Delivery is the safe handoff from an isolated task worktree to delivery. It exists because a worker finishing its code is not the same as that code being ready to merge: the controller still needs to know what changed, confirm it was reviewed and tested, and avoid losing work during cleanup.
-
-The flow is simple:
+Guarded Delivery is the safe handoff from an isolated task worktree to delivery. A worker finishing code is not the same as that code being ready to merge: the controller still reviews it, runs the required verification, and preserves the delivery record.
 
 1. Choose how the completed work should be delivered.
 2. Let the worker make the change in its own Git worktree.
 3. Review and verify the result.
 4. Deliver the verified change, then record what landed.
-5. Record delivery before cleaning up that task's worktree and tmux window; do so after integration and verification, before marking it done.
+5. Record delivery before cleaning up the task worktree and tmux window.
 
-### Choose a delivery mode
+Choose one run-wide mode:
 
-Every run chooses one mode before workers start:
+- `no-mistakes` runs the project's full validation pipeline before Task Graph delivers a green PR.
+- `direct-pr` uses normal review and verification before opening a PR.
+- `local-only` keeps delivery local and fast-forwards only a clean integration branch.
 
-- `no-mistakes`: choose this when the task must complete the project's full validation pipeline before Task Graph delivers a green PR.
-- `direct-pr`: choose this when normal review and verification are sufficient, and Task Graph should deliver a PR without the extra pipeline.
-- `local-only`: choose this when the work should stay local; Task Graph verifies and reviews it, then fast-forwards a clean local integration branch.
-
-`+yolo` is optional. It lets the controller complete a routine green delivery after the required checks pass, so you do not need to approve that last ordinary step. It never skips failed verification or authorizes a security-sensitive action, an irreversible action, or an explicit discard.
-
-### What Task Graph protects
-
-Before `launch-exec`, Task Graph confirms that a worker is in its registered Git worktree on the right task branch, never in the controller checkout. It records the worktree, branch, and base commit so the controller can identify exactly what the worker started from. If it cannot recognize a running process, it marks it `UNKNOWN` and asks for inspection instead of guessing that it is safe to relaunch.
-
-For unattended work, Task Graph creates one detached activity session per plan, `task-graph-<plan-slug>`. Workers, reviews, and repairs each get a named window in that session while the controller remains isolated in `task-graph-controller-<plan-slug>`. `DONE` is review-ready only: retain the task worktree and its exited window through diff inspection, verification, task-commit creation, and integration. Once that task is integrated and verified, `record-delivery --result landed` records the result. Immediately run teardown before marking that task done; it removes only that task's worktree and recorded tmux window. The plan session disappears naturally after its final window closes. Retain failed or retrying windows for diagnosis; teardown still refuses dirty or unlanded work unless the controller explicitly chooses to discard it.
-
-## Low-Intrusion Monitoring
-
-The controller runs a bounded `watcher.py watch-exec --checkpoint --seconds 60` checkpoint immediately after launch, then repeats bounded checkpoints while work is expected. Checkpoint mode probes immediately, polls every five seconds, and returns early at `SUCCEEDED_AWAITING_REVIEW`, `NEEDS_ATTENTION`, `STALE`, or `UNKNOWN`. A quiet checkpoint prints its outcome and exits `124` after its bound.
-
-Automatic monitoring must never use shell `sleep`, compound commands, manual `status --json` polling, or `status --watch`. Each checkpoint is a standalone read-only command; it never relaunches workers or changes task, runtime, report, delivery, or session state. Users may still request the status dashboards below.
-
-## Controller reconciliation
-
-Task Graph uses the board as the source of current work and treats old runtime records as history. Before reporting status or ending a controller turn, run `reconcile`; dispatch every safe review or first focused repair it returns. `No change` is valid only when the reconciliation queue has no autonomous work. While tasks are in flight, Codex controllers run bounded foreground `supervise` checkpoints; each checkpoint writes durable wakes under `.agent/<plan>/state/` before it signals the controller.
-
-For FirstMate-style protection against a blind end, explicitly install the scoped Stop hook in a target project. It preserves existing hooks and blocks one turn only when reconciliation has actionable work:
-
-```bash
-python3 <skill-dir>/scripts/kanban.py install-stop-hook --repo <repo-root> --plan <plan-slug>
-python3 <skill-dir>/scripts/kanban.py uninstall-stop-hook --repo <repo-root> --plan <plan-slug>
-```
-
-## Local controller
-
-For unattended local workers, start one repository controller. It requires tmux, records its fleet lease in `.agent/state/fleet-controller.json`, and serializes every board, runtime, delivery, worktree, and teardown mutation through a durable request/result journal in `.agent/state/`. The plan state under `.agent/<plan-slug>/state/controller.json` remains the per-plan recovery record. A second live controller is refused; `start` is the explicit safe recovery action only after the prior tmux session is absent. It never auto-restarts a controller.
-
-All mutating `kanban.py` commands are controller requests. They accept an optional stable `--operation-id`; retries with the same id are deduplicated, while calls without one receive a fresh id. The controller durably claims an operation before executing it and reconciles claimed work from each command's durable postcondition after restart. Its short-lived `starting` lease excludes concurrent starts, while an explicitly restarted, stale no-tmux lease is recoverable. If no live controller owns the repository, they fail closed with a `Controller migration required` error. `status` and `watcher.py` remain read-only observation tools; worker completion is also submitted as a controller request rather than granted a mutation bypass.
-
-```bash
-python3 <skill-dir>/scripts/controller.py start --repo <repo-root> --plan <plan-slug>
-python3 <skill-dir>/scripts/controller.py start --repo <repo-root> --plan <plan-slug> --no-mistakes-command '<project gate command>'
-python3 <skill-dir>/scripts/controller.py status --repo <repo-root> --plan <plan-slug>
-python3 <skill-dir>/scripts/controller.py stop --repo <repo-root> --plan <plan-slug>
-```
-
-The controller claims durable wakes before it launches a reviewer or focused repair, then acknowledges them only after that session starts. Unexpected controller exceptions are appended to `state/controller-failures.jsonl` (the newest 50 are retained) and the latest record is exposed as `active_failure` in `controller.json`. Claimed wakes remain untouched, so after inspection an operator can explicitly run `controller.py start` to resume them through the normal protocol. The controller never auto-restarts or clears the active failure until a replacement tmux controller has launched successfully. Human-required wakes (`INSPECTION_REQUIRED`, `USER_CONTEXT_REQUIRED`, `RETRY_DECISION_REQUIRED`) and delivery approval or tooling failures are persisted as a pending alert, marked `escalated`, and pause the controller without discarding queued autonomous work. A `SUPERVISION_STATE_CORRUPTION` alert means the queue, claims, or dedupe state cannot be read safely: repair or replace the named artifact, then explicitly run `controller.py start`. The controller never auto-repairs that state or auto-restarts. Resolve other underlying task conditions, then use `start` to reconcile and resume. `status` reports `live`, `healthy`, pending alerts, active failures, and a recovery recommendation when the controller is dead or stale; it only reports, never restarts. `stop` is an explicit operator action; Stop hooks remain a backstop, not a dispatcher.
-
-Delivery is policy-gated. With `+yolo`, `local-only` fast-forwards only a clean integration branch; `direct-pr` pushes through the PR/check/merge path; and `no-mistakes` first runs the command supplied at controller start, then follows the PR path. Without `+yolo`, the state records `DELIVERY_APPROVAL_REQUIRED` instead of landing work. External delivery commands are polled with named bounds while refreshing the controller heartbeat. A timeout before a mutating operation produces a precise delivery checkpoint. Before submitting a remote merge, the controller durably records the branch and expected task head; a merge timeout or interruption pauses at `DELIVERY_OUTCOME_UNKNOWN`. On the next `start`, it verifies the PR is merged at that expected head before finalizing it, and never retries an ambiguous merge automatically.
+`+yolo` permits routine green delivery after required checks pass. It never authorizes a security-sensitive action, an irreversible action, or an explicit discard.
 
 ## Command Reference
 
-Inspect the dependency graph:
+Inspect startable work:
 
 ```bash
 python3 <skill-dir>/scripts/kanban.py plan --repo <repo-root> --plan <plan-slug> --limit 5
 python3 <skill-dir>/scripts/kanban.py plan --repo <repo-root> --plan <plan-slug> --limit 5 --json
 ```
 
-Launch an already reserved unattended task:
+Launch an already reserved unattended task and attach to its plan session:
 
 ```bash
-python3 <skill-dir>/scripts/kanban.py launch-exec --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --branch task-graph/<plan-slug>/001-example --worktree <task-worktree>
+python3 <skill-dir>/scripts/kanban.py launch-exec \
+  --repo <repo-root> --plan <plan-slug> --run-id <run-id> \
+  --task 001-example.md --branch task-graph/<plan-slug>/001-example \
+  --worktree <task-worktree>
 tmux attach -t task-graph-<plan-slug>
 ```
 
-Run the compact persistent monitor, or run an explicit bounded controller checkpoint. The watcher dashboard is read-only; controller supervision alone owns wake queue transitions. `status --watch` is a user-requested dashboard, not controller automation:
+Observe or manage the controller:
 
 ```bash
-python3 <skill-dir>/scripts/watcher.py watch-exec --repo <repo-root> --seconds 180
 python3 <skill-dir>/scripts/controller.py start --repo <repo-root> --plan <plan-slug>
 python3 <skill-dir>/scripts/controller.py status --repo <repo-root> --plan <plan-slug>
 python3 <skill-dir>/scripts/controller.py stop --repo <repo-root> --plan <plan-slug>
-python3 <skill-dir>/scripts/kanban.py reconcile --repo <repo-root> --plan <plan-slug> --json
-python3 <skill-dir>/scripts/kanban.py supervise --repo <repo-root> --plan <plan-slug> --seconds 60
-python3 <skill-dir>/scripts/watcher.py watch-exec --checkpoint --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --seconds 60
 python3 <skill-dir>/scripts/kanban.py status --repo <repo-root>
 python3 <skill-dir>/scripts/kanban.py status --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --json
-python3 <skill-dir>/scripts/watcher.py status --repo <repo-root> --interval 2
 ```
 
 Complete the post-worker lifecycle:
@@ -149,28 +156,32 @@ python3 <skill-dir>/scripts/kanban.py delivery-ready --repo <repo-root> --plan <
 python3 <skill-dir>/scripts/kanban.py record-delivery --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --result landed
 python3 <skill-dir>/scripts/kanban.py teardown --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md
 python3 <skill-dir>/scripts/kanban.py done --repo <repo-root> --plan <plan-slug> --task 001-example.md
-python3 <skill-dir>/scripts/kanban.py board --repo <repo-root> --plan <plan-slug>
 ```
 
-Before integrating a completed `ship` task, create a portable diff package:
+Before integrating a completed `ship` task, preserve its reviewable delta:
 
 ```bash
-python3 <skill-dir>/scripts/kanban.py archive-diff --repo <repo-root> --plan <plan-slug> --run-id <run-id> --task 001-example.md --base <base-commit> --head <task-head-commit> --branch <task-branch> --review reviews/001-example.md
+python3 <skill-dir>/scripts/kanban.py archive-diff \
+  --repo <repo-root> --plan <plan-slug> --run-id <run-id> \
+  --task 001-example.md --base <base-commit> --head <task-head-commit> \
+  --branch <task-branch> --review reviews/001-example.md
 ```
+
+## Controller Safety Notes
+
+The controller keeps the current board authoritative and treats old runtime records as history. Before reporting status or ending a controller turn, run `reconcile`; `No change` is valid only when there is no autonomous action. While work is in flight, use bounded `supervise` checkpoints.
+
+The tmux-resident controller records its plan state at `.agent/<plan-slug>/state/controller.json`. It never auto-restarts. Unexpected exceptions are written to `controller-failures.jsonl`, with the newest failure exposed as `active_failure`; Claimed wakes remain untouched so an operator can inspect the condition and explicitly run `controller.py start` to resume safely. A `SUPERVISION_STATE_CORRUPTION` alert means the controller cannot safely read its queue or claims: repair or replace the named artifact, then explicitly start the controller again.
 
 ## Portable diff packages
 
-Diff packages preserve the reviewed task delta and its metadata under `.agent/<plan-slug>/runs/<run-id>/diffs/`, so the controller can reconnect review evidence to the integrated change.
+Portable diff packages live under `.agent/<plan-slug>/runs/<run-id>/diffs/`. They preserve a reviewed task delta and metadata so the controller can reconnect review evidence to the integrated change.
 
 ## Improvement Loop Checkpoints
 
-When a `codex exec` worker reports `DONE_WITH_CONCERNS`, the controller reads the persisted report and begins one automatic focused repair-and-audit attempt. The retry uses a fresh isolated worker from the failed task branch's verified HEAD, inherits the selected execution and delivery policy, and receives a brief limited to the reported gap. The controller always reports the retry outcome to the user, whether the repair is ready for normal integration or remains unresolved.
+When a `codex exec` worker reports `DONE_WITH_CONCERNS`, the controller performs one automatic focused repair-and-audit attempt and always reports the retry outcome. Only after that automatic retry still reports concerns does it ask whether to stop with the current unresolved result or continue into another focused improvement-and-audit loop. Continue immediately launches exactly one linked repair-and-audit attempt; a later failed audit requires another Stop or Continue decision.
 
-The controller durably reserves a repair's child run, branch, and worktree before setup, but it consumes the automatic repair only after a valid child runtime record exists. A restart resumes that reservation instead of creating another worker. Failed setup artifacts remain available for inspection; if they conflict with the reservation, the controller raises `INSPECTION_REQUIRED` and never removes them automatically.
-
-Only after that automatic retry still reports concerns does the controller stop and ask whether to stop with the current unresolved result or continue into another focused improvement-and-audit loop. Continue immediately launches exactly one linked repair-and-audit attempt; a later failed audit requires another Stop or Continue decision.
-
-## Installation and Other Harnesses
+## Other Installation Options
 
 Install for both Codex and Claude Code:
 
@@ -186,17 +197,9 @@ npx task-graph-skill@latest install --claude-only
 
 For local development, use `./install.sh --link --force`.
 
-## Task Contract
-
-Each task has `Type`, `Goal`, `Context`, `Scope`, `Out Of Scope`, `Dependencies`, `Parallel`, `Acceptance Criteria`, and `Test Notes`. `Dependencies` is authoritative; `Parallel` is human guidance. `ship` tasks change code or docs; `scout` tasks produce a report and do not integrate code.
-
-## Example Use Case
-
-For a backend feature with schema, repository, API, tests, and docs, Task Graph creates separate task files only where work can be reviewed or executed independently. Dependents wait for their prerequisites; independent tasks run together.
-
 ## Contributing
 
-Run the test suite with:
+Run the full test suite with:
 
 ```bash
 python3 -m unittest discover
