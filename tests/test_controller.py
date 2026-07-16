@@ -217,6 +217,21 @@ class ControllerStateTest(unittest.TestCase):
             CONTROLLER.start_controller(self.repo, self.plan, None)
         self.assertIsNone(CONTROLLER.load_state(self.repo, self.plan)["active_failure"])
 
+    def test_start_reports_plan_specific_tmux_attach_command(self) -> None:
+        output = io.StringIO()
+
+        with patch.object(CONTROLLER, "require_tmux"), patch.object(
+            CONTROLLER, "tmux_start", return_value=123
+        ), patch("sys.stdout", output):
+            CONTROLLER.start_controller(self.repo, self.plan, None)
+
+        session = CONTROLLER.controller_session_name(self.plan)
+        self.assertEqual(
+            f"Started controller: {session}\n"
+            f"Connect: tmux attach -t {session}\n",
+            output.getvalue(),
+        )
+
     def test_status_recommends_explicit_start_for_a_dead_controller_with_active_failure(self) -> None:
         CONTROLLER.create_state(self.repo, self.plan, None)
         CONTROLLER.record_controller_failure(

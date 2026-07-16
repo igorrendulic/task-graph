@@ -993,6 +993,7 @@ def start_controller(repo: Path, plan: str, no_mistakes_command: str | None) -> 
         with KANBAN.fleet_mutation_lock(repo):
             KANBAN.write_fleet_state(repo, {"lifecycle": "running", "session": str(state["session"]), "plan": plan, "pid": state["pid"]})
         print(f"Started controller: {state['session']}")
+        print(f"Connect: tmux attach -t {state['session']}")
 
 
 def status_controller(repo: Path, plan: str) -> None:
