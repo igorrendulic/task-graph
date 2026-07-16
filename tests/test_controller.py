@@ -182,6 +182,62 @@ class ControllerStateTest(unittest.TestCase):
 
         review.assert_not_called()
 
+    def test_corrupt_claims_pause_before_replaying_an_acknowledged_wake(self) -> None:
+        wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REVIEW_REQUIRED"}
+        state = CONTROLLER.create_state(self.repo, self.plan, None)
+        state["dispatches"] = {"wake-1": {"state": "acknowledged", "wake": wake}}
+        CONTROLLER.write_state(self.repo, self.plan, state)
+        claims = CONTROLLER.KANBAN.wake_claims_path(self.repo, self.plan)
+        claims.parent.mkdir(parents=True, exist_ok=True)
+        claims.write_text("{", encoding="utf-8")
+
+        with patch.object(CONTROLLER, "resume_claimed_wakes") as resume, patch.object(
+            CONTROLLER.KANBAN, "claim_wake"
+        ) as claim:
+            self.assertEqual([], CONTROLLER.drain_once(self.repo, self.plan, state))
+
+        self.assertEqual("paused", state["lifecycle"])
+        self.assertEqual("SUPERVISION_STATE_CORRUPTION", state["pending_alert"]["reason"])
+        self.assertEqual(str(claims), state["pending_alert"]["artifact"])
+        resume.assert_not_called()
+        claim.assert_not_called()
+
+    def test_malformed_queue_line_pauses_and_identifies_source(self) -> None:
+        state = CONTROLLER.create_state(self.repo, self.plan, None)
+        queue = CONTROLLER.KANBAN.supervision_queue_path(self.repo, self.plan)
+        queue.parent.mkdir(parents=True, exist_ok=True)
+        queue.write_text(
+            '{"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REVIEW_REQUIRED"}\n{}\n',
+            encoding="utf-8",
+        )
+
+        self.assertEqual([], CONTROLLER.drain_once(self.repo, self.plan, state))
+
+        self.assertEqual("paused", state["lifecycle"])
+        self.assertEqual("SUPERVISION_STATE_CORRUPTION", state["pending_alert"]["reason"])
+        self.assertEqual(str(queue), state["pending_alert"]["artifact"])
+        self.assertEqual(2, state["pending_alert"]["line"])
+
+    def test_repaired_claims_resume_preserved_claimed_wake_after_explicit_restart(self) -> None:
+        wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REVIEW_REQUIRED"}
+        state = CONTROLLER.create_state(self.repo, self.plan, None)
+        state["dispatches"] = {"wake-1": {"state": "claimed", "wake": wake}}
+        CONTROLLER.write_state(self.repo, self.plan, state)
+        claims = CONTROLLER.KANBAN.wake_claims_path(self.repo, self.plan)
+        claims.parent.mkdir(parents=True, exist_ok=True)
+        claims.write_text("{", encoding="utf-8")
+        CONTROLLER.drain_once(self.repo, self.plan, state)
+        claims.write_text('{"wake-1": "claimed"}', encoding="utf-8")
+
+        with patch.object(CONTROLLER, "start_review", return_value="review-session"), patch.object(
+            CONTROLLER.KANBAN, "claim_wake"
+        ) as claim, patch.object(CONTROLLER.KANBAN, "acknowledge_wake") as acknowledge:
+            state["lifecycle"] = "running"  # explicit controller start reacquires the lease before draining.
+            CONTROLLER.drain_once(self.repo, self.plan, state)
+
+        claim.assert_not_called()
+        acknowledge.assert_called_once_with(self.repo, self.plan, "wake-1")
+
     def test_restart_resumes_claimed_wake_without_claiming_again(self) -> None:
         wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REVIEW_REQUIRED"}
         state = CONTROLLER.create_state(self.repo, self.plan, None)

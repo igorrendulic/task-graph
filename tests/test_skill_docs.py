@@ -6,6 +6,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SkillDocsTest(unittest.TestCase):
+    def test_docs_describe_supervision_corruption_recovery(self) -> None:
+        docs = (ROOT / "SKILL.md").read_text(encoding="utf-8") + (ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("SUPERVISION_STATE_CORRUPTION", docs)
+        self.assertIn("repair or replace", docs)
+        self.assertIn("explicit", docs)
+
     def test_docs_require_a_plan_scoped_board(self) -> None:
         skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")

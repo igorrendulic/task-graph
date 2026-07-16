@@ -191,10 +191,30 @@ def pause_for_alert(repo: Path, plan: str, state: dict[str, Any], wake: dict[str
     print(f"Controller paused: {reason} for {wake.get('task', 'unknown task')}")
 
 
+def pause_for_supervision_corruption(
+    repo: Path, plan: str, state: dict[str, Any], error: KANBAN.SupervisionStateCorruption
+) -> None:
+    """Persist a fail-closed alert without changing the corrupt coordination state."""
+    def pause(latest: dict[str, Any]) -> None:
+        latest["lifecycle"] = "paused"
+        latest["pending_alert"] = {
+            "reason": "SUPERVISION_STATE_CORRUPTION",
+            "artifact": str(error.path),
+            "line": error.line,
+            "detail": error.detail,
+            "at": KANBAN.utc_now(),
+        }
+
+    replace_state(state, mutate_state(repo, plan, pause))
+    print(f"Controller paused: SUPERVISION_STATE_CORRUPTION at {error.path}")
+
+
 def pending_alert_resolved(repo: Path, plan: str, alert: object) -> bool:
     if not isinstance(alert, dict):
         return True
     task, reason = str(alert.get("task", "")), str(alert.get("reason", ""))
+    if reason == "SUPERVISION_STATE_CORRUPTION":
+        return True
     if task not in {item.path.name for item in KANBAN.read_tasks_readonly(repo, plan) if item.column == "in-progress"}:
         return True
     if reason in HUMAN_REQUIRED_ACTIONS:
@@ -597,25 +617,33 @@ def reconcile_reviewer_dispatches(repo: Path, plan: str, state: dict[str, Any]) 
 
 
 def drain_once(repo: Path, plan: str, state: dict[str, Any]) -> list[str]:
-    resume_claimed_wakes(repo, plan, state)
-    reconcile_reviewer_dispatches(repo, plan, state)
-    KANBAN.supervise_once(repo, plan)
-    claims = KANBAN.load_json_object(KANBAN.wake_claims_path(repo, plan))
-    results: list[str] = []
-    for wake in KANBAN.queued_wakes(repo, plan):
-        wake_id = str(wake.get("id", ""))
-        if claims.get(wake_id) in {"acknowledged", "escalated"}:
-            continue
-        if claims.get(wake_id) == "claimed":
-            if state.get("dispatches", {}).get(wake_id, {}).get("state") == "claimed":
-                results.append(dispatch_wake(repo, plan, wake, state, claimed=True))
-                if state.get("lifecycle") != "running":
-                    break
-            continue
-        results.append(dispatch_wake(repo, plan, wake, state))
-        if state.get("lifecycle") != "running":
-            break
-    return results
+    try:
+        claims = KANBAN.load_supervision_json_object(KANBAN.wake_claims_path(repo, plan))
+        KANBAN.load_supervision_json_object(KANBAN.supervision_index_path(repo, plan))
+        wakes = KANBAN.queued_wakes(repo, plan)
+        resume_claimed_wakes(repo, plan, state)
+        reconcile_reviewer_dispatches(repo, plan, state)
+        KANBAN.supervise_once(repo, plan)
+        claims = KANBAN.load_supervision_json_object(KANBAN.wake_claims_path(repo, plan))
+        wakes = KANBAN.queued_wakes(repo, plan)
+        results: list[str] = []
+        for wake in wakes:
+            wake_id = str(wake["id"])
+            if claims.get(wake_id) in {"acknowledged", "escalated"}:
+                continue
+            if claims.get(wake_id) == "claimed":
+                if state.get("dispatches", {}).get(wake_id, {}).get("state") == "claimed":
+                    results.append(dispatch_wake(repo, plan, wake, state, claimed=True))
+                    if state.get("lifecycle") != "running":
+                        break
+                continue
+            results.append(dispatch_wake(repo, plan, wake, state))
+            if state.get("lifecycle") != "running":
+                break
+        return results
+    except KANBAN.SupervisionStateCorruption as error:
+        pause_for_supervision_corruption(repo, plan, state, error)
+        return []
 
 
 def run_controller(repo: Path, plan: str) -> int:

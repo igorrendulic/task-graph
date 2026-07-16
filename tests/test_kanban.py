@@ -971,11 +971,30 @@ class KanbanTest(unittest.TestCase):
         (self.repo / ".agent").mkdir()
         queue = KANBAN.supervision_queue_path(self.repo, self.plan)
         queue.parent.mkdir(parents=True)
-        for entry in ("   \n", '{"id": "wake-1"}\n', '{"id": "wake-1", "task": "001-work.md"}\n'):
+        for entry in (
+            "   \n",
+            '{"id": "wake-1"}\n',
+            '{"id": "wake-1", "task": "001-work.md"}\n',
+            '{"id": "wake-1", "task": "001-work.md", "run_id": "run-a"}\n',
+        ):
             with self.subTest(entry=entry):
                 queue.write_text(entry, encoding="utf-8")
-                with self.assertRaisesRegex(SystemExit, "Malformed wake queue entry"):
+                with self.assertRaisesRegex(KANBAN.SupervisionStateCorruption, f"{queue}:1"):
                     KANBAN.queued_wakes(self.repo, self.plan)
+
+    def test_strict_supervision_loader_rejects_corrupt_or_non_object_state(self) -> None:
+        (self.repo / ".agent").mkdir()
+        claims = KANBAN.wake_claims_path(self.repo, self.plan)
+        claims.parent.mkdir(parents=True)
+        for content in ("{", "[]"):
+            with self.subTest(content=content):
+                claims.write_text(content, encoding="utf-8")
+                with self.assertRaisesRegex(KANBAN.SupervisionStateCorruption, str(claims)):
+                    KANBAN.load_supervision_json_object(claims)
+
+    def test_missing_supervision_state_is_empty_for_first_run(self) -> None:
+        (self.repo / ".agent").mkdir()
+        self.assertEqual({}, KANBAN.load_supervision_json_object(KANBAN.wake_claims_path(self.repo, self.plan)))
 
     def test_escalated_wake_is_terminal_and_cannot_be_reclaimed(self) -> None:
         state = self.repo / ".agent" / self.plan / "state"

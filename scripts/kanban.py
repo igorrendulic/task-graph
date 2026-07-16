@@ -49,6 +49,17 @@ class Schedule:
     available: set[str]
 
 
+class SupervisionStateCorruption(RuntimeError):
+    """Durable coordination state cannot be interpreted safely."""
+
+    def __init__(self, path: Path, detail: str, line: int | None = None) -> None:
+        self.path = path
+        self.line = line
+        self.detail = detail
+        location = f"{path}:{line}" if line is not None else str(path)
+        super().__init__(f"Supervision state corruption at {location}: {detail}")
+
+
 def title_from_file(path: Path) -> str:
     for line in path.read_text(encoding="utf-8").splitlines():
         if line.startswith("# "):
@@ -870,6 +881,19 @@ def load_json_object(path: Path) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
 
 
+def load_supervision_json_object(path: Path) -> dict[str, object]:
+    """Read required coordination state without treating corruption as absence."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as error:
+        raise SupervisionStateCorruption(path, error.msg) from error
+    if not isinstance(value, dict):
+        raise SupervisionStateCorruption(path, "expected a JSON object")
+    return value
+
+
 def append_jsonl_durable(path: Path, entries: list[dict[str, object]]) -> None:
     """Append JSONL records and confirm their contents are durable before returning."""
     if not entries:
@@ -899,16 +923,16 @@ def _queued_wakes(repo: Path, plan: str) -> list[dict[str, object]]:
     wakes: list[dict[str, object]] = []
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         if not line.strip():
-            raise SystemExit(f"Malformed wake queue entry at {path}:{line_number}")
+            raise SupervisionStateCorruption(path, "empty queue record", line_number)
         try:
             wake = json.loads(line)
         except json.JSONDecodeError as error:
-            raise SystemExit(f"Malformed wake queue entry at {path}:{line_number}: {error.msg}") from error
+            raise SupervisionStateCorruption(path, error.msg, line_number) from error
         if not isinstance(wake, dict) or any(
             not isinstance(wake.get(field), str) or not wake[field].strip()
-            for field in ("id", "task", "action")
+            for field in ("id", "task", "run_id", "action")
         ):
-            raise SystemExit(f"Malformed wake queue entry at {path}:{line_number}")
+            raise SupervisionStateCorruption(path, "missing required wake identity or action field", line_number)
         wakes.append(wake)
     return wakes
 
@@ -923,7 +947,7 @@ def claim_wake(repo: Path, plan: str, wake_id: str) -> dict[str, object]:
         wakes = {str(wake["id"]): wake for wake in _queued_wakes(repo, plan) if "id" in wake}
         if wake_id not in wakes:
             raise SystemExit(f"Unknown wake: {wake_id}")
-        claims = load_json_object(wake_claims_path(repo, plan))
+        claims = load_supervision_json_object(wake_claims_path(repo, plan))
         if claims.get(wake_id) in {"acknowledged", "escalated"}:
             raise SystemExit(f"Wake already {claims[wake_id]}: {wake_id}")
         if claims.get(wake_id) == "claimed":
@@ -935,7 +959,7 @@ def claim_wake(repo: Path, plan: str, wake_id: str) -> dict[str, object]:
 
 def acknowledge_wake(repo: Path, plan: str, wake_id: str) -> None:
     with wake_queue_lock(repo, plan):
-        claims = load_json_object(wake_claims_path(repo, plan))
+        claims = load_supervision_json_object(wake_claims_path(repo, plan))
         if claims.get(wake_id) != "claimed":
             raise SystemExit(f"Wake must be claimed before acknowledgement: {wake_id}")
         claims[wake_id] = "acknowledged"
@@ -944,7 +968,7 @@ def acknowledge_wake(repo: Path, plan: str, wake_id: str) -> None:
 
 def escalate_wake(repo: Path, plan: str, wake_id: str) -> None:
     with wake_queue_lock(repo, plan):
-        claims = load_json_object(wake_claims_path(repo, plan))
+        claims = load_supervision_json_object(wake_claims_path(repo, plan))
         if claims.get(wake_id) != "claimed":
             raise SystemExit(f"Wake must be claimed before escalation: {wake_id}")
         claims[wake_id] = "escalated"
@@ -956,7 +980,7 @@ def supervise_once(repo: Path, plan: str) -> list[dict[str, object]]:
     actions = reconcile_actions(repo, plan)
     with wake_queue_lock(repo, plan):
         index_path = supervision_index_path(repo, plan)
-        seen = load_json_object(index_path)
+        seen = load_supervision_json_object(index_path)
         queued_ids = {str(wake.get("id")) for wake in _queued_wakes(repo, plan) if wake.get("id")}
         new_wakes: list[dict[str, object]] = []
         durable_fingerprints: dict[str, str] = {}
