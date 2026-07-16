@@ -7,6 +7,13 @@ const path = require("node:path");
 
 const SKILL_NAME = "task-graph";
 const ROOT_DIR = path.resolve(__dirname, "..");
+const REQUIRED_PAYLOAD = [
+  "SKILL.md",
+  "scripts/kanban.py",
+  "scripts/controller.py",
+  "scripts/watcher.py",
+];
+const CODEX_AGENT_METADATA = "agents/openai.yaml";
 
 function usage() {
   console.log(`Usage: task-graph-skill install [options]
@@ -114,8 +121,11 @@ function run(label, action, options) {
   }
 }
 
-function assertPayloadExists() {
-  for (const relativePath of ["SKILL.md", "scripts/kanban.py"]) {
+function assertPayloadExists(includeAgents) {
+  const requiredPaths = includeAgents
+    ? [...REQUIRED_PAYLOAD, CODEX_AGENT_METADATA]
+    : REQUIRED_PAYLOAD;
+  for (const relativePath of requiredPaths) {
     const payloadPath = path.join(ROOT_DIR, relativePath);
     if (!fs.existsSync(payloadPath)) {
       die(`Missing ${payloadPath}`);
@@ -141,16 +151,15 @@ function copyPayload(dest, includeAgents, options) {
     () => fs.copyFileSync(path.join(ROOT_DIR, "SKILL.md"), path.join(tmp, "SKILL.md")),
     options,
   );
-  run(
-    `cp ${path.join(ROOT_DIR, "scripts", "kanban.py")} ${path.join(tmp, "scripts", "kanban.py")}`,
-    () => fs.copyFileSync(
-      path.join(ROOT_DIR, "scripts", "kanban.py"),
-      path.join(tmp, "scripts", "kanban.py"),
-    ),
-    options,
-  );
+  for (const script of ["kanban.py", "controller.py", "watcher.py"]) {
+    run(
+      `cp ${path.join(ROOT_DIR, "scripts", script)} ${path.join(tmp, "scripts", script)}`,
+      () => fs.copyFileSync(path.join(ROOT_DIR, "scripts", script), path.join(tmp, "scripts", script)),
+      options,
+    );
+  }
 
-  if (includeAgents && fs.existsSync(path.join(ROOT_DIR, "agents", "openai.yaml"))) {
+  if (includeAgents) {
     run(
       `mkdir -p ${path.join(tmp, "agents")}`,
       () => fs.mkdirSync(path.join(tmp, "agents"), { recursive: true }),
@@ -171,8 +180,20 @@ function copyPayload(dest, includeAgents, options) {
     return;
   }
 
-  fs.rmSync(dest, { recursive: true, force: true });
-  fs.renameSync(tmp, dest);
+  const backup = `${dest}.backup.${process.pid}`;
+  if (existsOrSymlink(dest)) {
+    fs.rmSync(backup, { recursive: true, force: true });
+    fs.renameSync(dest, backup);
+  }
+  try {
+    fs.renameSync(tmp, dest);
+  } catch (error) {
+    if (existsOrSymlink(backup)) {
+      fs.renameSync(backup, dest);
+    }
+    throw error;
+  }
+  fs.rmSync(backup, { recursive: true, force: true });
 }
 
 function installTarget(label, dest, includeAgents, options) {
@@ -186,7 +207,6 @@ function installTarget(label, dest, includeAgents, options) {
     if (!options.force) {
       die(`${label} skill already exists at ${dest}. Re-run with --force to replace it.`);
     }
-    run(`rm -rf ${dest}`, () => fs.rmSync(dest, { recursive: true, force: true }), options);
   }
 
   run(
@@ -199,13 +219,13 @@ function installTarget(label, dest, includeAgents, options) {
 
 function main() {
   const options = parseArgs(process.argv.slice(2));
-  assertPayloadExists();
-
   if (options.installCodex) {
+    assertPayloadExists(true);
     installTarget("Codex", path.join(codexHome(), "skills", SKILL_NAME), true, options);
   }
 
   if (options.installClaude) {
+    assertPayloadExists(false);
     installTarget("Claude Code", path.join(claudeHome(), "skills", SKILL_NAME), false, options);
   }
 

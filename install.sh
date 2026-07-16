@@ -2,6 +2,7 @@
 set -eu
 
 SKILL_NAME="task-graph"
+REQUIRED_SCRIPTS="kanban.py controller.py watcher.py"
 
 usage() {
   cat <<EOF
@@ -71,16 +72,29 @@ copy_payload() {
   run rm -rf "$tmp"
   run mkdir -p "$tmp/scripts"
   run cp "$SCRIPT_DIR/SKILL.md" "$tmp/SKILL.md"
-  run cp "$SCRIPT_DIR/scripts/kanban.py" "$tmp/scripts/kanban.py"
+  for script in $REQUIRED_SCRIPTS; do
+    run cp "$SCRIPT_DIR/scripts/$script" "$tmp/scripts/$script"
+  done
 
-  if [ "$include_agents" -eq 1 ] && [ -f "$SCRIPT_DIR/agents/openai.yaml" ]; then
+  if [ "$include_agents" -eq 1 ]; then
     run mkdir -p "$tmp/agents"
     run cp "$SCRIPT_DIR/agents/openai.yaml" "$tmp/agents/openai.yaml"
   fi
 
   if [ "$DRY_RUN" -eq 0 ]; then
-    rm -rf "$dest"
-    mv "$tmp" "$dest"
+    backup="${dest}.backup.$$"
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+      rm -rf "$backup"
+      mv "$dest" "$backup"
+    fi
+    if mv "$tmp" "$dest"; then
+      rm -rf "$backup"
+    else
+      if [ -e "$backup" ] || [ -L "$backup" ]; then
+        mv "$backup" "$dest"
+      fi
+      exit 1
+    fi
   else
     info "dry-run: mv $tmp $dest"
   fi
@@ -88,7 +102,28 @@ copy_payload() {
 
 link_payload() {
   dest=$1
-  run ln -s "$SCRIPT_DIR" "$dest"
+  tmp="${dest}.tmp.$$"
+
+  run rm -rf "$tmp"
+  run ln -s "$SCRIPT_DIR" "$tmp"
+
+  if [ "$DRY_RUN" -eq 0 ]; then
+    backup="${dest}.backup.$$"
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+      rm -rf "$backup"
+      mv "$dest" "$backup"
+    fi
+    if mv "$tmp" "$dest"; then
+      rm -rf "$backup"
+    else
+      if [ -e "$backup" ] || [ -L "$backup" ]; then
+        mv "$backup" "$dest"
+      fi
+      exit 1
+    fi
+  else
+    info "dry-run: mv $tmp $dest"
+  fi
 }
 
 install_target() {
@@ -104,7 +139,14 @@ install_target() {
     if [ "$FORCE" -ne 1 ]; then
       die "${label} skill already exists at $dest. Re-run with --force to replace it."
     fi
-    run rm -rf "$dest"
+  fi
+
+  [ -f "$SCRIPT_DIR/SKILL.md" ] || die "Missing $SCRIPT_DIR/SKILL.md"
+  for script in $REQUIRED_SCRIPTS; do
+    [ -f "$SCRIPT_DIR/scripts/$script" ] || die "Missing $SCRIPT_DIR/scripts/$script"
+  done
+  if [ "$include_agents" -eq 1 ]; then
+    [ -f "$SCRIPT_DIR/agents/openai.yaml" ] || die "Missing $SCRIPT_DIR/agents/openai.yaml"
   fi
 
   run mkdir -p "$(dirname "$dest")"
@@ -153,9 +195,6 @@ while [ "$#" -gt 0 ]; do
 done
 
 SCRIPT_DIR=$(resolve_script_dir)
-
-[ -f "$SCRIPT_DIR/SKILL.md" ] || die "Missing $SCRIPT_DIR/SKILL.md"
-[ -f "$SCRIPT_DIR/scripts/kanban.py" ] || die "Missing $SCRIPT_DIR/scripts/kanban.py"
 
 CODEX_HOME=${CODEX_HOME:-"$HOME/.codex"}
 CLAUDE_HOME=${CLAUDE_HOME:-"$HOME/.claude"}
