@@ -1,7 +1,9 @@
 import importlib.util
+import io
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -33,6 +35,75 @@ class ControllerStateTest(unittest.TestCase):
         self.assertEqual("running", state["lifecycle"])
         self.assertEqual("make check", saved["no_mistakes_command"])
         self.assertEqual(CONTROLLER.controller_session_name(self.plan), saved["session"])
+
+    def test_status_does_not_overwrite_an_acknowledged_dispatch(self) -> None:
+        state = CONTROLLER.create_state(self.repo, self.plan, None)
+        wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REVIEW_REQUIRED"}
+
+        def acknowledge_during_status(_session: str) -> bool:
+            CONTROLLER.mutate_state(
+                self.repo,
+                self.plan,
+                lambda current: current["dispatches"].update({"wake-1": {"state": "acknowledged", "wake": wake}}),
+            )
+            return False
+
+        with patch.object(CONTROLLER.KANBAN, "tmux_session_exists", side_effect=acknowledge_during_status), patch(
+            "sys.stdout", new_callable=io.StringIO
+        ):
+            CONTROLLER.status_controller(self.repo, self.plan)
+
+        saved = CONTROLLER.load_state(self.repo, self.plan)
+        self.assertEqual("acknowledged", saved["dispatches"]["wake-1"]["state"])
+        self.assertEqual(state["revision"] + 1, saved["revision"])
+
+    def test_stop_wins_over_a_heartbeat_update(self) -> None:
+        stale_state = CONTROLLER.create_state(self.repo, self.plan, None).copy()
+        heartbeat_started = threading.Event()
+        heartbeat_finished = threading.Event()
+        original_write_state = CONTROLLER.write_state
+
+        def start_heartbeat_after_stopped_state_is_written(repo: Path, plan: str, state: dict[str, object]) -> None:
+            original_write_state(repo, plan, state)
+            if state.get("lifecycle") != "stopped":
+                return
+            thread = threading.Thread(
+                target=lambda: (heartbeat_started.set(), CONTROLLER.refresh_heartbeat(self.repo, self.plan, stale_state), heartbeat_finished.set())
+            )
+            thread.start()
+            self.assertTrue(heartbeat_started.wait(timeout=1))
+
+        with patch.object(CONTROLLER.subprocess, "run"), patch.object(
+            CONTROLLER.KANBAN, "tmux_session_exists", return_value=False
+        ), patch.object(
+            CONTROLLER, "write_state", side_effect=start_heartbeat_after_stopped_state_is_written
+        ):
+            CONTROLLER.stop_controller(self.repo, self.plan)
+
+        self.assertTrue(heartbeat_finished.wait(timeout=1))
+        saved = CONTROLLER.load_state(self.repo, self.plan)
+        self.assertEqual("stopped", saved["lifecycle"])
+        self.assertIsNone(saved["lease"])
+
+    def test_state_revision_advances_once_per_successful_mutation(self) -> None:
+        created = CONTROLLER.create_state(self.repo, self.plan, None)
+        created_revision = created["revision"]
+        CONTROLLER.refresh_heartbeat(self.repo, self.plan, created)
+        after_heartbeat = CONTROLLER.load_state(self.repo, self.plan)
+        heartbeat_revision = after_heartbeat["revision"]
+        with patch.object(CONTROLLER.KANBAN, "escalate_wake"):
+            CONTROLLER.pause_for_alert(
+                self.repo,
+                self.plan,
+                after_heartbeat,
+                {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "USER_CONTEXT_REQUIRED"},
+                "USER_CONTEXT_REQUIRED",
+            )
+        after_pause = CONTROLLER.load_state(self.repo, self.plan)
+
+        self.assertEqual(1, created_revision)
+        self.assertEqual(2, heartbeat_revision)
+        self.assertEqual(3, after_pause["revision"])
 
     def test_claimed_wake_is_acknowledged_only_after_dispatch_starts(self) -> None:
         wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REVIEW_REQUIRED"}
@@ -219,16 +290,21 @@ class ControllerStateTest(unittest.TestCase):
         self.assertEqual("make check", restored["no_mistakes_command"])
         self.assertIn("wake-1", restored["dispatches"])
 
-    def test_status_persists_recovery_required_for_dead_running_controller_with_work(self) -> None:
+    def test_status_projects_recovery_for_dead_running_controller_with_work_without_persisting_it(self) -> None:
         state = CONTROLLER.create_state(self.repo, self.plan, None)
         (self.repo / ".agent" / self.plan / "in-progress").mkdir()
         (self.repo / ".agent" / self.plan / "in-progress" / "001-work.md").write_text("# Work\n")
-        with patch.object(CONTROLLER.KANBAN, "tmux_session_exists", return_value=False):
+        with patch.object(CONTROLLER.KANBAN, "tmux_session_exists", return_value=False), patch(
+            "sys.stdout", new_callable=io.StringIO
+        ) as output:
             CONTROLLER.status_controller(self.repo, self.plan)
 
         saved = CONTROLLER.load_state(self.repo, self.plan)
-        self.assertTrue(saved["recovery_required"])
-        self.assertEqual("CONTROLLER_RECOVERY_REQUIRED", saved["recovery_alert"]["reason"])
+        reported = json.loads(output.getvalue())
+        self.assertFalse(saved["recovery_required"])
+        self.assertIsNone(saved["recovery_alert"])
+        self.assertTrue(reported["recovery_required"])
+        self.assertEqual("CONTROLLER_RECOVERY_REQUIRED", reported["recovery_alert"]["reason"])
 
     def test_start_refuses_unresolved_persisted_alert(self) -> None:
         state = CONTROLLER.create_state(self.repo, self.plan, None)
@@ -290,7 +366,14 @@ class ControllerStateTest(unittest.TestCase):
         (run / "reviews").mkdir(parents=True)
         (run / "reviews" / "001-work.md").write_text("not a verdict\n", encoding="utf-8")
         wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REVIEW_REQUIRED"}
-        state = {"dispatches": {"wake-1": {"state": "acknowledged", "wake": wake, "result": "review-session"}}}
+        state = CONTROLLER.create_state(self.repo, self.plan, None)
+        state = CONTROLLER.mutate_state(
+            self.repo,
+            self.plan,
+            lambda current: current["dispatches"].update(
+                {"wake-1": {"state": "acknowledged", "wake": wake, "result": "review-session"}}
+            ),
+        )
         with patch.object(CONTROLLER.KANBAN, "tmux_liveness", return_value="IDLE_OR_DEAD"):
             CONTROLLER.reconcile_reviewer_dispatches(self.repo, self.plan, state)
 

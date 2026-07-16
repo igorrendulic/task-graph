@@ -19,7 +19,7 @@ import tempfile
 from datetime import datetime
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
@@ -55,6 +55,19 @@ def controller_lease_lock(repo: Path, plan: str):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+@contextmanager
+def controller_state_lock(repo: Path, plan: str):
+    """Serialize durable controller state independently of startup ownership."""
+    path = KANBAN.plan_dir(repo, plan) / "state" / "controller-state.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def write_state(repo: Path, plan: str, state: dict[str, Any]) -> None:
     KANBAN.write_atomic(controller_state_path(repo, plan), json.dumps(state, indent=2, sort_keys=True) + "\n")
 
@@ -80,6 +93,7 @@ def normalize_state(state: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("recovery_alert", None)
     state.setdefault("recovery_required", False)
     state.setdefault("dispatches", {})
+    state.setdefault("revision", 0)
     return state
 
 
@@ -99,18 +113,37 @@ def create_state(repo: Path, plan: str, no_mistakes_command: str | None) -> dict
         "recovery_required": False,
         "updated_at": KANBAN.utc_now(),
     }
-    write_state(repo, plan, state)
+    state["revision"] = 1
+    with controller_state_lock(repo, plan):
+        write_state(repo, plan, state)
     return state
 
 
-def update_state(repo: Path, plan: str, state: dict[str, Any]) -> None:
+def persist_mutation(repo: Path, plan: str, state: dict[str, Any]) -> None:
+    state["revision"] = int(state["revision"]) + 1
     state["updated_at"] = KANBAN.utc_now()
     write_state(repo, plan, state)
 
 
+def mutate_state(repo: Path, plan: str, mutation: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    """Reload, mutate, and atomically persist controller state under one lock."""
+    with controller_state_lock(repo, plan):
+        state = load_state(repo, plan)
+        if state is None:
+            raise SystemExit("Controller has not been started")
+        mutation(state)
+        persist_mutation(repo, plan, state)
+        return state
+
+
+def replace_state(snapshot: dict[str, Any], current: dict[str, Any]) -> None:
+    snapshot.clear()
+    snapshot.update(current)
+
+
 def refresh_heartbeat(repo: Path, plan: str, state: dict[str, Any]) -> None:
-    state["heartbeat_at"] = KANBAN.utc_now()
-    update_state(repo, plan, state)
+    current = mutate_state(repo, plan, lambda latest: latest.__setitem__("heartbeat_at", KANBAN.utc_now()))
+    replace_state(state, current)
 
 
 def heartbeat_is_fresh(value: object) -> bool:
@@ -129,13 +162,15 @@ def has_in_progress_tasks(repo: Path, plan: str) -> bool:
 
 def pause_for_alert(repo: Path, plan: str, state: dict[str, Any], wake: dict[str, object], reason: str) -> None:
     wake_id = str(wake["id"])
-    state.setdefault("dispatches", {})[wake_id] = {"state": "escalated", "wake": wake, "result": reason}
-    state["pending_alert"] = {
-        "wake_id": wake_id, "task": str(wake.get("task", "")), "run_id": str(wake.get("run_id", "")),
-        "reason": reason, "at": KANBAN.utc_now(),
-    }
-    state["lifecycle"] = "paused"
-    update_state(repo, plan, state)
+    def pause(latest: dict[str, Any]) -> None:
+        latest.setdefault("dispatches", {})[wake_id] = {"state": "escalated", "wake": wake, "result": reason}
+        latest["pending_alert"] = {
+            "wake_id": wake_id, "task": str(wake.get("task", "")), "run_id": str(wake.get("run_id", "")),
+            "reason": reason, "at": KANBAN.utc_now(),
+        }
+        latest["lifecycle"] = "paused"
+
+    replace_state(state, mutate_state(repo, plan, pause))
     KANBAN.escalate_wake(repo, plan, wake_id)
     print(f"Controller paused: {reason} for {wake.get('task', 'unknown task')}")
 
@@ -157,8 +192,7 @@ def reconcile_pending_alert(repo: Path, plan: str, state: dict[str, Any]) -> boo
         return True
     if not pending_alert_resolved(repo, plan, alert):
         return False
-    state["pending_alert"] = None
-    update_state(repo, plan, state)
+    replace_state(state, mutate_state(repo, plan, lambda latest: latest.__setitem__("pending_alert", None)))
     return True
 
 
@@ -313,11 +347,14 @@ def deliver(repo: Path, plan: str, wake: dict[str, object], state: dict[str, Any
 
 def dispatch_wake(repo: Path, plan: str, wake: dict[str, object], state: dict[str, Any], *, claimed: bool = False) -> str:
     wake_id = str(wake["id"])
-    dispatches = state.setdefault("dispatches", {})
     if not claimed:
         wake = KANBAN.claim_wake(repo, plan, wake_id)
-        dispatches[wake_id] = {"state": "claimed", "wake": wake}
-        update_state(repo, plan, state)
+        replace_state(
+            state,
+            mutate_state(
+                repo, plan, lambda latest: latest.setdefault("dispatches", {}).__setitem__(wake_id, {"state": "claimed", "wake": wake})
+            ),
+        )
     action = str(wake["action"])
     if action in HUMAN_REQUIRED_ACTIONS:
         pause_for_alert(repo, plan, state, wake, action)
@@ -336,11 +373,21 @@ def dispatch_wake(repo: Path, plan: str, wake: dict[str, object], state: dict[st
     if result != "LANDED" and action == "DELIVERY_REQUIRED":
         pause_for_alert(repo, plan, state, wake, result)
         return result
-    dispatches[wake_id] = {"state": "started", "wake": wake, "result": result}
-    update_state(repo, plan, state)
+    replace_state(
+        state,
+        mutate_state(
+            repo, plan, lambda latest: latest.setdefault("dispatches", {}).__setitem__(
+                wake_id, {"state": "started", "wake": wake, "result": result}
+            )
+        ),
+    )
     KANBAN.acknowledge_wake(repo, plan, wake_id)
-    dispatches[wake_id]["state"] = "acknowledged"
-    update_state(repo, plan, state)
+    replace_state(
+        state,
+        mutate_state(
+            repo, plan, lambda latest: latest.setdefault("dispatches", {}).setdefault(wake_id, {}).__setitem__("state", "acknowledged")
+        ),
+    )
     return result
 
 
@@ -352,8 +399,14 @@ def resume_claimed_wakes(repo: Path, plan: str, state: dict[str, Any]) -> None:
             dispatch_wake(repo, plan, entry["wake"], state, claimed=True)
         elif entry.get("state") == "started":
             KANBAN.acknowledge_wake(repo, plan, str(wake_id))
-            entry["state"] = "acknowledged"
-            update_state(repo, plan, state)
+            replace_state(
+                state,
+                mutate_state(
+                    repo,
+                    plan,
+                    lambda latest: latest.setdefault("dispatches", {}).setdefault(str(wake_id), {}).__setitem__("state", "acknowledged"),
+                ),
+            )
 
 
 def reconcile_reviewer_dispatches(repo: Path, plan: str, state: dict[str, Any]) -> None:
@@ -378,7 +431,19 @@ def reconcile_reviewer_dispatches(repo: Path, plan: str, state: dict[str, Any]) 
                 entry["result"] = "REVIEW_VERDICT_REQUIRED"
                 changed = True
     if changed:
-        update_state(repo, plan, state)
+        results = {
+            str(wake_id): str(entry["result"])
+            for wake_id, entry in state.get("dispatches", {}).items()
+            if isinstance(entry, dict) and entry.get("state") == "acknowledged" and isinstance(entry.get("result"), str)
+        }
+
+        def update_results(latest: dict[str, Any]) -> None:
+            for wake_id, result in results.items():
+                entry = latest.setdefault("dispatches", {}).get(wake_id)
+                if isinstance(entry, dict):
+                    entry["result"] = result
+
+        replace_state(state, mutate_state(repo, plan, update_results))
 
 
 def drain_once(repo: Path, plan: str, state: dict[str, Any]) -> list[str]:
@@ -428,17 +493,20 @@ def start_controller(repo: Path, plan: str, no_mistakes_command: str | None) -> 
         if not reconcile_pending_alert(repo, plan, state):
             alert = state.get("pending_alert") or {}
             raise SystemExit(f"Pending controller alert: {alert.get('reason', 'human action required')}")
-        state["lifecycle"] = "running"
-        state["lease"] = {"session": controller_session_name(plan), "acquired_at": KANBAN.utc_now()}
-        state["recovery_required"] = False
-        state["recovery_alert"] = None
-        if no_mistakes_command is not None:
-            state["no_mistakes_command"] = no_mistakes_command
+        def acquire_lease(latest: dict[str, Any]) -> None:
+            latest["lifecycle"] = "running"
+            latest["lease"] = {"session": controller_session_name(plan), "acquired_at": KANBAN.utc_now()}
+            latest["recovery_required"] = False
+            latest["recovery_alert"] = None
+            if no_mistakes_command is not None:
+                latest["no_mistakes_command"] = no_mistakes_command
+
+        state = mutate_state(repo, plan, acquire_lease)
         command = " ".join(shlex.quote(value) for value in [sys.executable, str(Path(__file__).resolve()), "run", "--repo", str(repo), "--plan", plan])
         # Persist ownership before creating tmux so a crash cannot leave an unowned controller.
-        update_state(repo, plan, state)
         state["pid"] = tmux_start(str(state["session"]), repo, command)
-        update_state(repo, plan, state)
+        pid = state["pid"]
+        state = mutate_state(repo, plan, lambda latest: latest.__setitem__("pid", pid))
         print(f"Started controller: {state['session']}")
 
 
@@ -446,31 +514,32 @@ def status_controller(repo: Path, plan: str) -> None:
     state = load_state(repo, plan)
     if state is None:
         raise SystemExit("Controller has not been started")
-    state["live"] = KANBAN.tmux_session_exists(str(state["session"]))
-    state["healthy"] = bool(state["live"] and heartbeat_is_fresh(state.get("heartbeat_at")))
-    state["recovery_required"] = bool(
-        state.get("lifecycle") == "running" and has_in_progress_tasks(repo, plan) and not state["healthy"]
+    projection = json.loads(json.dumps(state))
+    projection["live"] = KANBAN.tmux_session_exists(str(projection["session"]))
+    projection["healthy"] = bool(projection["live"] and heartbeat_is_fresh(projection.get("heartbeat_at")))
+    projection["recovery_required"] = bool(
+        projection.get("lifecycle") == "running" and has_in_progress_tasks(repo, plan) and not projection["healthy"]
     )
-    if state["recovery_required"]:
-        state["recovery_alert"] = {"reason": "CONTROLLER_RECOVERY_REQUIRED", "at": KANBAN.utc_now()}
+    if projection["recovery_required"]:
+        projection["recovery_alert"] = {"reason": "CONTROLLER_RECOVERY_REQUIRED", "at": KANBAN.utc_now()}
     else:
-        state["recovery_alert"] = None
-    update_state(repo, plan, state)
-    print(json.dumps(state, indent=2, sort_keys=True))
+        projection["recovery_alert"] = None
+    print(json.dumps(projection, indent=2, sort_keys=True))
 
 
 def stop_controller(repo: Path, plan: str) -> None:
-    state = load_state(repo, plan)
-    if state is None:
-        raise SystemExit("Controller has not been started")
-    subprocess.run(["tmux", "kill-session", "-t", str(state["session"])], text=True, capture_output=True)
-    if KANBAN.tmux_session_exists(str(state["session"])):
-        raise SystemExit("Controller session could not be terminated; lease retained")
-    state["lifecycle"] = "stopped"
-    state["lease"] = None
-    state["recovery_required"] = False
-    state["recovery_alert"] = None
-    update_state(repo, plan, state)
+    with controller_state_lock(repo, plan):
+        state = load_state(repo, plan)
+        if state is None:
+            raise SystemExit("Controller has not been started")
+        subprocess.run(["tmux", "kill-session", "-t", str(state["session"])], text=True, capture_output=True)
+        if KANBAN.tmux_session_exists(str(state["session"])):
+            raise SystemExit("Controller session could not be terminated; lease retained")
+        state["lifecycle"] = "stopped"
+        state["lease"] = None
+        state["recovery_required"] = False
+        state["recovery_alert"] = None
+        persist_mutation(repo, plan, state)
     print(f"Stopped controller: {state['session']}")
 
 
