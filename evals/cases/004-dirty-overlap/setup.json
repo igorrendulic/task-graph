@@ -1,0 +1,8 @@
+{
+  "dirtyChanges": [
+    {
+      "path": "src/settings.py",
+      "append": "\n# existing local edit\n"
+    }
+  ]
+}

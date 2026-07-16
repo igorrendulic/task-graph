@@ -1,0 +1,15 @@
+{
+  "planSlug": "shared-file",
+  "tasks": {
+    "001-add-parser": {
+      "dependsOn": [],
+      "parallelSafe": false,
+      "rationaleContains": ["shared"]
+    },
+    "002-add-serializer": {
+      "dependsOn": ["001-add-parser"],
+      "parallelSafe": false,
+      "rationaleContains": ["shared"]
+    }
+  }
+}

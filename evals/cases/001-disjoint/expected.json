@@ -1,0 +1,15 @@
+{
+  "planSlug": "disjoint-changes",
+  "tasks": {
+    "001-add-schema": {
+      "dependsOn": [],
+      "parallelSafe": true,
+      "rationaleContains": ["disjoint"]
+    },
+    "002-add-formatter": {
+      "dependsOn": [],
+      "parallelSafe": true,
+      "rationaleContains": ["disjoint"]
+    }
+  }
+}
