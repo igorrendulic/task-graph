@@ -13,6 +13,14 @@ class SkillDocsTest(unittest.TestCase):
         self.assertIn("repair or replace", docs)
         self.assertIn("explicit", docs)
 
+    def test_readme_documents_controller_failure_journal_recovery(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("controller-failures.jsonl", readme)
+        self.assertIn("active_failure", readme)
+        self.assertIn("Claimed wakes remain untouched", readme)
+        self.assertIn("never auto-restarts", readme)
+
     def test_docs_require_a_plan_scoped_board(self) -> None:
         skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")

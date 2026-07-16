@@ -105,6 +105,131 @@ class ControllerStateTest(unittest.TestCase):
         self.assertEqual(2, heartbeat_revision)
         self.assertEqual(3, after_pause["revision"])
 
+    def test_controller_failure_record_is_active_and_keeps_newest_fifty_entries(self) -> None:
+        CONTROLLER.create_state(self.repo, self.plan, None)
+
+        for number in range(51):
+            CONTROLLER.record_controller_failure(
+                self.repo,
+                self.plan,
+                phase="drain",
+                error=RuntimeError(f"failure {number}"),
+                wake_id=f"wake-{number}",
+            )
+
+        entries = [
+            json.loads(line)
+            for line in CONTROLLER.controller_failure_journal_path(self.repo, self.plan).read_text().splitlines()
+        ]
+        self.assertEqual(50, len(entries))
+        self.assertEqual("failure 1", entries[0]["message"])
+        self.assertEqual("failure 50", entries[-1]["message"])
+        self.assertEqual(entries[-1], CONTROLLER.load_state(self.repo, self.plan)["active_failure"])
+
+    def test_controller_failure_record_has_bounded_traceback_and_wake_id(self) -> None:
+        CONTROLLER.create_state(self.repo, self.plan, None)
+
+        try:
+            raise ValueError("boom")
+        except ValueError as error:
+            failure = CONTROLLER.record_controller_failure(
+                self.repo, self.plan, phase="supervise", error=error, wake_id="wake-9"
+            )
+
+        self.assertEqual("supervise", failure["phase"])
+        self.assertEqual("ValueError", failure["exception_type"])
+        self.assertEqual("boom", failure["message"])
+        self.assertEqual("wake-9", failure["wake_id"])
+        self.assertIsInstance(failure["timestamp"], str)
+        self.assertLessEqual(len(failure["traceback"]), CONTROLLER.FAILURE_TRACEBACK_MAX_CHARS)
+
+    def test_supervision_failure_records_phase_without_changing_claimed_wake(self) -> None:
+        CONTROLLER.create_state(self.repo, self.plan, None)
+        wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REVIEW_REQUIRED"}
+        CONTROLLER.mutate_state(
+            self.repo,
+            self.plan,
+            lambda latest: latest["dispatches"].update({"wake-1": {"state": "claimed", "wake": wake}}),
+        )
+        with patch.object(CONTROLLER, "refresh_heartbeat"), patch.object(CONTROLLER, "drain_once"), patch.object(
+            CONTROLLER.KANBAN, "command_supervise", side_effect=RuntimeError("supervision broke")
+        ):
+            self.assertEqual(1, CONTROLLER.run_controller(self.repo, self.plan))
+
+        saved = CONTROLLER.load_state(self.repo, self.plan)
+        self.assertEqual("supervise", saved["active_failure"]["phase"])
+        self.assertEqual("RuntimeError", saved["active_failure"]["exception_type"])
+        self.assertEqual("claimed", saved["dispatches"]["wake-1"]["state"])
+
+    def test_review_dispatch_failure_records_claimed_wake_as_resumable(self) -> None:
+        CONTROLLER.create_state(self.repo, self.plan, None)
+        wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REVIEW_REQUIRED"}
+        with patch.object(CONTROLLER.KANBAN, "load_supervision_json_object", return_value={}), patch.object(
+            CONTROLLER.KANBAN, "queued_wakes", return_value=[wake]
+        ), patch.object(CONTROLLER, "resume_claimed_wakes"), patch.object(
+            CONTROLLER, "reconcile_reviewer_dispatches"
+        ), patch.object(CONTROLLER.KANBAN, "supervise_once"), patch.object(
+            CONTROLLER.KANBAN, "claim_wake", return_value=wake
+        ), patch.object(CONTROLLER, "start_review", side_effect=RuntimeError("review launch failed")), patch.object(
+            CONTROLLER.KANBAN, "acknowledge_wake"
+        ) as acknowledge:
+            self.assertEqual(1, CONTROLLER.run_controller(self.repo, self.plan))
+
+        saved = CONTROLLER.load_state(self.repo, self.plan)
+        self.assertEqual("drain", saved["active_failure"]["phase"])
+        self.assertEqual("wake-1", saved["active_failure"]["wake_id"])
+        self.assertEqual("claimed", saved["dispatches"]["wake-1"]["state"])
+        acknowledge.assert_not_called()
+
+    def test_resumed_claimed_wake_failure_records_the_wake_being_resumed(self) -> None:
+        first = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REVIEW_REQUIRED"}
+        second = {"id": "wake-2", "task": "002-work.md", "run_id": "run-a", "action": "REVIEW_REQUIRED"}
+        CONTROLLER.create_state(self.repo, self.plan, None)
+        CONTROLLER.mutate_state(
+            self.repo,
+            self.plan,
+            lambda latest: latest["dispatches"].update(
+                {"wake-1": {"state": "claimed", "wake": first}, "wake-2": {"state": "claimed", "wake": second}}
+            ),
+        )
+        with patch.object(CONTROLLER.KANBAN, "load_supervision_json_object", return_value={}), patch.object(
+            CONTROLLER.KANBAN, "queued_wakes", return_value=[]
+        ), patch.object(CONTROLLER, "reconcile_reviewer_dispatches"), patch.object(
+            CONTROLLER, "start_review", side_effect=RuntimeError("resume launch failed")
+        ):
+            self.assertEqual(1, CONTROLLER.run_controller(self.repo, self.plan))
+
+        self.assertEqual("wake-1", CONTROLLER.load_state(self.repo, self.plan)["active_failure"]["wake_id"])
+
+    def test_successful_tmux_start_clears_active_failure_but_failed_start_preserves_it(self) -> None:
+        CONTROLLER.create_state(self.repo, self.plan, None)
+        CONTROLLER.record_controller_failure(
+            self.repo, self.plan, phase="drain", error=RuntimeError("boom"), wake_id=None
+        )
+        with patch.object(CONTROLLER, "require_tmux"), patch.object(
+            CONTROLLER, "tmux_start", side_effect=RuntimeError("no tmux")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no tmux"):
+                CONTROLLER.start_controller(self.repo, self.plan, None)
+        self.assertIsNotNone(CONTROLLER.load_state(self.repo, self.plan)["active_failure"])
+
+        with patch.object(CONTROLLER, "require_tmux"), patch.object(CONTROLLER, "tmux_start", return_value=123):
+            CONTROLLER.start_controller(self.repo, self.plan, None)
+        self.assertIsNone(CONTROLLER.load_state(self.repo, self.plan)["active_failure"])
+
+    def test_status_recommends_explicit_start_for_a_dead_controller_with_active_failure(self) -> None:
+        CONTROLLER.create_state(self.repo, self.plan, None)
+        CONTROLLER.record_controller_failure(
+            self.repo, self.plan, phase="drain", error=RuntimeError("boom"), wake_id=None
+        )
+        with patch.object(CONTROLLER.KANBAN, "tmux_session_exists", return_value=False), patch(
+            "sys.stdout", new_callable=io.StringIO
+        ) as output:
+            CONTROLLER.status_controller(self.repo, self.plan)
+
+        projection = json.loads(output.getvalue())
+        self.assertEqual("Inspect active_failure and explicitly run controller.py start.", projection["recovery_recommendation"])
+
     def test_claimed_wake_is_acknowledged_only_after_dispatch_starts(self) -> None:
         wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REVIEW_REQUIRED"}
         CONTROLLER.create_state(self.repo, self.plan, None)

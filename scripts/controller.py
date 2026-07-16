@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from datetime import datetime
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -40,6 +41,8 @@ PUSH_TIMEOUT_SECONDS = 5 * 60
 PR_LOOKUP_TIMEOUT_SECONDS = 60
 PR_CHECKS_TIMEOUT_SECONDS = 30 * 60
 MERGE_TIMEOUT_SECONDS = 5 * 60
+FAILURE_JOURNAL_LIMIT = 50
+FAILURE_TRACEBACK_MAX_CHARS = 4_000
 
 
 @dataclass(frozen=True)
@@ -49,8 +52,21 @@ class ExternalRun:
     missing: bool = False
 
 
+class WakeDispatchFailure(Exception):
+    """Preserve the wake that was active when dispatch raised unexpectedly."""
+
+    def __init__(self, wake_id: str, error: Exception):
+        super().__init__(str(error))
+        self.wake_id = wake_id
+        self.error = error
+
+
 def controller_state_path(repo: Path, plan: str) -> Path:
     return KANBAN.plan_dir(repo, plan) / "state" / "controller.json"
+
+
+def controller_failure_journal_path(repo: Path, plan: str) -> Path:
+    return KANBAN.plan_dir(repo, plan) / "state" / "controller-failures.jsonl"
 
 
 def controller_session_name(plan: str) -> str:
@@ -109,6 +125,7 @@ def normalize_state(state: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("recovery_required", False)
     state.setdefault("dispatches", {})
     state.setdefault("delivery_attempt", None)
+    state.setdefault("active_failure", None)
     state.setdefault("revision", 0)
     return state
 
@@ -127,6 +144,7 @@ def create_state(repo: Path, plan: str, no_mistakes_command: str | None) -> dict
         "pending_alert": None,
         "recovery_alert": None,
         "recovery_required": False,
+        "active_failure": None,
         "updated_at": KANBAN.utc_now(),
     }
     state["revision"] = 1
@@ -152,6 +170,35 @@ def mutate_state(repo: Path, plan: str, mutation: Callable[[dict[str, Any]], Non
         return state
 
 
+def record_controller_failure(
+    repo: Path, plan: str, *, phase: str, error: BaseException, wake_id: str | None
+) -> dict[str, object]:
+    """Persist the latest unexpected controller failure without touching wakes."""
+    trace = "".join(traceback.format_exception(type(error), error, error.__traceback__))[-FAILURE_TRACEBACK_MAX_CHARS:]
+    failure: dict[str, object] = {
+        "timestamp": KANBAN.utc_now(),
+        "phase": phase,
+        "exception_type": type(error).__name__,
+        "message": str(error),
+        "wake_id": wake_id,
+        "traceback": trace,
+    }
+    with controller_state_lock(repo, plan):
+        journal = controller_failure_journal_path(repo, plan)
+        try:
+            entries = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except FileNotFoundError:
+            entries = []
+        entries.append(failure)
+        KANBAN.write_atomic(journal, "".join(json.dumps(entry, sort_keys=True) + "\n" for entry in entries[-FAILURE_JOURNAL_LIMIT:]))
+        state = load_state(repo, plan)
+        if state is None:
+            raise SystemExit("Controller has not been started")
+        state["active_failure"] = failure
+        persist_mutation(repo, plan, state)
+    return failure
+
+
 def replace_state(snapshot: dict[str, Any], current: dict[str, Any]) -> None:
     snapshot.clear()
     snapshot.update(current)
@@ -160,6 +207,17 @@ def replace_state(snapshot: dict[str, Any], current: dict[str, Any]) -> None:
 def refresh_heartbeat(repo: Path, plan: str, state: dict[str, Any]) -> None:
     current = mutate_state(repo, plan, lambda latest: latest.__setitem__("heartbeat_at", KANBAN.utc_now()))
     replace_state(state, current)
+
+
+def last_dispatch_wake_id(state: dict[str, Any]) -> str | None:
+    """Return the most recently persisted dispatch identity, if any."""
+    dispatches = state.get("dispatches")
+    if not isinstance(dispatches, dict):
+        return None
+    for wake_id in reversed(dispatches):
+        if isinstance(wake_id, str):
+            return wake_id
+    return None
 
 
 def heartbeat_is_fresh(value: object) -> bool:
@@ -561,12 +619,22 @@ def dispatch_wake(repo: Path, plan: str, wake: dict[str, object], state: dict[st
     return result
 
 
+def dispatch_wake_with_context(
+    repo: Path, plan: str, wake: dict[str, object], state: dict[str, Any], *, claimed: bool = False
+) -> str:
+    """Dispatch one wake while retaining its identity if the dispatch fails."""
+    try:
+        return dispatch_wake(repo, plan, wake, state, claimed=claimed)
+    except Exception as error:
+        raise WakeDispatchFailure(str(wake["id"]), error) from error
+
+
 def resume_claimed_wakes(repo: Path, plan: str, state: dict[str, Any]) -> None:
     for wake_id, entry in list(state.get("dispatches", {}).items()):
         if not isinstance(entry, dict) or not isinstance(entry.get("wake"), dict):
             continue
         if entry.get("state") == "claimed":
-            dispatch_wake(repo, plan, entry["wake"], state, claimed=True)
+            dispatch_wake_with_context(repo, plan, entry["wake"], state, claimed=True)
         elif entry.get("state") == "started":
             KANBAN.acknowledge_wake(repo, plan, str(wake_id))
             replace_state(
@@ -633,11 +701,11 @@ def drain_once(repo: Path, plan: str, state: dict[str, Any]) -> list[str]:
                 continue
             if claims.get(wake_id) == "claimed":
                 if state.get("dispatches", {}).get(wake_id, {}).get("state") == "claimed":
-                    results.append(dispatch_wake(repo, plan, wake, state, claimed=True))
+                    results.append(dispatch_wake_with_context(repo, plan, wake, state, claimed=True))
                     if state.get("lifecycle") != "running":
                         break
                 continue
-            results.append(dispatch_wake(repo, plan, wake, state))
+            results.append(dispatch_wake_with_context(repo, plan, wake, state))
             if state.get("lifecycle") != "running":
                 break
         return results
@@ -651,13 +719,38 @@ def run_controller(repo: Path, plan: str) -> int:
     if state is None:
         raise SystemExit("Controller has not been started")
     while state.get("lifecycle") == "running":
-        refresh_heartbeat(repo, plan, state)
-        drain_once(repo, plan, state)
-        if state.get("lifecycle") != "running":
-            break
-        # Supervision owns the bounded wait and writes any wake before it returns.
-        KANBAN.command_supervise(repo, plan, CHECKPOINT_SECONDS)
-        state = load_state(repo, plan) or state
+        for phase, operation in (
+            ("heartbeat", lambda: refresh_heartbeat(repo, plan, state)),
+            ("drain", lambda: drain_once(repo, plan, state)),
+            ("supervise", lambda: KANBAN.command_supervise(repo, plan, CHECKPOINT_SECONDS)),
+        ):
+            if phase == "supervise" and state.get("lifecycle") != "running":
+                break
+            try:
+                operation()
+                if phase == "supervise":
+                    state = load_state(repo, plan) or state
+            except WakeDispatchFailure as failure:
+                failure = record_controller_failure(
+                    repo, plan, phase=phase, error=failure.error, wake_id=failure.wake_id
+                )
+                print(
+                    f"Controller failed during {phase}: {failure['exception_type']}: {failure['message']}",
+                    file=sys.stderr,
+                )
+                return 1
+            except Exception as error:
+                failure = record_controller_failure(
+                    repo, plan, phase=phase, error=error, wake_id=last_dispatch_wake_id(state)
+                )
+                print(
+                    f"Controller failed during {phase}: {failure['exception_type']}: {failure['message']}",
+                    file=sys.stderr,
+                )
+                return 1
+        else:
+            continue
+        break
     return 0
 
 
@@ -687,6 +780,7 @@ def start_controller(repo: Path, plan: str, no_mistakes_command: str | None) -> 
         state["pid"] = tmux_start(str(state["session"]), repo, command)
         pid = state["pid"]
         state = mutate_state(repo, plan, lambda latest: latest.__setitem__("pid", pid))
+        state = mutate_state(repo, plan, lambda latest: latest.__setitem__("active_failure", None))
         print(f"Started controller: {state['session']}")
 
 
@@ -704,6 +798,10 @@ def status_controller(repo: Path, plan: str) -> None:
         projection["recovery_alert"] = {"reason": "CONTROLLER_RECOVERY_REQUIRED", "at": KANBAN.utc_now()}
     else:
         projection["recovery_alert"] = None
+    if not projection["healthy"] and (projection.get("active_failure") or projection["recovery_required"]):
+        projection["recovery_recommendation"] = "Inspect active_failure and explicitly run controller.py start."
+    else:
+        projection["recovery_recommendation"] = None
     print(json.dumps(projection, indent=2, sort_keys=True))
 
 
