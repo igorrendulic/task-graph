@@ -96,7 +96,9 @@ python3 <skill-dir>/scripts/kanban.py uninstall-stop-hook --repo <repo-root> --p
 
 ## Local controller
 
-For unattended local workers, start one controller per plan. It requires tmux, records its lease, heartbeat, session, and every wake dispatch in `.agent/<plan-slug>/state/controller.json`. A second live controller for the same plan is refused; `start` is the explicit safe recovery action only after the prior tmux session is absent. It never auto-restarts a controller.
+For unattended local workers, start one repository controller. It requires tmux, records its fleet lease in `.agent/state/fleet-controller.json`, and serializes every board, runtime, delivery, worktree, and teardown mutation through a durable request/result journal in `.agent/state/`. The plan state under `.agent/<plan-slug>/state/controller.json` remains the per-plan recovery record. A second live controller is refused; `start` is the explicit safe recovery action only after the prior tmux session is absent. It never auto-restarts a controller.
+
+All mutating `kanban.py` commands are controller requests. They accept an optional stable `--operation-id`; retries with the same id are deduplicated, while calls without one receive a fresh id. The controller durably claims an operation before executing it and reconciles claimed work from each command's durable postcondition after restart. Its short-lived `starting` lease excludes concurrent starts, while an explicitly restarted, stale no-tmux lease is recoverable. If no live controller owns the repository, they fail closed with a `Controller migration required` error. `status` and `watcher.py` remain read-only observation tools; worker completion is also submitted as a controller request rather than granted a mutation bypass.
 
 ```bash
 python3 <skill-dir>/scripts/controller.py start --repo <repo-root> --plan <plan-slug>

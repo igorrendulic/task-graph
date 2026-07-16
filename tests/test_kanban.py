@@ -113,11 +113,10 @@ class KanbanTest(unittest.TestCase):
         write_task(self.repo, self.plan, "todo", "001-one.md", "One")
         write_task(self.repo, self.plan, "todo", "002-two.md", "Two")
 
-        result = self.run_helper(
-            "reserve", "--limit", "2", "--run-id", "run-a", "--delivery-mode", "direct-pr"
-        )
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            KANBAN.command_reserve(self.repo, self.plan, 2, "run-a", "direct-pr", False)
 
-        self.assertIn("Reserved launch batch (limit 2):", result.stdout)
+        self.assertIn("Reserved launch batch (limit 2):", output.getvalue())
         self.assertTrue((self.repo / ".agent" / self.plan / "in-progress" / "001-one.md").exists())
         self.assertTrue((self.repo / ".agent" / self.plan / "in-progress" / "002-two.md").exists())
         run_dir = self.repo / ".agent" / self.plan / "runs" / "run-a"
@@ -172,7 +171,7 @@ class KanbanTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        self.run_helper("reserve", "--limit", "2", "--run-id", "run-b", "--delivery-mode", "direct-pr")
+        KANBAN.command_reserve(self.repo, self.plan, 2, "run-b", "direct-pr", False)
 
         self.assertTrue((self.repo / ".agent" / self.plan / "todo" / "001-done-in-ledger.md").exists())
         self.assertTrue((self.repo / ".agent" / self.plan / "in-progress" / "002-next.md").exists())
@@ -181,27 +180,17 @@ class KanbanTest(unittest.TestCase):
         write_task(self.repo, self.plan, "in-progress", "001-work.md", "Work")
         base, head = self.init_git_repo()
 
-        result = self.run_helper(
-            "archive-diff",
-            "--run-id",
-            "run-a",
-            "--task",
-            "001-work.md",
-            "--base",
-            base,
-            "--head",
-            head,
-            "--branch",
-            "task-graph/first-plan/001-work",
-            "--review",
-            "reviews/001-work.md",
-        )
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            KANBAN.command_archive_diff(
+                self.repo, self.plan, "run-a", "001-work.md", base, head,
+                "task-graph/first-plan/001-work", "reviews/001-work.md",
+            )
 
         diff_dir = self.repo / ".agent" / self.plan / "runs" / "run-a" / "diffs"
-        patch = diff_dir / "001-work.patch"
+        patch_file = diff_dir / "001-work.patch"
         metadata = diff_dir / "001-work.md"
-        self.assertIn(str(patch), result.stdout)
-        self.assertIn("-before", patch.read_text(encoding="utf-8"))
+        self.assertIn(str(patch_file), output.getvalue())
+        self.assertIn("-before", patch_file.read_text(encoding="utf-8"))
         summary = metadata.read_text(encoding="utf-8")
         self.assertIn("task-graph/first-plan/001-work", summary)
         self.assertIn(base, summary)
@@ -213,34 +202,11 @@ class KanbanTest(unittest.TestCase):
         write_task(self.repo, self.plan, "in-progress", "001-work.md", "Work")
         self.init_git_repo()
 
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(HELPER),
-                "archive-diff",
-                "--repo",
-                str(self.repo),
-                "--plan",
-                self.plan,
-                "--run-id",
-                "run-a",
-                "--task",
-                "001-work.md",
-                "--base",
-                "does-not-exist",
-                "--head",
-                "HEAD",
-                "--branch",
-                "task-graph/first-plan/001-work",
-                "--review",
-                "reviews/001-work.md",
-            ],
-            text=True,
-            capture_output=True,
-        )
-
-        self.assertNotEqual(0, result.returncode)
-        self.assertIn("unknown revision", result.stderr)
+        with self.assertRaisesRegex(SystemExit, "unknown revision"):
+            KANBAN.command_archive_diff(
+                self.repo, self.plan, "run-a", "001-work.md", "does-not-exist", "HEAD",
+                "task-graph/first-plan/001-work", "reviews/001-work.md",
+            )
         self.assertFalse((self.repo / ".agent" / self.plan / "runs" / "run-a" / "diffs").exists())
 
     def test_plans_with_matching_task_names_and_run_ids_are_isolated(self) -> None:
@@ -248,12 +214,10 @@ class KanbanTest(unittest.TestCase):
         write_task(self.repo, self.plan, "todo", "001-work.md", "First Work")
         write_task(self.repo, second_plan, "todo", "001-work.md", "Second Work")
 
-        self.run_helper("reserve", "--limit", "1", "--run-id", "shared-run", "--delivery-mode", "direct-pr")
-        self.run_helper(
-            "reserve", "--limit", "1", "--run-id", "shared-run", "--delivery-mode", "direct-pr", plan=second_plan
-        )
-        self.run_helper("board")
-        self.run_helper("board", plan=second_plan)
+        KANBAN.command_reserve(self.repo, self.plan, 1, "shared-run", "direct-pr", False)
+        KANBAN.command_reserve(self.repo, second_plan, 1, "shared-run", "direct-pr", False)
+        KANBAN.rewrite_board(self.repo, self.plan)
+        KANBAN.rewrite_board(self.repo, second_plan)
 
         first_board = (self.repo / ".agent" / self.plan / "kanban.md").read_text(encoding="utf-8")
         second_board = (self.repo / ".agent" / second_plan / "kanban.md").read_text(encoding="utf-8")
@@ -1187,6 +1151,62 @@ class KanbanTest(unittest.TestCase):
         (run / "reviews" / "001-work.md").write_text("Review status: approved\n", encoding="utf-8")
 
         self.assertEqual("DELIVERY_REQUIRED", KANBAN.reconcile_actions(self.repo, self.plan)[0]["action"])
+
+class ControllerRequestMigrationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        self.plan = "sample-plan"
+        (self.repo / ".agent" / self.plan).mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_mutation_request_fails_closed_without_a_live_fleet_controller(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "Controller migration required"):
+            KANBAN.submit_controller_request(
+                self.repo, self.plan, "start", {"plan": self.plan}, operation_id="op-start"
+            )
+
+    def test_public_mutating_cli_does_not_move_a_task_without_controller(self) -> None:
+        write_task(self.repo, self.plan, "todo", "001-work.md", "Work")
+        result = __import__("subprocess").run(
+            [sys.executable, str(ROOT / "scripts" / "kanban.py"), "start", "--repo", str(self.repo), "--plan", self.plan],
+            text=True, capture_output=True,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("Controller migration required", result.stderr)
+        self.assertTrue((self.repo / ".agent" / self.plan / "todo" / "001-work.md").exists())
+
+    def test_request_uses_stable_operation_id_and_deduplicates(self) -> None:
+        KANBAN.write_fleet_state(self.repo, {"version": 1, "lifecycle": "running", "session": "test"})
+        with patch.object(KANBAN, "tmux_session_exists", return_value=True):
+            first = KANBAN.submit_controller_request(
+                self.repo, self.plan, "start", {"plan": self.plan}, operation_id="op-start"
+            )
+            second = KANBAN.submit_controller_request(
+                self.repo, self.plan, "start", {"plan": self.plan}, operation_id="op-start"
+            )
+        self.assertEqual("queued", first["state"])
+        self.assertEqual(first, second)
+        self.assertEqual(1, len(KANBAN.load_controller_requests(self.repo)))
+
+    def test_implicit_operation_ids_are_fresh(self) -> None:
+        KANBAN.write_fleet_state(self.repo, {"version": 1, "lifecycle": "running", "session": "test"})
+        with patch.object(KANBAN, "tmux_session_exists", return_value=True):
+            first = KANBAN.new_operation_id()
+            second = KANBAN.new_operation_id()
+            KANBAN.submit_controller_request(self.repo, self.plan, "start", {}, operation_id=first)
+            KANBAN.submit_controller_request(self.repo, self.plan, "start", {}, operation_id=second)
+        self.assertNotEqual(first, second)
+        self.assertEqual(2, len(KANBAN.load_controller_requests(self.repo)))
+
+    def test_corrupt_request_journal_fails_closed(self) -> None:
+        path = KANBAN.controller_requests_path(self.repo)
+        path.parent.mkdir(parents=True)
+        path.write_text("not-json\n", encoding="utf-8")
+        with self.assertRaises(KANBAN.SupervisionStateCorruption):
+            KANBAN.load_controller_requests(self.repo)
 
 
 if __name__ == "__main__":

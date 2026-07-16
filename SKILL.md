@@ -13,6 +13,7 @@ Assume the repository root is the current working directory unless the user give
 - Task folders: `.agent/<plan-slug>/todo`, `.agent/<plan-slug>/in-progress`, `.agent/<plan-slug>/done`
 - Run artifacts: `.agent/<plan-slug>/runs/<run-id>/`
 - State helper: `scripts/kanban.py`; read-only watcher: `scripts/watcher.py`
+- Repository controller: `scripts/controller.py` owns every mutation through `.agent/state/fleet-controller.json` and durable request/result/claim journals. Public mutating `kanban.py` commands are requests (use stable `--operation-id` only for retries; omitted ids are fresh) and fail closed when no live fleet controller exists; `status` and `watcher.py` are observation only. A controller claims an operation before execution and reconciles each claimed command from its durable postcondition after restart; a stale no-tmux `starting` lease is recoverable only by explicit start, and workers never receive a direct mutation bypass.
 
 For every plan, read the supplied implementation plan, derive and announce a concise lowercase kebab-case `<plan-slug>` from its goal, then pass `--plan <plan-slug>` to every helper command. Reuse that slug when resuming the same plan. Run helper commands from any directory, passing `--repo <repo-root>` when the current directory is not the target repo. The target repo must contain `.agent/`; if it does not, ask before creating project workflow files. The helper never reads or updates the legacy shared `.agent/tasks`, `.agent/kanban.md`, or `.agent/runs` layout.
 

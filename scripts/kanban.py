@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -32,6 +33,185 @@ RUNTIME_FIELDS = {
     "window", "role", "worktree", "base_commit", "brief", "report", "log", "started_at", "finished_at", "exit_code",
 }
 _mutation_local = threading.local()
+
+
+# Repository-wide controller protocol.  The board remains plan-scoped, but a
+# single controller owns mutations for the whole repository.  JSONL is used
+# for the request/result journals so an interrupted controller can replay an
+# operation by its stable id without inventing a second transition.
+FLEET_STATE_VERSION = 1
+
+
+def new_operation_id() -> str:
+    """Allocate a fresh operation identity unless a retry explicitly supplies one."""
+    return uuid.uuid4().hex
+
+
+def fleet_state_path(repo: Path) -> Path:
+    return agent_dir(repo) / "state" / "fleet-controller.json"
+
+
+def fleet_mutation_lock_path(repo: Path) -> Path:
+    return agent_dir(repo) / "state" / "fleet-mutation.lock"
+
+
+def controller_requests_path(repo: Path) -> Path:
+    return agent_dir(repo) / "state" / "controller-requests.jsonl"
+
+
+def controller_results_path(repo: Path) -> Path:
+    return agent_dir(repo) / "state" / "controller-results.jsonl"
+
+
+def controller_claims_path(repo: Path) -> Path:
+    return agent_dir(repo) / "state" / "controller-operation-claims.json"
+
+
+@contextmanager
+def fleet_mutation_lock(repo: Path):
+    path = fleet_mutation_lock_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def write_fleet_state(repo: Path, state: dict[str, object]) -> None:
+    state = {**state, "version": FLEET_STATE_VERSION, "updated_at": utc_now()}
+    write_atomic(fleet_state_path(repo), json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
+def load_fleet_state(repo: Path) -> dict[str, object] | None:
+    try:
+        state = json.loads(fleet_state_path(repo).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"Invalid fleet controller state: {error.msg}") from None
+    if not isinstance(state, dict) or state.get("version") != FLEET_STATE_VERSION:
+        raise SystemExit("Invalid fleet controller state")
+    return state
+
+
+def fleet_controller_is_live(repo: Path) -> bool:
+    state = load_fleet_state(repo)
+    return bool(state and state.get("lifecycle") == "running" and isinstance(state.get("session"), str)
+                and tmux_session_exists(str(state["session"])))
+
+
+def load_controller_requests(repo: Path) -> list[dict[str, object]]:
+    path = controller_requests_path(repo)
+    if not path.exists():
+        return []
+    records: list[dict[str, object]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise SupervisionStateCorruption(path, error.msg, line_number) from None
+        if not isinstance(record, dict) or not isinstance(record.get("operation_id"), str):
+            raise SupervisionStateCorruption(path, "invalid controller request", line_number)
+        records.append(record)
+    return records
+
+
+def load_controller_results(repo: Path) -> dict[str, dict[str, object]]:
+    path = controller_results_path(repo)
+    if not path.exists():
+        return {}
+    results: dict[str, dict[str, object]] = {}
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            result = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise SupervisionStateCorruption(path, error.msg, line_number) from None
+        if not isinstance(result, dict) or not isinstance(result.get("operation_id"), str):
+            raise SupervisionStateCorruption(path, "invalid controller result", line_number)
+        results[str(result["operation_id"])] = result
+    return results
+
+
+def load_controller_claims(repo: Path) -> dict[str, dict[str, object]]:
+    path = controller_claims_path(repo)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as error:
+        raise SupervisionStateCorruption(path, error.msg) from None
+    if not isinstance(value, dict) or not all(isinstance(key, str) and isinstance(item, dict) for key, item in value.items()):
+        raise SupervisionStateCorruption(path, "expected an operation-id object")
+    return value
+
+
+def claim_controller_operation(repo: Path, request: dict[str, object]) -> dict[str, object]:
+    """Write the replay marker before a controller invokes a mutator."""
+    operation_id = str(request["operation_id"])
+    with fleet_mutation_lock(repo):
+        claims = load_controller_claims(repo)
+        claim = claims.get(operation_id)
+        if claim is not None:
+            return claim
+        claim = {"operation_id": operation_id, "state": "claimed", "request": request, "claimed_at": utc_now()}
+        if request.get("command") == "start":
+            plan = request.get("plan")
+            if isinstance(plan, str):
+                tasks = read_tasks(repo, plan)
+                completed = done_names(tasks)
+                startable = sorted(
+                    (task for task in tasks if task.column == "todo" and is_startable(task, completed)),
+                    key=lambda task: task.path.name,
+                )
+                if startable:
+                    claim["intent_task"] = startable[0].path.name
+        if request.get("command") == "reserve":
+            plan, arguments = request.get("plan"), request.get("arguments")
+            if isinstance(plan, str) and isinstance(arguments, dict):
+                schedule = schedule_tasks(repo, plan, int(arguments.get("limit", 5)), str(arguments.get("run_id") or "") or None)
+                claim["intent_tasks"] = [task.path.name for task in schedule.batch]
+                claim["intent_policy"] = {"mode": arguments.get("delivery_mode"), "yolo": bool(arguments.get("yolo", False))}
+        claims[operation_id] = claim
+        write_atomic(controller_claims_path(repo), json.dumps(claims, indent=2, sort_keys=True) + "\n")
+        return claim
+
+
+def submit_controller_request(repo: Path, plan: str, command: str, arguments: dict[str, object], *, operation_id: str) -> dict[str, object]:
+    """Durably queue a mutation; the caller never performs it itself."""
+    if not operation_id.strip():
+        raise SystemExit("--operation-id must not be empty")
+    with fleet_mutation_lock(repo):
+        if not fleet_controller_is_live(repo):
+            raise SystemExit("Controller migration required: no live repository controller; start controller.py first")
+        results = load_controller_results(repo)
+        if operation_id in results:
+            return results[operation_id]
+        for request in load_controller_requests(repo):
+            if request["operation_id"] == operation_id:
+                return request
+        request: dict[str, object] = {
+            "operation_id": operation_id, "plan": plan, "command": command,
+            "arguments": arguments, "state": "queued", "requested_at": utc_now(),
+        }
+        append_jsonl_durable(controller_requests_path(repo), [request])
+        return request
+
+
+def record_controller_result(repo: Path, operation_id: str, *, state: str, detail: str = "") -> dict[str, object]:
+    with fleet_mutation_lock(repo):
+        existing = load_controller_results(repo).get(operation_id)
+        if existing is not None:
+            return existing
+        result: dict[str, object] = {"operation_id": operation_id, "state": state, "detail": detail, "completed_at": utc_now()}
+        append_jsonl_durable(controller_results_path(repo), [result])
+        claims = load_controller_claims(repo)
+        if operation_id in claims:
+            claims[operation_id]["state"] = state
+            claims[operation_id]["completed_at"] = result["completed_at"]
+            write_atomic(controller_claims_path(repo), json.dumps(claims, indent=2, sort_keys=True) + "\n")
+        return result
 
 
 @dataclass(frozen=True)
@@ -830,6 +1010,39 @@ def command_finish_runtime(repo: Path, plan: str, run_id: str, task_name: str, e
         write_runtime_record(path, record)
 
 
+def resume_runtime_launch(repo: Path, plan: str, run_id: str, task_name: str) -> None:
+    """Complete a crash-interrupted launch after its runtime intent was written."""
+    path = runtime_path(repo, plan, run_id, task_name)
+    record = load_json_object(path)
+    if not is_valid_runtime_record(record):
+        raise SystemExit("cannot resume invalid runtime launch")
+    target = tmux_target(record)
+    if tmux_target_exists(target):
+        return
+    worktree = Path(str(record["worktree"]))
+    brief = Path(str(record["brief"]))
+    log = Path(str(record["log"]))
+    report = Path(str(record["report"]))
+    command = [str(value) for value in record["command"]]
+    prompt = (
+        f"Read {brief}. Work only on the assigned task in the current worktree. "
+        "Do not write outside that worktree and do not run git commit. "
+        "Return the complete final report in your final response, including status, summary, tests, concerns, and a suggested commit message."
+    )
+    codex_command = " ".join(shlex.quote(item) for item in [*command, prompt])
+    wrapper = (
+        f"set -o pipefail; {codex_command} 2>&1 | tee -a {shlex.quote(str(log))}; "
+        "exit_code=${PIPESTATUS[0]}; "
+        f"{shlex.quote(shutil.which('python3') or 'python3')} {shlex.quote(str(Path(__file__).resolve()))} "
+        f"finish-runtime --repo {shlex.quote(str(repo))} --plan {shlex.quote(plan)} --run-id {shlex.quote(run_id)} "
+        f"--task {shlex.quote(task_name)} --exit-code $exit_code; exit $exit_code"
+    )
+    pane_pid = tmux_create_window(repo, plan, str(record["session"]), str(record["window"]), worktree, wrapper)
+    if pane_pid is not None:
+        record["pid"] = pane_pid
+        write_runtime_record(path, record)
+
+
 def prepare_completed_task(repo: Path, plan: str, run_id: str, task_name: str) -> dict[str, object]:
     """Commit a successful worker worktree and return verified diff inputs.
 
@@ -995,11 +1208,15 @@ def mark_repair_attempt_phase(repo: Path, plan: str, task_name: str, phase: str)
         return record
 
 
-def record_repair_attempt(repo: Path, plan: str, task_name: str) -> None:
+def record_repair_attempt(repo: Path, plan: str, task_name: str, *, operation_id: str | None = None) -> None:
+    path = supervision_state_path(repo, plan, task_name)
+    existing = load_json_object(path)
+    if operation_id is not None and existing.get("record_repair_operation_id") == operation_id:
+        return
     attempts = legacy_repair_attempts(repo, plan, task_name) + 1
     write_atomic(
-        supervision_state_path(repo, plan, task_name),
-        json.dumps({"task": task_name, "repair_attempts": attempts, "updated_at": utc_now()}, indent=2) + "\n",
+        path,
+        json.dumps({"task": task_name, "repair_attempts": attempts, "record_repair_operation_id": operation_id, "updated_at": utc_now()}, indent=2) + "\n",
     )
 
 
@@ -1212,10 +1429,7 @@ def command_install_stop_hook(repo: Path, plan: str) -> None:
         raise SystemExit(f"Invalid Codex hooks file: {config_path}: {error}") from None
     hooks = config.setdefault("hooks", {})
     stop = hooks.setdefault("Stop", [])
-    command = " ".join(
-        shlex.quote(value)
-        for value in ("python3", str(Path(__file__).resolve()), "stop-guard", "--repo", str(repo), "--plan", plan)
-    )
+    command = stop_hook_command(repo, plan)
     if not any(command in str(item) for item in stop):
         stop.append({"hooks": [{"type": "command", "command": command, "timeout": 30}]})
     write_atomic(config_path, json.dumps(config, indent=2) + "\n")
@@ -1238,6 +1452,22 @@ def command_uninstall_stop_hook(repo: Path, plan: str) -> None:
     config["hooks"]["Stop"] = retained
     write_atomic(config_path, json.dumps(config, indent=2) + "\n")
     print(f"Uninstalled Task Graph Stop hook: {config_path}")
+
+
+def stop_hook_command(repo: Path, plan: str) -> str:
+    return " ".join(
+        shlex.quote(value)
+        for value in ("python3", str(Path(__file__).resolve()), "stop-guard", "--repo", str(repo), "--plan", plan)
+    )
+
+
+def stop_hook_installed(repo: Path, plan: str) -> bool:
+    try:
+        config = json.loads((repo / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+    stop = config.get("hooks", {}).get("Stop", []) if isinstance(config, dict) else []
+    return isinstance(stop, list) and any(stop_hook_command(repo, plan) in str(item) for item in stop)
 
 
 def latest_runtime_record(repo: Path, plan: str, task_name: str) -> tuple[str, Path, dict[str, object]] | None:
@@ -1358,6 +1588,24 @@ def delivery_path(repo: Path, plan: str, run_id: str, task_name: str) -> Path:
     return run_dir(repo, plan, run_id) / "delivery" / f"{Path(task_name).stem}.json"
 
 
+def teardown_path(repo: Path, plan: str, run_id: str, task_name: str) -> Path:
+    return run_dir(repo, plan, run_id) / "teardown" / f"{Path(task_name).stem}.json"
+
+
+def write_teardown_progress(repo: Path, plan: str, run_id: str, task_name: str, **updates: object) -> dict[str, object]:
+    path = teardown_path(repo, plan, run_id, task_name)
+    try:
+        progress = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        progress = {"task": task_name, "worktree_removed": False, "window_removed": False, "completed": False}
+    if not isinstance(progress, dict):
+        raise SystemExit(f"Invalid teardown progress: {path}")
+    progress.update(updates)
+    progress["updated_at"] = utc_now()
+    write_atomic(path, json.dumps(progress, indent=2, sort_keys=True) + "\n")
+    return progress
+
+
 def command_record_delivery(repo: Path, plan: str, run_id: str, task_name: str, result: str) -> None:
     with plan_mutation_lock(repo, plan):
         _command_record_delivery(repo, plan, run_id, task_name, result)
@@ -1382,6 +1630,12 @@ def command_teardown(repo: Path, plan: str, run_id: str, task_name: str, discard
 
 def _command_teardown(repo: Path, plan: str, run_id: str, task_name: str, discard: bool) -> None:
     try:
+        prior = json.loads(teardown_path(repo, plan, run_id, task_name).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        prior = {}
+    if isinstance(prior, dict) and prior.get("completed") is True:
+        return
+    try:
         record = json.loads(runtime_path(repo, plan, run_id, task_name).read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise SystemExit("teardown requires a runtime record") from None
@@ -1397,19 +1651,23 @@ def _command_teardown(repo: Path, plan: str, run_id: str, task_name: str, discar
         raise SystemExit("teardown refuses dirty or unlanded work without explicit discard")
     if discard:
         write_atomic(delivery, json.dumps({"result": "discarded", "at": utc_now()}) + "\n")
-    result = subprocess.run(["git", "worktree", "remove", str(worktree)], cwd=repo, text=True, capture_output=True)
-    if result.returncode:
-        raise SystemExit(result.stderr.strip() or "git worktree remove failed")
+    progress = write_teardown_progress(repo, plan, run_id, task_name, started_at=utc_now())
+    if not progress.get("worktree_removed"):
+        result = subprocess.run(["git", "worktree", "remove", str(worktree)], cwd=repo, text=True, capture_output=True)
+        if result.returncode and worktree.exists():
+            raise SystemExit(result.stderr.strip() or "git worktree remove failed")
+        write_teardown_progress(repo, plan, run_id, task_name, worktree_removed=True)
     target = tmux_target(record)
-    with tmux_window_lock(repo, plan):
-        tmux = subprocess.run(
-            ["tmux", "kill-window", "-t", target],
-            cwd=repo,
-            text=True,
-            capture_output=True,
-        )
-    if tmux.returncode and "can't find session" not in tmux.stderr.lower():
-        raise SystemExit(tmux.stderr.strip() or tmux.stdout.strip() or "tmux failed to remove session")
+    progress = json.loads(teardown_path(repo, plan, run_id, task_name).read_text(encoding="utf-8"))
+    if not progress.get("window_removed"):
+        with tmux_window_lock(repo, plan):
+            tmux = subprocess.run(
+                ["tmux", "kill-window", "-t", target], cwd=repo, text=True, capture_output=True,
+            )
+        if tmux.returncode and "can't find session" not in tmux.stderr.lower():
+            raise SystemExit(tmux.stderr.strip() or tmux.stdout.strip() or "tmux failed to remove session")
+        write_teardown_progress(repo, plan, run_id, task_name, window_removed=True)
+    write_teardown_progress(repo, plan, run_id, task_name, completed=True, completed_at=utc_now())
 
 
 def runtime_activity_at(run: Path, task_name: str, record: dict[str, object]) -> datetime | None:
@@ -1628,6 +1886,7 @@ def main() -> None:
     parser.add_argument("--interval", type=float, default=2.0, help="Status refresh interval in seconds")
     parser.add_argument("--seconds", type=int, help="Maximum watch-exec monitor duration in seconds")
     parser.add_argument("--wake-id", help="Durable wake identifier")
+    parser.add_argument("--operation-id", help="Stable id for a controller-owned mutation request")
     args = parser.parse_args()
 
     repo = args.repo.resolve()
@@ -1647,6 +1906,21 @@ def main() -> None:
         raise SystemExit(watcher.watch_exec(repo, args.plan, args.run_id, args.task, args.seconds, checkpoint=args.checkpoint))
     if not args.plan:
         raise SystemExit(f"{args.command} requires --plan <plan-slug>")
+    # Validate syntax before the controller-client protocol so malformed plan
+    # names retain the CLI's precise error instead of looking like migration.
+    plan_dir(repo, args.plan)
+    mutation_commands = {"board", "reserve", "start", "done", "record-repair", "record-delivery", "teardown", "launch-exec", "archive-diff", "finish-runtime", "supervise", "claim-wake", "ack-wake", "install-stop-hook", "uninstall-stop-hook"}
+    if args.command in mutation_commands:
+        values: dict[str, object] = {
+            "plan": args.plan, "limit": args.limit, "run_id": args.run_id, "task": args.task,
+            "delivery_mode": args.delivery_mode, "yolo": args.yolo, "result": args.result,
+            "discard": args.discard, "branch": args.branch, "worktree": str(args.worktree) if args.worktree else None,
+            "base": args.base, "head": args.head, "review": args.review,
+            "exit_code": args.exit_code, "seconds": args.seconds, "wake_id": args.wake_id,
+        }
+        operation_id = args.operation_id or new_operation_id()
+        print(json.dumps(submit_controller_request(repo, args.plan, args.command, values, operation_id=operation_id), sort_keys=True))
+        return
     if args.command == "stop-guard":
         raise SystemExit(command_stop_guard(repo, args.plan))
     if args.command == "install-stop-hook":

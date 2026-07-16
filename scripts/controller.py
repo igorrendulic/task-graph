@@ -43,6 +43,7 @@ PR_CHECKS_TIMEOUT_SECONDS = 30 * 60
 MERGE_TIMEOUT_SECONDS = 5 * 60
 FAILURE_JOURNAL_LIMIT = 50
 FAILURE_TRACEBACK_MAX_CHARS = 4_000
+STARTING_LEASE_MAX_AGE_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -199,6 +200,134 @@ def record_controller_failure(
     return failure
 
 
+def reconcile_controller_requests(repo: Path) -> list[dict[str, object]]:
+    """Replay pending repository-wide mutations exactly once.
+
+    A result record is the commit point.  Re-running this routine after a
+    controller restart skips completed operation ids, which makes launch and
+    teardown recovery safe without asking the watcher to mutate anything.
+    """
+    completed = KANBAN.load_controller_results(repo)
+    results: list[dict[str, object]] = []
+    for request in KANBAN.load_controller_requests(repo):
+        operation_id = str(request["operation_id"])
+        if operation_id in completed:
+            continue
+        if request_postcondition_met(repo, request):
+            results.append(KANBAN.record_controller_result(repo, operation_id, state="succeeded"))
+            continue
+        # Persist the claim before invoking any command.  A restart sees this
+        # marker and re-enters the command's idempotent reconciliation path.
+        KANBAN.claim_controller_operation(repo, request)
+        plan = str(request.get("plan", ""))
+        arguments = request.get("arguments")
+        if not plan or not isinstance(arguments, dict):
+            results.append(KANBAN.record_controller_result(repo, operation_id, state="failed", detail="invalid request"))
+            continue
+        try:
+            command = str(request.get("command"))
+            if command == "start":
+                KANBAN.command_start(repo, plan)
+            elif command == "board":
+                KANBAN.rewrite_board(repo, plan)
+            elif command == "reserve":
+                KANBAN.command_reserve(repo, plan, int(arguments.get("limit", 5)), str(arguments["run_id"]),
+                                       str(arguments.get("delivery_mode")), bool(arguments.get("yolo", False)))
+            elif command == "done":
+                KANBAN.command_done(repo, plan, str(arguments["task"]))
+            elif command == "record-repair":
+                KANBAN.task_in_progress(repo, plan, str(arguments["task"]))
+                KANBAN.record_repair_attempt(repo, plan, str(arguments["task"]), operation_id=operation_id)
+            elif command == "archive-diff":
+                KANBAN.command_archive_diff(repo, plan, str(arguments["run_id"]), str(arguments["task"]),
+                                            str(arguments["base"]), str(arguments["head"]), str(arguments["branch"]), str(arguments["review"]))
+            elif command == "launch-exec":
+                existing = KANBAN.load_json_object(KANBAN.runtime_path(repo, plan, str(arguments["run_id"]), str(arguments["task"])))
+                if KANBAN.is_valid_runtime_record(existing) and not KANBAN.tmux_target_exists(KANBAN.tmux_target(existing)):
+                    KANBAN.resume_runtime_launch(repo, plan, str(arguments["run_id"]), str(arguments["task"]))
+                else:
+                    KANBAN.command_launch_exec(repo, plan, str(arguments["run_id"]), str(arguments["task"]),
+                                               str(arguments["branch"]), Path(str(arguments["worktree"])).resolve())
+            elif command == "finish-runtime":
+                KANBAN.command_finish_runtime(repo, plan, str(arguments["run_id"]), str(arguments["task"]), int(arguments["exit_code"]))
+            elif command == "supervise":
+                KANBAN.command_supervise(repo, plan, int(arguments["seconds"]))
+            elif command == "claim-wake":
+                KANBAN.claim_wake(repo, plan, str(arguments["wake_id"]))
+            elif command == "ack-wake":
+                KANBAN.acknowledge_wake(repo, plan, str(arguments["wake_id"]))
+            elif command == "install-stop-hook":
+                KANBAN.command_install_stop_hook(repo, plan)
+            elif command == "uninstall-stop-hook":
+                KANBAN.command_uninstall_stop_hook(repo, plan)
+            elif command == "record-delivery":
+                KANBAN.command_record_delivery(repo, plan, str(arguments["run_id"]), str(arguments["task"]), str(arguments["result"]))
+            elif command == "teardown":
+                KANBAN.command_teardown(repo, plan, str(arguments["run_id"]), str(arguments["task"]), bool(arguments.get("discard", False)))
+            else:
+                raise SystemExit(f"unsupported controller request command: {command}")
+        except (SystemExit, OSError, ValueError, KeyError) as error:
+            results.append(KANBAN.record_controller_result(repo, operation_id, state="failed", detail=str(error)))
+        else:
+            results.append(KANBAN.record_controller_result(repo, operation_id, state="succeeded"))
+    return results
+
+
+def request_postcondition_met(repo: Path, request: dict[str, object]) -> bool:
+    """Recognize a mutation that committed before its result journal entry."""
+    plan, command = str(request.get("plan", "")), str(request.get("command", ""))
+    arguments = request.get("arguments")
+    if not plan or not isinstance(arguments, dict):
+        return False
+    task, run_id = str(arguments.get("task", "")), str(arguments.get("run_id", ""))
+    if command == "done":
+        return bool(task and (KANBAN.plan_dir(repo, plan) / "done" / task).exists())
+    if command == "start":
+        claim = KANBAN.load_controller_claims(repo).get(str(request.get("operation_id", "")), {})
+        intended = claim.get("intent_task") if isinstance(claim, dict) else None
+        return isinstance(intended, str) and any(
+            (KANBAN.plan_dir(repo, plan) / column / intended).exists() for column in ("in-progress", "done")
+        )
+    if command == "launch-exec":
+        if not (task and run_id):
+            return False
+        record = KANBAN.load_json_object(KANBAN.runtime_path(repo, plan, run_id, task))
+        return KANBAN.is_valid_runtime_record(record) and record.get("plan") == plan and record.get("task") == task and KANBAN.tmux_target_exists(KANBAN.tmux_target(record))
+    if command == "reserve":
+        execution = KANBAN.load_execution(repo, plan)
+        claim = KANBAN.load_controller_claims(repo).get(str(request.get("operation_id", "")), {})
+        intended = claim.get("intent_tasks") if isinstance(claim, dict) else None
+        policy = claim.get("intent_policy") if isinstance(claim, dict) else None
+        moved = isinstance(intended, list) and all(
+            isinstance(name, str) and any((KANBAN.plan_dir(repo, plan) / column / name).exists() for column in ("in-progress", "done"))
+            for name in intended
+        )
+        return bool(execution and execution.get("run_id") == run_id and moved and policy == KANBAN.load_json_object(KANBAN.policy_path(repo, plan, run_id)))
+    if command == "record-delivery":
+        path = KANBAN.delivery_path(repo, plan, run_id, task)
+        return path.exists() and KANBAN.load_json_object(path).get("result") == arguments.get("result")
+    if command == "teardown":
+        return KANBAN.load_json_object(KANBAN.teardown_path(repo, plan, run_id, task)).get("completed") is True
+    if command == "archive-diff":
+        directory = KANBAN.run_dir(repo, plan, run_id) / "diffs"
+        return bool(task and run_id and (directory / f"{Path(task).stem}.patch").exists() and (directory / f"{Path(task).stem}.md").exists())
+    if command == "finish-runtime":
+        record = KANBAN.load_json_object(KANBAN.runtime_path(repo, plan, run_id, task))
+        return record.get("finished_at") is not None and record.get("exit_code") == arguments.get("exit_code")
+    if command == "record-repair":
+        state = KANBAN.load_json_object(KANBAN.supervision_state_path(repo, plan, task))
+        return state.get("record_repair_operation_id") == request.get("operation_id")
+    if command in {"claim-wake", "ack-wake"}:
+        claim = KANBAN.load_supervision_json_object(KANBAN.wake_claims_path(repo, plan)).get(str(arguments.get("wake_id", "")))
+        return claim == ("claimed" if command == "claim-wake" else "acknowledged")
+    if command in {"install-stop-hook", "uninstall-stop-hook"}:
+        installed = KANBAN.stop_hook_installed(repo, plan)
+        return installed if command == "install-stop-hook" else not installed
+    if command == "board":
+        return False
+    return False
+
+
 def replace_state(snapshot: dict[str, Any], current: dict[str, Any]) -> None:
     snapshot.clear()
     snapshot.update(current)
@@ -226,6 +355,16 @@ def heartbeat_is_fresh(value: object) -> bool:
     try:
         age = (datetime.now().astimezone() - datetime.fromisoformat(value)).total_seconds()
         return 0 <= age <= HEARTBEAT_MAX_AGE_SECONDS
+    except ValueError:
+        return False
+
+
+def starting_lease_is_stale(fleet: dict[str, object]) -> bool:
+    value = fleet.get("starting_at")
+    if not isinstance(value, str):
+        return False
+    try:
+        return (datetime.now().astimezone() - datetime.fromisoformat(value)).total_seconds() > STARTING_LEASE_MAX_AGE_SECONDS
     except ValueError:
         return False
 
@@ -265,6 +404,21 @@ def pause_for_supervision_corruption(
 
     replace_state(state, mutate_state(repo, plan, pause))
     print(f"Controller paused: SUPERVISION_STATE_CORRUPTION at {error.path}")
+
+
+def pause_for_fleet_corruption(
+    repo: Path, plan: str, state: dict[str, Any], error: KANBAN.SupervisionStateCorruption
+) -> None:
+    """Fail closed when a repository-wide request/result journal is malformed."""
+    def pause(latest: dict[str, Any]) -> None:
+        latest["lifecycle"] = "paused"
+        latest["pending_alert"] = {
+            "reason": "FLEET_REQUEST_STATE_CORRUPTION", "artifact": str(error.path),
+            "line": error.line, "detail": error.detail, "at": KANBAN.utc_now(),
+        }
+
+    replace_state(state, mutate_state(repo, plan, pause))
+    print(f"Controller paused: FLEET_REQUEST_STATE_CORRUPTION at {error.path}")
 
 
 def pending_alert_resolved(repo: Path, plan: str, alert: object) -> bool:
@@ -743,6 +897,7 @@ def run_controller(repo: Path, plan: str) -> int:
         raise SystemExit("Controller has not been started")
     while state.get("lifecycle") == "running":
         for phase, operation in (
+            ("requests", lambda: reconcile_controller_requests(repo)),
             ("heartbeat", lambda: refresh_heartbeat(repo, plan, state)),
             ("drain", lambda: drain_once(repo, plan, state)),
             ("supervise", lambda: KANBAN.command_supervise(repo, plan, CHECKPOINT_SECONDS)),
@@ -762,6 +917,12 @@ def run_controller(repo: Path, plan: str) -> int:
                     file=sys.stderr,
                 )
                 return 1
+            except KANBAN.SupervisionStateCorruption as error:
+                if phase == "requests":
+                    pause_for_fleet_corruption(repo, plan, state, error)
+                else:
+                    pause_for_supervision_corruption(repo, plan, state, error)
+                return 1
             except Exception as error:
                 failure = record_controller_failure(
                     repo, plan, phase=phase, error=error, wake_id=last_dispatch_wake_id(state)
@@ -780,6 +941,17 @@ def run_controller(repo: Path, plan: str) -> int:
 def start_controller(repo: Path, plan: str, no_mistakes_command: str | None) -> None:
     require_tmux()
     with controller_lease_lock(repo, plan):
+        with KANBAN.fleet_mutation_lock(repo):
+            fleet = KANBAN.load_fleet_state(repo)
+            if fleet and fleet.get("lifecycle") == "starting":
+                same_owner = fleet.get("plan") == plan and fleet.get("session") == controller_session_name(plan)
+                if not (same_owner and starting_lease_is_stale(fleet) and not KANBAN.tmux_session_exists(str(fleet.get("session", "")))):
+                    raise SystemExit("A live repository controller already exists")
+            if fleet and fleet.get("lifecycle") == "running":
+                same_owner = fleet.get("plan") == plan and fleet.get("session") == controller_session_name(plan)
+                if not same_owner or KANBAN.tmux_session_exists(str(fleet.get("session", ""))):
+                    raise SystemExit("A live repository controller already exists")
+            KANBAN.write_fleet_state(repo, {"lifecycle": "starting", "session": controller_session_name(plan), "plan": plan, "starting_at": KANBAN.utc_now()})
         state = load_state(repo, plan)
         if state and KANBAN.tmux_session_exists(str(state.get("session"))):
             raise SystemExit("A live controller already exists for this plan")
@@ -807,10 +979,19 @@ def start_controller(repo: Path, plan: str, no_mistakes_command: str | None) -> 
             raise SystemExit("Controller start was superseded by stop")
         state = latest
         # Persist ownership before creating tmux so a crash cannot leave an unowned controller.
-        state["pid"] = tmux_start(str(state["session"]), repo, command)
+        try:
+            state["pid"] = tmux_start(str(state["session"]), repo, command)
+        except Exception:
+            with KANBAN.fleet_mutation_lock(repo):
+                fleet = KANBAN.load_fleet_state(repo)
+                if fleet and fleet.get("plan") == plan and fleet.get("session") == state.get("session"):
+                    KANBAN.write_fleet_state(repo, {"lifecycle": "stopped", "session": str(state["session"]), "plan": plan})
+            raise
         pid = state["pid"]
         state = mutate_state(repo, plan, lambda latest: latest.__setitem__("pid", pid))
         state = mutate_state(repo, plan, lambda latest: latest.__setitem__("active_failure", None))
+        with KANBAN.fleet_mutation_lock(repo):
+            KANBAN.write_fleet_state(repo, {"lifecycle": "running", "session": str(state["session"]), "plan": plan, "pid": state["pid"]})
         print(f"Started controller: {state['session']}")
 
 
@@ -841,6 +1022,12 @@ def stop_controller(repo: Path, plan: str) -> None:
             state = load_state(repo, plan)
             if state is None:
                 raise SystemExit("Controller has not been started")
+            with KANBAN.fleet_mutation_lock(repo):
+                fleet = KANBAN.load_fleet_state(repo)
+                if fleet is not None and (
+                    fleet.get("plan") != plan or fleet.get("session") != state.get("session")
+                ):
+                    raise SystemExit("Requested plan does not own the active repository controller")
             subprocess.run(["tmux", "kill-session", "-t", str(state["session"])], text=True, capture_output=True)
             if KANBAN.tmux_session_exists(str(state["session"])):
                 raise SystemExit("Controller session could not be terminated; lease retained")
@@ -849,6 +1036,8 @@ def stop_controller(repo: Path, plan: str) -> None:
             state["recovery_required"] = False
             state["recovery_alert"] = None
             persist_mutation(repo, plan, state)
+            with KANBAN.fleet_mutation_lock(repo):
+                KANBAN.write_fleet_state(repo, {"lifecycle": "stopped", "session": str(state["session"]), "plan": plan})
     print(f"Stopped controller: {state['session']}")
 
 

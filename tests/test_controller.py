@@ -854,6 +854,173 @@ class ControllerStateTest(unittest.TestCase):
 
         launch.assert_not_called()
 
+class FleetControllerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        self.plan = "sample-plan"
+        (self.repo / ".agent" / self.plan).mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_reconciliation_executes_each_operation_once_after_restart(self) -> None:
+        CONTROLLER.KANBAN.write_fleet_state(self.repo, {"lifecycle": "running", "session": "controller"})
+        with patch.object(CONTROLLER.KANBAN, "tmux_session_exists", return_value=True):
+            CONTROLLER.KANBAN.submit_controller_request(
+                self.repo, self.plan, "start", {"plan": self.plan}, operation_id="op-1"
+            )
+        with patch.object(CONTROLLER.KANBAN, "command_start") as start:
+            CONTROLLER.reconcile_controller_requests(self.repo)
+            CONTROLLER.reconcile_controller_requests(self.repo)
+        start.assert_called_once_with(self.repo, self.plan)
+        self.assertEqual("succeeded", CONTROLLER.KANBAN.load_controller_results(self.repo)["op-1"]["state"])
+
+    def test_starting_fleet_lease_blocks_a_second_plan_before_tmux_creation(self) -> None:
+        other = "other-plan"
+        (self.repo / ".agent" / other).mkdir(parents=True)
+        CONTROLLER.KANBAN.write_fleet_state(
+            self.repo, {"lifecycle": "starting", "session": "task-graph-controller-sample-plan", "plan": self.plan}
+        )
+        with patch.object(CONTROLLER, "require_tmux"), patch.object(CONTROLLER, "tmux_start") as start:
+            with self.assertRaisesRegex(SystemExit, "repository controller"):
+                CONTROLLER.start_controller(self.repo, other, None)
+        start.assert_not_called()
+
+    def test_stale_starting_lease_can_be_explicitly_recovered(self) -> None:
+        CONTROLLER.KANBAN.write_fleet_state(
+            self.repo, {"lifecycle": "starting", "session": CONTROLLER.controller_session_name(self.plan), "plan": self.plan,
+                        "starting_at": "2000-01-01T00:00:00+00:00"}
+        )
+        with patch.object(CONTROLLER, "require_tmux"), patch.object(CONTROLLER, "tmux_start", return_value=123) as start, patch.object(
+            CONTROLLER.KANBAN, "tmux_session_exists", return_value=False
+        ):
+            CONTROLLER.start_controller(self.repo, self.plan, None)
+        start.assert_called_once()
+
+    def test_fleet_request_corruption_pauses_controller(self) -> None:
+        state = CONTROLLER.create_state(self.repo, self.plan, None)
+        path = CONTROLLER.KANBAN.controller_requests_path(self.repo)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("bad\n", encoding="utf-8")
+        CONTROLLER.pause_for_fleet_corruption(self.repo, self.plan, state, CONTROLLER.KANBAN.SupervisionStateCorruption(path, "bad", 1))
+        self.assertEqual("paused", CONTROLLER.load_state(self.repo, self.plan)["lifecycle"])
+
+    def test_claimed_record_repair_reconciles_without_a_second_attempt(self) -> None:
+        task = self.repo / ".agent" / self.plan / "in-progress" / "001-work.md"
+        task.parent.mkdir(parents=True)
+        task.write_text("# Work\n\n## Dependencies\n\nNone\n", encoding="utf-8")
+        request = {"operation_id": "repair-op", "plan": self.plan, "command": "record-repair", "arguments": {"task": "001-work.md"}}
+        CONTROLLER.KANBAN.write_fleet_state(self.repo, {"lifecycle": "running", "session": "controller"})
+        with patch.object(CONTROLLER.KANBAN, "tmux_session_exists", return_value=True):
+            CONTROLLER.KANBAN.submit_controller_request(self.repo, self.plan, "record-repair", {"task": "001-work.md"}, operation_id="repair-op")
+        CONTROLLER.KANBAN.claim_controller_operation(self.repo, request)
+        CONTROLLER.KANBAN.record_repair_attempt(self.repo, self.plan, "001-work.md", operation_id="repair-op")
+        CONTROLLER.reconcile_controller_requests(self.repo)
+        state = CONTROLLER.KANBAN.load_json_object(CONTROLLER.KANBAN.supervision_state_path(self.repo, self.plan, "001-work.md"))
+        self.assertEqual(1, state["repair_attempts"])
+
+    def test_claimed_done_is_finalized_after_crash_without_a_second_move(self) -> None:
+        source = self.repo / ".agent" / self.plan / "in-progress" / "001-work.md"
+        source.parent.mkdir(parents=True)
+        source.write_text("# Work\n\n## Dependencies\n\nNone\n", encoding="utf-8")
+        request = {"operation_id": "done-op", "plan": self.plan, "command": "done", "arguments": {"task": "001-work.md"}}
+        CONTROLLER.KANBAN.submit_controller_request = CONTROLLER.KANBAN.submit_controller_request
+        CONTROLLER.KANBAN.append_jsonl_durable(CONTROLLER.KANBAN.controller_requests_path(self.repo), [request])
+        CONTROLLER.KANBAN.claim_controller_operation(self.repo, request)
+        CONTROLLER.KANBAN.command_done(self.repo, self.plan, "001-work.md")
+        with patch.object(CONTROLLER.KANBAN, "command_done") as done:
+            CONTROLLER.reconcile_controller_requests(self.repo)
+        done.assert_not_called()
+        self.assertEqual("succeeded", CONTROLLER.KANBAN.load_controller_results(self.repo)["done-op"]["state"])
+
+    def test_claimed_launch_is_finalized_when_runtime_record_already_exists(self) -> None:
+        request = {"operation_id": "launch-op", "plan": self.plan, "command": "launch-exec", "arguments": {"run_id": "run-a", "task": "001-work.md", "branch": "topic", "worktree": "/tmp/work"}}
+        CONTROLLER.KANBAN.append_jsonl_durable(CONTROLLER.KANBAN.controller_requests_path(self.repo), [request])
+        CONTROLLER.KANBAN.claim_controller_operation(self.repo, request)
+        path = CONTROLLER.KANBAN.runtime_path(self.repo, self.plan, "run-a", "001-work.md")
+        path.parent.mkdir(parents=True)
+        path.write_text("{}\n", encoding="utf-8")
+        with patch.object(CONTROLLER.KANBAN, "command_launch_exec") as launch:
+            CONTROLLER.reconcile_controller_requests(self.repo)
+        launch.assert_called_once()
+        self.assertEqual("succeeded", CONTROLLER.KANBAN.load_controller_results(self.repo)["launch-op"]["state"])
+
+    def test_claimed_start_finalizes_original_intended_task_without_starting_next(self) -> None:
+        for name in ("001-first.md", "002-next.md"):
+            path = self.repo / ".agent" / self.plan / "todo" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# Work\n\n## Dependencies\n\nNone\n", encoding="utf-8")
+        request = {"operation_id": "start-op", "plan": self.plan, "command": "start", "arguments": {}}
+        CONTROLLER.KANBAN.append_jsonl_durable(CONTROLLER.KANBAN.controller_requests_path(self.repo), [request])
+        CONTROLLER.KANBAN.claim_controller_operation(self.repo, request)
+        CONTROLLER.KANBAN.command_start(self.repo, self.plan)
+        with patch.object(CONTROLLER.KANBAN, "command_start") as start:
+            CONTROLLER.reconcile_controller_requests(self.repo)
+        start.assert_not_called()
+        self.assertTrue((self.repo / ".agent" / self.plan / "todo" / "002-next.md").exists())
+
+    def test_claimed_launch_requires_valid_record_and_live_recorded_window(self) -> None:
+        task = CONTROLLER.KANBAN.Task("in-progress", Path("001-work.md"), "Work", (), "ship")
+        record = CONTROLLER.KANBAN.new_runtime_record(
+            task=task, plan=self.plan, run_id="run-b", branch="topic", worktree=Path("/tmp/work"),
+            brief=Path("/tmp/brief"), report=Path("/tmp/report"), log=Path("/tmp/log"), command=["codex"], base_commit="a" * 40,
+        )
+        request = {"operation_id": "launch-valid", "plan": self.plan, "command": "launch-exec", "arguments": {"run_id": "run-b", "task": "001-work.md", "branch": "topic", "worktree": "/tmp/work"}}
+        CONTROLLER.KANBAN.append_jsonl_durable(CONTROLLER.KANBAN.controller_requests_path(self.repo), [request])
+        CONTROLLER.KANBAN.claim_controller_operation(self.repo, request)
+        CONTROLLER.KANBAN.write_runtime_record(CONTROLLER.KANBAN.runtime_path(self.repo, self.plan, "run-b", "001-work.md"), record)
+        with patch.object(CONTROLLER.KANBAN, "tmux_target_exists", return_value=True), patch.object(CONTROLLER.KANBAN, "command_launch_exec") as launch:
+            CONTROLLER.reconcile_controller_requests(self.repo)
+        launch.assert_not_called()
+
+    def test_heartbeat_fresh_for_current_timestamp(self) -> None:
+        self.assertTrue(CONTROLLER.heartbeat_is_fresh(CONTROLLER.KANBAN.utc_now()))
+
+    def test_hook_postconditions_distinguish_installed_from_uninstalled(self) -> None:
+        hooks = self.repo / ".codex" / "hooks.json"
+        hooks.parent.mkdir(parents=True)
+        hooks.write_text('{"hooks":{"Stop":[]}}\n', encoding="utf-8")
+        install = {"operation_id": "hook-install", "plan": self.plan, "command": "install-stop-hook", "arguments": {}}
+        uninstall = {"operation_id": "hook-remove", "plan": self.plan, "command": "uninstall-stop-hook", "arguments": {}}
+        self.assertFalse(CONTROLLER.request_postcondition_met(self.repo, install))
+        self.assertTrue(CONTROLLER.request_postcondition_met(self.repo, uninstall))
+
+    def test_valid_runtime_without_window_is_resumed_once(self) -> None:
+        task = CONTROLLER.KANBAN.Task("in-progress", Path("001-work.md"), "Work", (), "ship")
+        record = CONTROLLER.KANBAN.new_runtime_record(task=task, plan=self.plan, run_id="run-c", branch="topic", worktree=Path("/tmp/work"), brief=Path("/tmp/brief"), report=Path("/tmp/report"), log=Path("/tmp/log"), command=["codex"], base_commit="a" * 40)
+        request = {"operation_id": "launch-resume", "plan": self.plan, "command": "launch-exec", "arguments": {"run_id": "run-c", "task": "001-work.md", "branch": "topic", "worktree": "/tmp/work"}}
+        CONTROLLER.KANBAN.append_jsonl_durable(CONTROLLER.KANBAN.controller_requests_path(self.repo), [request])
+        CONTROLLER.KANBAN.claim_controller_operation(self.repo, request)
+        CONTROLLER.KANBAN.write_runtime_record(CONTROLLER.KANBAN.runtime_path(self.repo, self.plan, "run-c", "001-work.md"), record)
+        with patch.object(CONTROLLER.KANBAN, "tmux_target_exists", return_value=False), patch.object(CONTROLLER.KANBAN, "resume_runtime_launch") as resume:
+            CONTROLLER.reconcile_controller_requests(self.repo)
+        resume.assert_called_once()
+
+    def test_board_request_rewrites_a_stale_existing_board(self) -> None:
+        board = self.repo / ".agent" / self.plan / "kanban.md"
+        board.write_text("stale\n", encoding="utf-8")
+        request = {"operation_id": "board-op", "plan": self.plan, "command": "board", "arguments": {}}
+        CONTROLLER.KANBAN.append_jsonl_durable(CONTROLLER.KANBAN.controller_requests_path(self.repo), [request])
+        with patch.object(CONTROLLER.KANBAN, "rewrite_board") as rewrite:
+            CONTROLLER.reconcile_controller_requests(self.repo)
+        rewrite.assert_called_once_with(self.repo, self.plan)
+
+    def test_partial_reserve_is_not_finalized_until_every_intended_task_moves(self) -> None:
+        for name in ("001-one.md", "002-two.md"):
+            path = self.repo / ".agent" / self.plan / "todo" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# Work\n\n## Dependencies\n\nNone\n", encoding="utf-8")
+        request = {"operation_id": "reserve-op", "plan": self.plan, "command": "reserve", "arguments": {"run_id": "run-reserve", "limit": 2, "delivery_mode": "direct-pr", "yolo": False}}
+        CONTROLLER.KANBAN.append_jsonl_durable(CONTROLLER.KANBAN.controller_requests_path(self.repo), [request])
+        CONTROLLER.KANBAN.claim_controller_operation(self.repo, request)
+        CONTROLLER.KANBAN.write_execution(self.repo, self.plan, "run-reserve", ["001-one.md", "002-two.md"])
+        CONTROLLER.KANBAN.write_atomic(CONTROLLER.KANBAN.policy_path(self.repo, self.plan, "run-reserve"), '{"mode":"direct-pr","yolo":false}\n')
+        source = self.repo / ".agent" / self.plan / "todo" / "001-one.md"
+        (self.repo / ".agent" / self.plan / "in-progress").mkdir(exist_ok=True)
+        source.replace(self.repo / ".agent" / self.plan / "in-progress" / "001-one.md")
+        self.assertFalse(CONTROLLER.request_postcondition_met(self.repo, request))
+
 
 if __name__ == "__main__":
     unittest.main()
