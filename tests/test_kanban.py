@@ -780,9 +780,44 @@ class KanbanTest(unittest.TestCase):
 
         self.assertEqual("REPAIR_REQUIRED", KANBAN.reconcile_actions(self.repo, self.plan)[0]["action"])
 
-        KANBAN.record_repair_attempt(self.repo, self.plan, "001-work.md")
+        KANBAN.reserve_repair_attempt(
+            self.repo,
+            self.plan,
+            "001-work.md",
+            attempt=1,
+            child_run_id="run-a-task001-repair1",
+            branch="task-branch-repair-1",
+            worktree=Path("/tmp/repair-worktree"),
+        )
+
+        self.assertEqual("REPAIR_REQUIRED", KANBAN.reconcile_actions(self.repo, self.plan)[0]["action"])
+
+        KANBAN.mark_repair_attempt_phase(self.repo, self.plan, "001-work.md", "failed")
+
+        self.assertEqual("REPAIR_REQUIRED", KANBAN.reconcile_actions(self.repo, self.plan)[0]["action"])
+
+        KANBAN.mark_repair_attempt_phase(self.repo, self.plan, "001-work.md", "launched")
 
         self.assertEqual("RETRY_DECISION_REQUIRED", KANBAN.reconcile_actions(self.repo, self.plan)[0]["action"])
+
+    def test_repair_attempt_record_counts_only_launched_attempts(self) -> None:
+        (self.repo / ".agent" / self.plan).mkdir(parents=True)
+        record = KANBAN.reserve_repair_attempt(
+            self.repo,
+            self.plan,
+            "001-work.md",
+            attempt=1,
+            child_run_id="run-a-task001-repair1",
+            branch="task-branch-repair-1",
+            worktree=Path("/tmp/repair-worktree"),
+        )
+
+        self.assertEqual("reserved", record["phase"])
+        self.assertEqual(0, KANBAN.repair_attempts(self.repo, self.plan, "001-work.md"))
+
+        KANBAN.mark_repair_attempt_phase(self.repo, self.plan, "001-work.md", "launched")
+
+        self.assertEqual(1, KANBAN.repair_attempts(self.repo, self.plan, "001-work.md"))
 
     def test_supervise_queues_actionable_wake_before_reporting(self) -> None:
         write_task(self.repo, self.plan, "in-progress", "001-work.md", "Work")

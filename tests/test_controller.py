@@ -419,14 +419,25 @@ class ControllerStateTest(unittest.TestCase):
         completed = __import__("subprocess").CompletedProcess
         with patch.object(CONTROLLER, "require_tmux"), patch.object(
             CONTROLLER.KANBAN, "latest_runtime_record", return_value=runtime
-        ), patch.object(CONTROLLER.KANBAN, "repair_attempts", return_value=0), patch.object(
-            CONTROLLER.KANBAN, "record_repair_attempt"
-        ) as record_attempt, patch.object(CONTROLLER.KANBAN, "read_run_policy", return_value={"mode": "direct-pr", "yolo": True}), patch.object(
+        ), patch.object(CONTROLLER.KANBAN, "repair_attempt", return_value=None), patch.object(
+            CONTROLLER.KANBAN, "reserve_repair_attempt", return_value={
+                "attempt": 1,
+                "child_run_id": "run-a-task001-repair1",
+                "branch": "task-branch-repair-1",
+                "worktree": "/tmp/repair-worktree",
+                "phase": "reserved",
+            }
+        ) as reserve_attempt, patch.object(CONTROLLER.KANBAN, "mark_repair_attempt_phase") as mark_phase, patch.object(
+            CONTROLLER.KANBAN, "read_run_policy", return_value={"mode": "direct-pr", "yolo": True}
+        ), patch.object(
             CONTROLLER.KANBAN, "create_child_worktree", return_value=Path("/tmp/repair-worktree")
-        ) as create_worktree, patch.object(CONTROLLER.KANBAN, "command_launch_exec") as launch:
+        ) as create_worktree, patch.object(CONTROLLER.KANBAN, "command_launch_exec") as launch, patch.object(
+            CONTROLLER.KANBAN, "runtime_record_for_run", return_value=("run-a-task001-repair1", parent, {"session": "repair-session"})
+        ):
             CONTROLLER.start_repair(self.repo, self.plan, wake)
 
-        record_attempt.assert_called_once_with(self.repo, self.plan, "001-work.md")
+        reserve_attempt.assert_called_once()
+        mark_phase.assert_called_once_with(self.repo, self.plan, "001-work.md", "launched")
         create_worktree.assert_called_once()
         self.assertEqual("task-branch", create_worktree.call_args.args[1])
         self.assertEqual("task-branch-repair-1", create_worktree.call_args.args[2])
@@ -434,6 +445,85 @@ class ControllerStateTest(unittest.TestCase):
         child = self.repo / ".agent" / self.plan / "runs" / "run-a-task001-repair1"
         self.assertEqual({"mode": "direct-pr", "yolo": True}, json.loads((child / "policy.json").read_text()))
         self.assertIn("add a regression test", (child / "briefs" / "001-work.md").read_text())
+
+    def test_repair_worktree_failure_does_not_consume_attempt(self) -> None:
+        wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REPAIR_REQUIRED"}
+        parent = self.repo / ".agent" / self.plan / "runs" / "run-a"
+        runtime = ("run-a", parent, {"branch": "task-branch", "worktree": "/work"})
+        with patch.object(CONTROLLER, "require_tmux"), patch.object(
+            CONTROLLER.KANBAN, "latest_runtime_record", return_value=runtime
+        ), patch.object(CONTROLLER.KANBAN, "repair_attempt", return_value=None), patch.object(
+            CONTROLLER.KANBAN, "reserve_repair_attempt", return_value={
+                "attempt": 1, "child_run_id": "run-a-task001-repair1", "branch": "task-branch-repair-1",
+                "worktree": "/tmp/repair-worktree", "phase": "reserved",
+            }
+        ), patch.object(CONTROLLER.KANBAN, "read_run_policy", return_value={"mode": "direct-pr", "yolo": True}
+        ), patch.object(CONTROLLER.KANBAN, "create_child_worktree", side_effect=SystemExit("failed")), patch.object(
+            CONTROLLER.KANBAN, "mark_repair_attempt_phase"
+        ) as mark_phase:
+            self.assertEqual("REPAIR_REQUIRED", CONTROLLER.start_repair(self.repo, self.plan, wake))
+
+        mark_phase.assert_called_once_with(self.repo, self.plan, "001-work.md", "failed")
+
+    def test_repair_restart_reuses_reserved_identity(self) -> None:
+        wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REPAIR_REQUIRED"}
+        parent = self.repo / ".agent" / self.plan / "runs" / "run-a"
+        runtime = ("run-a", parent, {"branch": "task-branch", "worktree": "/work"})
+        reservation = {
+            "attempt": 1, "child_run_id": "run-a-task001-repair1", "branch": "task-branch-repair-1",
+            "worktree": "/tmp/repair-worktree", "phase": "reserved",
+        }
+        with patch.object(CONTROLLER, "require_tmux"), patch.object(
+            CONTROLLER.KANBAN, "latest_runtime_record", return_value=runtime
+        ), patch.object(CONTROLLER.KANBAN, "runtime_record_for_run", return_value=None), patch.object(
+            CONTROLLER.KANBAN, "repair_attempt", return_value=reservation), patch.object(
+            CONTROLLER.KANBAN, "read_run_policy", return_value={"mode": "direct-pr", "yolo": True}
+        ), patch.object(CONTROLLER.KANBAN, "create_child_worktree", return_value=Path("/tmp/repair-worktree")) as create, patch.object(
+            CONTROLLER.KANBAN, "command_launch_exec"
+        ), patch.object(CONTROLLER.KANBAN, "mark_repair_attempt_phase"):
+            CONTROLLER.start_repair(self.repo, self.plan, wake)
+
+        create.assert_called_once_with(self.repo, "task-branch", "task-branch-repair-1", Path("/tmp/repair-worktree"))
+
+    def test_repair_restart_uses_existing_runtime_without_duplicate_launch(self) -> None:
+        wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REPAIR_REQUIRED"}
+        parent = self.repo / ".agent" / self.plan / "runs" / "run-a"
+        parent_runtime = ("run-a", parent, {"branch": "task-branch", "worktree": "/work"})
+        child_runtime = ("run-a-task001-repair1", parent, {"session": "repair-session"})
+        reservation = {
+            "attempt": 1, "child_run_id": "run-a-task001-repair1", "branch": "task-branch-repair-1",
+            "worktree": "/tmp/repair-worktree", "phase": "reserved",
+        }
+        with patch.object(CONTROLLER, "require_tmux"), patch.object(
+            CONTROLLER.KANBAN, "latest_runtime_record", return_value=parent_runtime
+        ), patch.object(CONTROLLER.KANBAN, "runtime_record_for_run", return_value=child_runtime), patch.object(
+            CONTROLLER.KANBAN, "repair_attempt", return_value=reservation), patch.object(
+            CONTROLLER.KANBAN, "mark_repair_attempt_phase"
+        ) as mark_phase, patch.object(CONTROLLER.KANBAN, "command_launch_exec") as launch:
+            self.assertEqual("repair-session", CONTROLLER.start_repair(self.repo, self.plan, wake))
+
+        mark_phase.assert_called_once_with(self.repo, self.plan, "001-work.md", "launched")
+        launch.assert_not_called()
+
+    def test_repair_conflicting_reserved_worktree_requires_inspection(self) -> None:
+        wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REPAIR_REQUIRED"}
+        parent = self.repo / ".agent" / self.plan / "runs" / "run-a"
+        worktree = self.repo / "reserved-worktree"
+        worktree.mkdir()
+        reservation = {
+            "attempt": 1, "child_run_id": "run-a-task001-repair1", "branch": "task-branch-repair-1",
+            "worktree": str(worktree), "phase": "reserved",
+        }
+        with patch.object(CONTROLLER, "require_tmux"), patch.object(
+            CONTROLLER.KANBAN, "runtime_record_for_run", return_value=None
+        ), patch.object(CONTROLLER.KANBAN, "repair_attempt", return_value=reservation), patch.object(
+            CONTROLLER.KANBAN, "latest_runtime_record", return_value=("run-a", parent, {"branch": "task-branch"})
+        ), patch.object(CONTROLLER.KANBAN, "read_run_policy", return_value={"mode": "direct-pr", "yolo": True}), patch.object(
+            CONTROLLER.KANBAN, "verified_worktree", side_effect=SystemExit("conflict")
+        ), patch.object(CONTROLLER.KANBAN, "command_launch_exec") as launch:
+            self.assertEqual("INSPECTION_REQUIRED", CONTROLLER.start_repair(self.repo, self.plan, wake))
+
+        launch.assert_not_called()
 
 
 if __name__ == "__main__":

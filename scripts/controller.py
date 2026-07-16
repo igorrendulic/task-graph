@@ -257,25 +257,55 @@ def repair_run_id(parent_run: str, task: str, attempt: int) -> str:
 
 
 def start_repair(repo: Path, plan: str, wake: dict[str, object], state: dict[str, Any] | None = None) -> str:
-    require_tmux()
     task = str(wake["task"])
+    reservation = KANBAN.repair_attempt(repo, plan, task)
+    if reservation is not None:
+        existing = KANBAN.runtime_record_for_run(repo, plan, str(reservation["child_run_id"]), task)
+        if existing is not None:
+            KANBAN.mark_repair_attempt_phase(repo, plan, task, "launched")
+            return str(existing[2].get("session", reservation["branch"]))
+        if reservation["phase"] == "launched":
+            return "INSPECTION_REQUIRED"
+
+    require_tmux()
     parent_run_id, parent_run, parent = latest_runtime(repo, plan, task)
-    attempt = KANBAN.repair_attempts(repo, plan, task) + 1
-    KANBAN.record_repair_attempt(repo, plan, task)
-    child_run_id = repair_run_id(parent_run_id, task, attempt)
+    if reservation is None:
+        attempt = KANBAN.repair_attempts(repo, plan, task) + 1
+        child_run_id = repair_run_id(parent_run_id, task, attempt)
+        branch = f"{parent['branch']}-repair-{attempt}"
+        worktree = Path(tempfile.gettempdir()) / f"task-graph-{plan}-{child_run_id}-{Path(task).stem}"
+        reservation = KANBAN.reserve_repair_attempt(
+            repo, plan, task, attempt=attempt, child_run_id=child_run_id, branch=branch, worktree=worktree
+        )
+    child_run_id = str(reservation["child_run_id"])
+    branch = str(reservation["branch"])
+    worktree = Path(str(reservation["worktree"]))
     policy = KANBAN.read_run_policy(repo, plan, parent_run_id)
     child = KANBAN.ensure_run_dirs(repo, plan, child_run_id)
-    KANBAN.write_atomic(KANBAN.policy_path(repo, plan, child_run_id), json.dumps(policy) + "\n")
+    policy_path = KANBAN.policy_path(repo, plan, child_run_id)
+    if not policy_path.exists():
+        KANBAN.write_atomic(policy_path, json.dumps(policy) + "\n")
     review = parent_run / "reviews" / task
     concerns = review.read_text(encoding="utf-8") if review.exists() else "Worker reported concerns; inspect prior report.\n"
     brief = child / "briefs" / task
-    brief.write_text(f"# Focused repair: {task}\n\n{concerns}", encoding="utf-8")
-    branch = f"{parent['branch']}-repair-{attempt}"
-    worktree = Path(tempfile.gettempdir()) / f"task-graph-{plan}-{child_run_id}-{Path(task).stem}"
-    KANBAN.create_child_worktree(repo, str(parent["branch"]), branch, worktree)
-    KANBAN.command_launch_exec(repo, plan, child_run_id, task, branch, worktree)
-    runtime = KANBAN.latest_runtime_record(repo, plan, task)
-    return str(runtime[2].get("session", branch)) if runtime else branch
+    if not brief.exists():
+        brief.write_text(f"# Focused repair: {task}\n\n{concerns}", encoding="utf-8")
+    try:
+        if worktree.exists():
+            KANBAN.verified_worktree(repo, worktree, branch)
+        else:
+            KANBAN.create_child_worktree(repo, str(parent["branch"]), branch, worktree)
+        KANBAN.command_launch_exec(repo, plan, child_run_id, task, branch, worktree)
+    except SystemExit:
+        if worktree.exists():
+            return "INSPECTION_REQUIRED"
+        KANBAN.mark_repair_attempt_phase(repo, plan, task, "failed")
+        return "REPAIR_REQUIRED"
+    runtime = KANBAN.runtime_record_for_run(repo, plan, child_run_id, task)
+    if runtime is None:
+        return "INSPECTION_REQUIRED"
+    KANBAN.mark_repair_attempt_phase(repo, plan, task, "launched")
+    return str(runtime[2].get("session", branch))
 
 
 def finalize_landed(repo: Path, plan: str, run_id: str, task: str) -> None:
@@ -371,6 +401,9 @@ def dispatch_wake(repo: Path, plan: str, wake: dict[str, object], state: dict[st
     else:
         result = action
     if result != "LANDED" and action == "DELIVERY_REQUIRED":
+        pause_for_alert(repo, plan, state, wake, result)
+        return result
+    if result == "INSPECTION_REQUIRED":
         pause_for_alert(repo, plan, state, wake, result)
         return result
     replace_state(

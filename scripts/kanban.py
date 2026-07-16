@@ -745,6 +745,13 @@ def supervision_state_path(repo: Path, plan: str, task_name: str) -> Path:
 
 
 def repair_attempts(repo: Path, plan: str, task_name: str) -> int:
+    attempt = repair_attempt(repo, plan, task_name)
+    if attempt is not None:
+        return 1 if attempt.get("phase") == "launched" else 0
+    return legacy_repair_attempts(repo, plan, task_name)
+
+
+def legacy_repair_attempts(repo: Path, plan: str, task_name: str) -> int:
     path = supervision_state_path(repo, plan, task_name)
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
@@ -755,8 +762,67 @@ def repair_attempts(repo: Path, plan: str, task_name: str) -> int:
     return state.get("repair_attempts", 0) if isinstance(state.get("repair_attempts", 0), int) else 0
 
 
+def repair_attempt(repo: Path, plan: str, task_name: str) -> dict[str, object] | None:
+    path = supervision_state_path(repo, plan, task_name)
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    attempt = state.get("repair_attempt")
+    if not isinstance(attempt, dict):
+        return None
+    required = ("attempt", "child_run_id", "branch", "worktree", "phase")
+    if not isinstance(attempt.get("attempt"), int) or any(not isinstance(attempt.get(key), str) for key in required[1:]):
+        return None
+    if attempt["phase"] not in {"reserved", "launched", "failed"}:
+        return None
+    return attempt
+
+
+def write_repair_attempt_state(repo: Path, plan: str, task_name: str, attempt: dict[str, object]) -> None:
+    phase = str(attempt["phase"])
+    write_atomic(
+        supervision_state_path(repo, plan, task_name),
+        json.dumps(
+            {
+                "task": task_name,
+                "repair_attempts": 1 if phase == "launched" else 0,
+                "repair_attempt": attempt,
+                "updated_at": utc_now(),
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+
+
+def reserve_repair_attempt(
+    repo: Path, plan: str, task_name: str, *, attempt: int, child_run_id: str, branch: str, worktree: Path
+) -> dict[str, object]:
+    record: dict[str, object] = {
+        "attempt": attempt,
+        "child_run_id": child_run_id,
+        "branch": branch,
+        "worktree": str(worktree),
+        "phase": "reserved",
+    }
+    write_repair_attempt_state(repo, plan, task_name, record)
+    return record
+
+
+def mark_repair_attempt_phase(repo: Path, plan: str, task_name: str, phase: str) -> dict[str, object]:
+    if phase not in {"reserved", "launched", "failed"}:
+        raise SystemExit(f"Invalid repair attempt phase: {phase}")
+    record = repair_attempt(repo, plan, task_name)
+    if record is None:
+        raise SystemExit(f"No repair attempt reserved for {task_name}")
+    record["phase"] = phase
+    write_repair_attempt_state(repo, plan, task_name, record)
+    return record
+
+
 def record_repair_attempt(repo: Path, plan: str, task_name: str) -> None:
-    attempts = repair_attempts(repo, plan, task_name) + 1
+    attempts = legacy_repair_attempts(repo, plan, task_name) + 1
     write_atomic(
         supervision_state_path(repo, plan, task_name),
         json.dumps({"task": task_name, "repair_attempts": attempts, "updated_at": utc_now()}, indent=2) + "\n",
@@ -998,6 +1064,18 @@ def latest_runtime_record(repo: Path, plan: str, task_name: str) -> tuple[str, P
         if is_valid_runtime_record(record) and record.get("task") == task_name:
             candidates.append((str(record.get("finished_at") or record.get("started_at") or ""), run, record))
     return max(candidates, key=lambda candidate: (candidate[0], candidate[1].name), default=None)
+
+
+def runtime_record_for_run(repo: Path, plan: str, run_id: str, task_name: str) -> tuple[str, Path, dict[str, object]] | None:
+    run = plan_dir(repo, plan) / "runs" / run_id
+    path = run / "runtime" / f"{Path(task_name).stem}.json"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    if not is_valid_runtime_record(record) or record.get("task") != task_name:
+        return None
+    return run_id, run, record
 
 
 def reconcile_actions(repo: Path, plan: str) -> list[dict[str, object]]:

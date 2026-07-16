@@ -164,6 +164,8 @@ Diff packages preserve the reviewed task delta and its metadata under `.agent/<p
 
 When a `codex exec` worker reports `DONE_WITH_CONCERNS`, the controller reads the persisted report and begins one automatic focused repair-and-audit attempt. The retry uses a fresh isolated worker from the failed task branch's verified HEAD, inherits the selected execution and delivery policy, and receives a brief limited to the reported gap. The controller always reports the retry outcome to the user, whether the repair is ready for normal integration or remains unresolved.
 
+The controller durably reserves a repair's child run, branch, and worktree before setup, but it consumes the automatic repair only after a valid child runtime record exists. A restart resumes that reservation instead of creating another worker. Failed setup artifacts remain available for inspection; if they conflict with the reservation, the controller raises `INSPECTION_REQUIRED` and never removes them automatically.
+
 Only after that automatic retry still reports concerns does the controller stop and ask whether to stop with the current unresolved result or continue into another focused improvement-and-audit loop. Continue immediately launches exactly one linked repair-and-audit attempt; a later failed audit requires another Stop or Continue decision.
 
 ## Installation and Other Harnesses
