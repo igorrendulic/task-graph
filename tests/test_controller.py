@@ -981,6 +981,7 @@ class FleetControllerTest(unittest.TestCase):
             task=task, plan=self.plan, run_id="run-b", branch="topic", worktree=Path("/tmp/work"),
             brief=Path("/tmp/brief"), report=Path("/tmp/report"), log=Path("/tmp/log"), command=["codex"], base_commit="a" * 40,
         )
+        record["launch_state"] = "launched"
         request = {"operation_id": "launch-valid", "plan": self.plan, "command": "launch-exec", "arguments": {"run_id": "run-b", "task": "001-work.md", "branch": "topic", "worktree": "/tmp/work"}}
         CONTROLLER.KANBAN.append_jsonl_durable(CONTROLLER.KANBAN.controller_requests_path(self.repo), [request])
         CONTROLLER.KANBAN.claim_controller_operation(self.repo, request)
@@ -1011,6 +1012,47 @@ class FleetControllerTest(unittest.TestCase):
         with patch.object(CONTROLLER.KANBAN, "tmux_target_exists", return_value=False), patch.object(CONTROLLER.KANBAN, "resume_runtime_launch") as resume:
             CONTROLLER.reconcile_controller_requests(self.repo)
         resume.assert_called_once()
+
+    def test_claimed_launch_requires_a_created_runtime_state(self) -> None:
+        task = CONTROLLER.KANBAN.Task("in-progress", Path("001-work.md"), "Work", (), "ship")
+        record = CONTROLLER.KANBAN.new_runtime_record(
+            task=task, plan=self.plan, run_id="run-created", branch="topic", worktree=Path("/tmp/work"),
+            brief=Path("/tmp/brief"), report=Path("/tmp/report"), log=Path("/tmp/log"), command=["codex"], base_commit="a" * 40,
+        )
+        request = {"operation_id": "launch-created", "plan": self.plan, "command": "launch-exec", "arguments": {"run_id": "run-created", "task": "001-work.md", "branch": "topic", "worktree": "/tmp/work"}}
+        CONTROLLER.KANBAN.write_runtime_record(CONTROLLER.KANBAN.runtime_path(self.repo, self.plan, "run-created", "001-work.md"), record)
+
+        with patch.object(CONTROLLER.KANBAN, "tmux_target_exists", return_value=True):
+            self.assertFalse(CONTROLLER.request_postcondition_met(self.repo, request))
+        record["launch_state"] = "launched"
+        CONTROLLER.KANBAN.write_runtime_record(CONTROLLER.KANBAN.runtime_path(self.repo, self.plan, "run-created", "001-work.md"), record)
+        with patch.object(CONTROLLER.KANBAN, "tmux_target_exists", return_value=True):
+            self.assertTrue(CONTROLLER.request_postcondition_met(self.repo, request))
+
+    def test_repair_wake_queue_requires_a_non_live_queue_corruption_pause(self) -> None:
+        CONTROLLER.create_state(self.repo, self.plan, None)
+        with self.assertRaisesRegex(SystemExit, "wake-queue corruption"):
+            CONTROLLER.repair_wake_queue(self.repo, self.plan)
+
+    def test_repair_wake_queue_snapshots_valid_records_and_requires_explicit_restart(self) -> None:
+        state = CONTROLLER.create_state(self.repo, self.plan, None)
+        queue = CONTROLLER.KANBAN.supervision_queue_path(self.repo, self.plan)
+        queue.parent.mkdir(parents=True, exist_ok=True)
+        valid = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REVIEW_REQUIRED"}
+        original = json.dumps(valid) + "\nnot-json\n"
+        queue.write_text(original, encoding="utf-8")
+        state.update({"lifecycle": "paused", "lease": None, "pending_alert": {"reason": "SUPERVISION_STATE_CORRUPTION", "artifact": str(queue)}})
+        CONTROLLER.write_state(self.repo, self.plan, state)
+
+        with patch.object(CONTROLLER.KANBAN, "tmux_session_exists", return_value=False):
+            repaired = CONTROLLER.repair_wake_queue(self.repo, self.plan)
+
+        self.assertEqual((1, 1), (repaired["retained"], repaired["discarded"]))
+        self.assertEqual(original, Path(repaired["snapshot"]).read_text(encoding="utf-8"))
+        self.assertEqual([valid], CONTROLLER.KANBAN.queued_wakes(self.repo, self.plan))
+        saved = CONTROLLER.load_state(self.repo, self.plan)
+        self.assertEqual("stopped", saved["lifecycle"])
+        self.assertIsNone(saved["pending_alert"])
 
     def test_board_request_rewrites_a_stale_existing_board(self) -> None:
         board = self.repo / ".agent" / self.plan / "kanban.md"

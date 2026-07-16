@@ -319,6 +319,30 @@ class KanbanTest(unittest.TestCase):
         runtime.pop("window")
         self.assertFalse(KANBAN.is_valid_runtime_record(runtime))
 
+    def test_tmux_target_exists_requires_a_nonempty_pane_id(self) -> None:
+        with patch.object(
+            KANBAN.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, stdout="\n"),
+        ):
+            self.assertFalse(KANBAN.tmux_target_exists("task-graph-plan:missing-window"))
+
+    def test_tmux_target_exists_accepts_a_nonempty_pane_id(self) -> None:
+        with patch.object(
+            KANBAN.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, stdout="%42\n"),
+        ):
+            self.assertTrue(KANBAN.tmux_target_exists("task-graph-plan:worker"))
+
+    def test_tmux_target_exists_rejects_a_tmux_error(self) -> None:
+        with patch.object(
+            KANBAN.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, stdout="%42\n"),
+        ):
+            self.assertFalse(KANBAN.tmux_target_exists("task-graph-plan:worker"))
+
     def test_shared_session_creates_first_and_subsequent_activity_windows(self) -> None:
         (self.repo / ".agent" / self.plan).mkdir(parents=True)
         with patch.object(KANBAN, "tmux_target_exists", return_value=False), patch.object(
@@ -472,6 +496,47 @@ class KanbanTest(unittest.TestCase):
                 KANBAN.command_launch_exec(self.repo, self.plan, run_id, task_name, "branch", Path("/tmp/worktree"))
 
         self.assertEqual(original, json.loads(runtime.read_text(encoding="utf-8")))
+
+    def test_transient_tmux_target_conflict_retries_once_and_marks_runtime_launched(self) -> None:
+        task_name, run_id = "001-work.md", "run-a"
+        write_task(self.repo, self.plan, "in-progress", task_name, "Work")
+        KANBAN.write_execution(self.repo, self.plan, run_id, [task_name])
+        brief = self.repo / ".agent" / self.plan / "runs" / run_id / "briefs" / task_name
+        brief.parent.mkdir(parents=True)
+        brief.write_text("# Brief\n", encoding="utf-8")
+        with (
+            patch.object(KANBAN.shutil, "which", return_value="/usr/bin/tmux"),
+            patch.object(KANBAN, "verified_worktree", return_value=(Path("/tmp/worktree"), "a" * 40)),
+            patch.object(KANBAN, "tmux_target_exists", return_value=False) as exists,
+            patch.object(KANBAN, "tmux_create_window", side_effect=[KANBAN.TmuxTargetConflict("target"), 123]) as create,
+        ):
+            KANBAN.command_launch_exec(self.repo, self.plan, run_id, task_name, "branch", Path("/tmp/worktree"))
+
+        self.assertEqual(2, create.call_count)
+        self.assertEqual(2, exists.call_count)
+        record = KANBAN.load_json_object(KANBAN.runtime_path(self.repo, self.plan, run_id, task_name))
+        self.assertEqual("launched", record["launch_state"])
+
+    def test_persistent_tmux_target_conflict_preserves_conflicted_runtime_without_retry(self) -> None:
+        task_name, run_id = "001-work.md", "run-a"
+        write_task(self.repo, self.plan, "in-progress", task_name, "Work")
+        KANBAN.write_execution(self.repo, self.plan, run_id, [task_name])
+        brief = self.repo / ".agent" / self.plan / "runs" / run_id / "briefs" / task_name
+        brief.parent.mkdir(parents=True)
+        brief.write_text("# Brief\n", encoding="utf-8")
+        with (
+            patch.object(KANBAN.shutil, "which", return_value="/usr/bin/tmux"),
+            patch.object(KANBAN, "verified_worktree", return_value=(Path("/tmp/worktree"), "a" * 40)),
+            patch.object(KANBAN, "tmux_target_exists", side_effect=[False, True]),
+            patch.object(KANBAN, "tmux_create_window", side_effect=KANBAN.TmuxTargetConflict("target")) as create,
+        ):
+            with self.assertRaisesRegex(SystemExit, "INSPECTION_REQUIRED"):
+                KANBAN.command_launch_exec(self.repo, self.plan, run_id, task_name, "branch", Path("/tmp/worktree"))
+
+        create.assert_called_once()
+        record = KANBAN.load_json_object(KANBAN.runtime_path(self.repo, self.plan, run_id, task_name))
+        self.assertEqual("conflicted", record["launch_state"])
+        self.assertIn("target", record["launch_diagnostic"])
 
     def write_runtime(self, run_id: str, task_name: str, **overrides: object) -> Path:
         directory = self.repo / ".agent" / self.plan / "runs" / run_id / "runtime"

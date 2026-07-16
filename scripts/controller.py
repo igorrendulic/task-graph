@@ -243,6 +243,8 @@ def reconcile_controller_requests(repo: Path) -> list[dict[str, object]]:
                                             str(arguments["base"]), str(arguments["head"]), str(arguments["branch"]), str(arguments["review"]))
             elif command == "launch-exec":
                 existing = KANBAN.load_json_object(KANBAN.runtime_path(repo, plan, str(arguments["run_id"]), str(arguments["task"])))
+                if KANBAN.is_valid_runtime_record(existing) and existing.get("launch_state") == "conflicted":
+                    raise SystemExit(f"INSPECTION_REQUIRED: retained conflicted runtime for {arguments['task']}")
                 if KANBAN.is_valid_runtime_record(existing) and not KANBAN.tmux_target_exists(KANBAN.tmux_target(existing)):
                     KANBAN.resume_runtime_launch(repo, plan, str(arguments["run_id"]), str(arguments["task"]))
                 else:
@@ -292,7 +294,13 @@ def request_postcondition_met(repo: Path, request: dict[str, object]) -> bool:
         if not (task and run_id):
             return False
         record = KANBAN.load_json_object(KANBAN.runtime_path(repo, plan, run_id, task))
-        return KANBAN.is_valid_runtime_record(record) and record.get("plan") == plan and record.get("task") == task and KANBAN.tmux_target_exists(KANBAN.tmux_target(record))
+        return (
+            KANBAN.is_valid_runtime_record(record)
+            and KANBAN.runtime_launch_succeeded(record)
+            and record.get("plan") == plan
+            and record.get("task") == task
+            and KANBAN.tmux_target_exists(KANBAN.tmux_target(record))
+        )
     if command == "reserve":
         execution = KANBAN.load_execution(repo, plan)
         claim = KANBAN.load_controller_claims(repo).get(str(request.get("operation_id", "")), {})
@@ -1017,6 +1025,33 @@ def status_controller(repo: Path, plan: str) -> None:
     print(json.dumps(projection, indent=2, sort_keys=True))
 
 
+def repair_wake_queue(repo: Path, plan: str) -> dict[str, object]:
+    """Repair only the queue after its controller paused on queue corruption."""
+    state = load_state(repo, plan)
+    if state is None:
+        raise SystemExit("Controller has not been started")
+    alert = state.get("pending_alert")
+    queue = KANBAN.supervision_queue_path(repo, plan)
+    if not (
+        state.get("lifecycle") == "paused"
+        and isinstance(alert, dict)
+        and alert.get("reason") == "SUPERVISION_STATE_CORRUPTION"
+        and alert.get("artifact") == str(queue)
+    ):
+        raise SystemExit("repair-wake-queue requires a paused controller for wake-queue corruption")
+    if KANBAN.tmux_session_exists(str(state.get("session", ""))):
+        raise SystemExit("repair-wake-queue requires a stopped/non-live controller")
+    repaired = KANBAN.repair_wake_queue(repo, plan)
+
+    def record_repair(latest: dict[str, Any]) -> None:
+        latest["lifecycle"] = "stopped"
+        latest["lease"] = None
+        latest["pending_alert"] = None
+
+    mutate_state(repo, plan, record_repair)
+    return repaired
+
+
 def stop_controller(repo: Path, plan: str) -> None:
     with controller_lease_lock(repo, plan):
         with controller_state_lock(repo, plan):
@@ -1044,7 +1079,7 @@ def stop_controller(repo: Path, plan: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("start", "run", "status", "stop"))
+    parser.add_argument("command", choices=("start", "run", "status", "stop", "repair-wake-queue"))
     parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--plan", required=True)
     parser.add_argument("--no-mistakes-command")
@@ -1056,6 +1091,11 @@ def main() -> int:
         run_controller(repo, args.plan)
     elif args.command == "status":
         status_controller(repo, args.plan)
+    elif args.command == "repair-wake-queue":
+        repaired = repair_wake_queue(repo, args.plan)
+        print(f"Repaired wake queue: retained {repaired['retained']}, discarded {repaired['discarded']}")
+        print(f"Snapshot: {repaired['snapshot']}")
+        print(f"Restart: {shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} start --repo {shlex.quote(str(repo))} --plan {shlex.quote(args.plan)}")
     else:
         stop_controller(repo, args.plan)
     return 0

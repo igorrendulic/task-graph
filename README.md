@@ -171,7 +171,9 @@ python3 <skill-dir>/scripts/kanban.py archive-diff \
 
 The controller keeps the current board authoritative and treats old runtime records as history. Before reporting status or ending a controller turn, run `reconcile`; `No change` is valid only when there is no autonomous action. While work is in flight, use bounded `supervise` checkpoints.
 
-The tmux-resident controller records its plan state at `.agent/<plan-slug>/state/controller.json`. It never auto-restarts. Unexpected exceptions are written to `controller-failures.jsonl`, with the newest failure exposed as `active_failure`; Claimed wakes remain untouched so an operator can inspect the condition and explicitly run `controller.py start` to resume safely. A `SUPERVISION_STATE_CORRUPTION` alert means the controller cannot safely read its queue or claims: repair or replace the named artifact, then explicitly start the controller again.
+The tmux-resident controller records its plan state at `.agent/<plan-slug>/state/controller.json`. It never auto-restarts. Unexpected exceptions are written to `controller-failures.jsonl`, with the newest failure exposed as `active_failure`; Claimed wakes remain untouched so an operator can inspect the condition and explicitly run `controller.py start` to resume safely. A `SUPERVISION_STATE_CORRUPTION` alert means the controller cannot safely read its queue or claims. When the paused, non-live controller identifies `wake-queue.jsonl`, run `controller.py repair-wake-queue --repo <repo-root> --plan <plan-slug>` to snapshot the original queue and atomically retain only schema-valid records, then explicitly start the controller again. It does not repair claims, tasks, worktrees, briefs, or runtime records.
+
+Worker launch records distinguish durable launch intent from a tmux window that was actually created. If tmux reports a target conflict that vanishes on the immediate locked re-check, the launcher retries once. A persistent or ambiguous target conflict leaves a conflicted runtime record and surfaces `INSPECTION_REQUIRED`; the controller never kills, reuses, or overwrites the unknown window.
 
 ## Portable diff packages
 

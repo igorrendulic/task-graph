@@ -32,7 +32,12 @@ RUNTIME_FIELDS = {
     "version", "plan", "run_id", "task", "session", "pid", "command", "branch",
     "window", "role", "worktree", "base_commit", "brief", "report", "log", "started_at", "finished_at", "exit_code",
 }
+LAUNCH_STATES = frozenset({"intent", "launched", "conflicted", "failed"})
 _mutation_local = threading.local()
+
+
+class TmuxTargetConflict(SystemExit):
+    """A named tmux target appeared while a caller was creating it."""
 
 
 # Repository-wide controller protocol.  The board remains plan-scoped, but a
@@ -810,6 +815,7 @@ def new_runtime_record(
         "command": command, "branch": branch, "worktree": str(worktree),
         "base_commit": base_commit,
         "brief": str(brief), "report": str(report), "log": str(log),
+        "launch_state": "intent", "launch_diagnostic": None,
         "started_at": started_at or utc_now(), "finished_at": None, "exit_code": None,
     }
 
@@ -824,7 +830,19 @@ def is_valid_runtime_record(record: object) -> bool:
         and isinstance(record.get("session"), str)
         and isinstance(record.get("window"), str)
         and isinstance(record.get("role"), str)
+        and ("launch_state" not in record or record.get("launch_state") in LAUNCH_STATES)
     )
+
+
+def runtime_launch_succeeded(record: dict[str, object]) -> bool:
+    """Legacy runtime records predate launch_state and remain recoverable."""
+    return record.get("launch_state", "launched") == "launched"
+
+
+def record_launch_state(path: Path, record: dict[str, object], state: str, diagnostic: str | None = None) -> None:
+    record["launch_state"] = state
+    record["launch_diagnostic"] = diagnostic
+    write_runtime_record(path, record)
 
 
 def runtime_path(repo: Path, plan: str, run_id: str, task_name: str) -> Path:
@@ -849,11 +867,12 @@ def tmux_target_exists(target: str) -> bool:
     if ":" not in target:
         return tmux_session_exists(target)
     try:
-        return subprocess.run(
+        result = subprocess.run(
             ["tmux", "display-message", "-p", "-t", target, "#{pane_id}"],
             text=True,
             capture_output=True,
-        ).returncode == 0
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
     except FileNotFoundError:
         return False
 
@@ -888,7 +907,7 @@ def tmux_create_window(
     with tmux_window_lock(repo, plan):
         target = f"{session}:{window}"
         if tmux_target_exists(target):
-            raise SystemExit(f"tmux target already exists: {target}")
+            raise TmuxTargetConflict(f"tmux target already exists: {target}")
         if tmux_session_exists(session):
             created = subprocess.run(
                 ["tmux", "new-window", "-d", "-t", session, "-n", window, "-c", str(cwd), "bash", "-lc", command],
@@ -902,7 +921,10 @@ def tmux_create_window(
                 capture_output=True,
             )
         if created.returncode:
-            raise SystemExit(created.stderr.strip() or created.stdout.strip() or "tmux failed to create activity window")
+            detail = created.stderr.strip() or created.stdout.strip() or "tmux failed to create activity window"
+            if "exist" in detail.lower() or "duplicate" in detail.lower():
+                raise TmuxTargetConflict(f"tmux target conflict: {target}: {detail}")
+            raise SystemExit(detail)
         subprocess.run(["tmux", "set-option", "-t", target, "remain-on-exit", "on"], capture_output=True)
         pane = subprocess.run(
             ["tmux", "display-message", "-p", "-t", target, "#{pane_pid}"], text=True, capture_output=True
@@ -964,7 +986,8 @@ def command_launch_exec(
             task=task, plan=plan, run_id=run_id, branch=branch, worktree=worktree,
             brief=brief, report=report, log=log, command=command, base_commit=base_commit, role=role,
         )
-        if tmux_target_exists(tmux_target(record)):
+        target = tmux_target(record)
+        if tmux_target_exists(target):
             raise SystemExit(f"tmux target already exists: {tmux_target(record)}")
         write_runtime_record(record_path, record)
         prompt = (
@@ -985,9 +1008,24 @@ def command_launch_exec(
         window = str(record["window"])
         try:
             pane_pid = tmux_create_window(repo, plan, session, window, worktree, wrapper)
-        except SystemExit:
-            record_path.unlink(missing_ok=True)
+        except TmuxTargetConflict as error:
+            # The lock has been released.  An absent exact target now proves
+            # this was a transient create race, so one retry is safe.
+            if tmux_target_exists(target):
+                record_launch_state(record_path, record, "conflicted", str(error))
+                raise SystemExit(f"INSPECTION_REQUIRED: {error}") from error
+            try:
+                pane_pid = tmux_create_window(repo, plan, session, window, worktree, wrapper)
+            except TmuxTargetConflict as retry_error:
+                record_launch_state(record_path, record, "conflicted", str(retry_error))
+                raise SystemExit(f"INSPECTION_REQUIRED: {retry_error}") from retry_error
+            except SystemExit as retry_error:
+                record_launch_state(record_path, record, "failed", str(retry_error))
+                raise
+        except SystemExit as error:
+            record_launch_state(record_path, record, "failed", str(error))
             raise
+        record_launch_state(record_path, record, "launched")
         if pane_pid is not None:
             record["pid"] = pane_pid
             write_runtime_record(record_path, record)
@@ -1017,8 +1055,11 @@ def resume_runtime_launch(repo: Path, plan: str, run_id: str, task_name: str) ->
     if not is_valid_runtime_record(record):
         raise SystemExit("cannot resume invalid runtime launch")
     target = tmux_target(record)
-    if tmux_target_exists(target):
+    if runtime_launch_succeeded(record) and tmux_target_exists(target):
         return
+    if tmux_target_exists(target):
+        record_launch_state(path, record, "conflicted", f"tmux target already exists: {target}")
+        raise SystemExit(f"INSPECTION_REQUIRED: tmux target already exists: {target}")
     worktree = Path(str(record["worktree"]))
     brief = Path(str(record["brief"]))
     log = Path(str(record["log"]))
@@ -1037,7 +1078,14 @@ def resume_runtime_launch(repo: Path, plan: str, run_id: str, task_name: str) ->
         f"finish-runtime --repo {shlex.quote(str(repo))} --plan {shlex.quote(plan)} --run-id {shlex.quote(run_id)} "
         f"--task {shlex.quote(task_name)} --exit-code $exit_code; exit $exit_code"
     )
-    pane_pid = tmux_create_window(repo, plan, str(record["session"]), str(record["window"]), worktree, wrapper)
+    try:
+        pane_pid = tmux_create_window(repo, plan, str(record["session"]), str(record["window"]), worktree, wrapper)
+    except TmuxTargetConflict as error:
+        if tmux_target_exists(target):
+            record_launch_state(path, record, "conflicted", str(error))
+            raise SystemExit(f"INSPECTION_REQUIRED: {error}") from error
+        pane_pid = tmux_create_window(repo, plan, str(record["session"]), str(record["window"]), worktree, wrapper)
+    record_launch_state(path, record, "launched")
     if pane_pid is not None:
         record["pid"] = pane_pid
         write_runtime_record(path, record)
@@ -1320,6 +1368,32 @@ def _queued_wakes(repo: Path, plan: str) -> list[dict[str, object]]:
 def queued_wakes(repo: Path, plan: str) -> list[dict[str, object]]:
     with wake_queue_lock(repo, plan):
         return _queued_wakes(repo, plan)
+
+
+def repair_wake_queue(repo: Path, plan: str) -> dict[str, object]:
+    """Snapshot and rebuild a corrupt wake queue without touching other state."""
+    path = supervision_queue_path(repo, plan)
+    with wake_queue_lock(repo, plan):
+        original = path.read_text(encoding="utf-8") if path.exists() else ""
+        snapshot = path.with_name(f"{path.name}.before-repair-{uuid.uuid4().hex}.jsonl")
+        write_atomic(snapshot, original)
+        retained: list[dict[str, object]] = []
+        discarded = 0
+        for line in original.splitlines():
+            try:
+                wake = json.loads(line)
+            except json.JSONDecodeError:
+                discarded += 1
+                continue
+            if not isinstance(wake, dict) or any(
+                not isinstance(wake.get(field), str) or not wake[field].strip()
+                for field in ("id", "task", "run_id", "action")
+            ):
+                discarded += 1
+                continue
+            retained.append(wake)
+        write_atomic(path, "".join(json.dumps(wake, sort_keys=True) + "\n" for wake in retained))
+    return {"snapshot": str(snapshot), "retained": len(retained), "discarded": discarded}
 
 
 def claim_wake(repo: Path, plan: str, wake_id: str) -> dict[str, object]:
