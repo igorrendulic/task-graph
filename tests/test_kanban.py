@@ -127,6 +127,21 @@ class KanbanTest(unittest.TestCase):
         ledger = (run_dir / "progress.md").read_text(encoding="utf-8")
         self.assertIn("- 001-one.md: in-progress", ledger)
         self.assertIn("- 002-two.md: in-progress", ledger)
+        execution = json.loads(
+            (self.repo / ".agent" / self.plan / "state" / "execution.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual("run-a", execution["run_id"])
+        self.assertEqual(["001-one.md", "002-two.md"], execution["tasks"])
+
+    def test_reserve_fails_closed_for_a_different_run_while_work_is_active(self) -> None:
+        write_task(self.repo, self.plan, "todo", "001-one.md", "One")
+        write_task(self.repo, self.plan, "todo", "002-two.md", "Two")
+
+        KANBAN.command_reserve(self.repo, self.plan, 1, "run-a", "direct-pr", False)
+
+        with self.assertRaisesRegex(SystemExit, "active execution run run-a"):
+            KANBAN.command_reserve(self.repo, self.plan, 1, "run-b", "direct-pr", False)
+        self.assertFalse((self.repo / ".agent" / self.plan / "runs" / "run-b").exists())
 
     def test_reserve_requires_and_persists_delivery_policy(self) -> None:
         write_task(self.repo, self.plan, "todo", "001-work.md", "Work")
@@ -282,7 +297,7 @@ class KanbanTest(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn("lowercase kebab-case", result.stderr)
 
-    def test_runtime_record_uses_a_deterministic_tmux_session_and_validates(self) -> None:
+    def test_runtime_record_uses_a_shared_plan_session_and_activity_window(self) -> None:
         task = KANBAN.Task("in-progress", Path("001-work.md"), "Work", (), "ship")
         now = "2026-07-14T12:00:00+00:00"
 
@@ -300,7 +315,9 @@ class KanbanTest(unittest.TestCase):
             base_commit="a" * 40,
         )
 
-        self.assertEqual("task-graph-first-plan-run-a-001-work", record["session"])
+        self.assertEqual("task-graph-first-plan", record["session"])
+        self.assertEqual("run-a-001-work-worker", record["window"])
+        self.assertEqual("worker", record["role"])
         self.assertIsNone(record["pid"])
         self.assertTrue(KANBAN.is_valid_runtime_record(record))
         record.pop("log")
@@ -324,6 +341,55 @@ class KanbanTest(unittest.TestCase):
 
         self.assertEqual("a" * 40, record["base_commit"])
         self.assertTrue(KANBAN.is_valid_runtime_record(record))
+
+    def test_runtime_records_require_a_shared_session_window(self) -> None:
+        record = {"session": "task-graph-first-plan", "window": "run-a-001-work-worker"}
+
+        self.assertEqual("task-graph-first-plan:run-a-001-work-worker", KANBAN.tmux_target(record))
+        runtime = KANBAN.new_runtime_record(
+            task=KANBAN.Task("in-progress", Path("001-work.md"), "Work", (), "ship"),
+            plan=self.plan, run_id="run-a", branch="branch", worktree=Path("/tmp/worktree"),
+            brief=Path("/tmp/brief.md"), report=Path("/tmp/report.md"), log=Path("/tmp/task.log"),
+            command=["codex", "exec"], base_commit="a" * 40,
+        )
+        runtime.pop("window")
+        self.assertFalse(KANBAN.is_valid_runtime_record(runtime))
+
+    def test_shared_session_creates_first_and_subsequent_activity_windows(self) -> None:
+        (self.repo / ".agent" / self.plan).mkdir(parents=True)
+        with patch.object(KANBAN, "tmux_target_exists", return_value=False), patch.object(
+            KANBAN, "tmux_session_exists", side_effect=[False, True]
+        ), patch.object(
+            KANBAN.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout="123\n")
+        ) as run:
+            KANBAN.tmux_create_window(self.repo, self.plan, "task-graph-first-plan", "run-a-001-worker", Path("/tmp/one"), "true")
+            KANBAN.tmux_create_window(self.repo, self.plan, "task-graph-first-plan", "run-b-002-worker", Path("/tmp/two"), "true")
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(
+            ["tmux", "new-session", "-d", "-s", "task-graph-first-plan", "-n", "run-a-001-worker", "-c", "/tmp/one", "bash", "-lc", "true"],
+            commands,
+        )
+        self.assertIn(
+            ["tmux", "new-window", "-d", "-t", "task-graph-first-plan", "-n", "run-b-002-worker", "-c", "/tmp/two", "bash", "-lc", "true"],
+            commands,
+        )
+
+    def test_status_checks_the_individual_shared_session_window(self) -> None:
+        write_task(self.repo, self.plan, "in-progress", "001-work.md", "Work")
+        self.write_runtime(
+            "run-a", "001-work.md", version=2, session="task-graph-first-plan",
+            window="run-a-001-work-worker", role="worker",
+        )
+        seen: list[str] = []
+
+        entries = KANBAN.collect_status(
+            self.repo,
+            tmux_alive=lambda target: (seen.append(target) or "RUNNING"),
+        )
+
+        self.assertEqual(["task-graph-first-plan:run-a-001-work-worker"], seen)
+        self.assertEqual("RUNNING", entries[0]["state"])
 
     def test_prepare_completed_task_commits_dirty_worker_worktree(self) -> None:
         write_task(self.repo, self.plan, "in-progress", "001-work.md", "Work")
@@ -368,6 +434,7 @@ class KanbanTest(unittest.TestCase):
         task_name = "001-work.md"
         run_id = "run-a"
         write_task(self.repo, self.plan, "in-progress", task_name, "Work")
+        KANBAN.write_execution(self.repo, self.plan, run_id, [task_name])
         brief = self.repo / ".agent" / self.plan / "runs" / run_id / "briefs" / task_name
         brief.parent.mkdir(parents=True)
         brief.write_text("# Brief\n", encoding="utf-8")
@@ -375,15 +442,8 @@ class KanbanTest(unittest.TestCase):
         with (
             patch.object(KANBAN.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"),
             patch.object(KANBAN, "verified_worktree", return_value=(Path("/tmp/worktree"), "a" * 40)),
-            patch.object(
-                KANBAN.subprocess,
-                "run",
-                side_effect=[
-                    subprocess.CompletedProcess([], 0),
-                    subprocess.CompletedProcess([], 0),
-                    subprocess.CompletedProcess([], 0, stdout="123\n"),
-                ],
-            ) as run,
+            patch.object(KANBAN, "tmux_target_exists", return_value=False),
+            patch.object(KANBAN, "tmux_create_window", return_value=123) as create_window,
         ):
             KANBAN.command_launch_exec(
                 self.repo, self.plan, run_id, task_name, "branch", Path("/tmp/worktree")
@@ -402,23 +462,65 @@ class KanbanTest(unittest.TestCase):
             ],
             record["command"],
         )
-        wrapper = run.call_args_list[0].args[0][-1]
+        self.assertEqual("task-graph-first-plan", create_window.call_args.args[2])
+        self.assertEqual("run-a-001-work-worker", create_window.call_args.args[3])
+        wrapper = create_window.call_args.args[-1]
         self.assertNotIn("--ask-for-approval", wrapper)
         self.assertNotIn("--add-dir", wrapper)
         self.assertIn("Return the complete final report", wrapper)
         self.assertNotIn("write the final report", wrapper)
         self.assertIn("do not run git commit", wrapper)
 
+    def test_launch_exec_rejects_an_unreserved_or_mismatched_run_before_creating_runtime(self) -> None:
+        task_name = "001-work.md"
+        write_task(self.repo, self.plan, "in-progress", task_name, "Work")
+        KANBAN.write_execution(self.repo, self.plan, "run-a", [task_name])
+
+        with patch.object(KANBAN.shutil, "which", return_value="/usr/bin/tmux"), patch.object(
+            KANBAN, "verified_worktree", return_value=(Path("/tmp/worktree"), "a" * 40)
+        ):
+            with self.assertRaisesRegex(SystemExit, "does not match launch run"):
+                KANBAN.command_launch_exec(self.repo, self.plan, "run-b", task_name, "branch", Path("/tmp/worktree"))
+
+        self.assertFalse((self.repo / ".agent" / self.plan / "runs" / "run-b" / "runtime").exists())
+
+    def test_duplicate_launch_preserves_the_original_runtime_record(self) -> None:
+        task_name = "001-work.md"
+        run_id = "run-a"
+        write_task(self.repo, self.plan, "in-progress", task_name, "Work")
+        KANBAN.write_execution(self.repo, self.plan, run_id, [task_name])
+        brief = self.repo / ".agent" / self.plan / "runs" / run_id / "briefs" / task_name
+        brief.parent.mkdir(parents=True)
+        brief.write_text("# Brief\n", encoding="utf-8")
+        original = KANBAN.new_runtime_record(
+            task=KANBAN.Task("in-progress", Path(task_name), "Work", (), "ship"), plan=self.plan, run_id=run_id,
+            branch="branch", worktree=Path("/tmp/worktree"), brief=brief,
+            report=brief.parents[1] / "reports" / task_name, log=brief.parents[1] / "logs" / "001-work.log",
+            command=["codex", "exec"], base_commit="a" * 40,
+        )
+        runtime = KANBAN.runtime_path(self.repo, self.plan, run_id, task_name)
+        KANBAN.write_runtime_record(runtime, original)
+
+        with patch.object(KANBAN.shutil, "which", return_value="/usr/bin/tmux"), patch.object(
+            KANBAN, "verified_worktree", return_value=(Path("/tmp/worktree"), "a" * 40)
+        ):
+            with self.assertRaisesRegex(SystemExit, "Runtime record already exists"):
+                KANBAN.command_launch_exec(self.repo, self.plan, run_id, task_name, "branch", Path("/tmp/worktree"))
+
+        self.assertEqual(original, json.loads(runtime.read_text(encoding="utf-8")))
+
     def write_runtime(self, run_id: str, task_name: str, **overrides: object) -> Path:
         directory = self.repo / ".agent" / self.plan / "runs" / run_id / "runtime"
         directory.mkdir(parents=True, exist_ok=True)
         started = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
         record: dict[str, object] = {
-            "version": 1,
+            "version": 2,
             "plan": self.plan,
             "run_id": run_id,
             "task": task_name,
-            "session": KANBAN.tmux_session_name(self.plan, run_id, task_name),
+            "session": KANBAN.tmux_plan_session_name(self.plan),
+            "window": KANBAN.tmux_window_name(run_id, task_name, "worker"),
+            "role": "worker",
             "pid": 123,
             "command": ["codex", "exec"],
             "branch": "branch",
@@ -449,7 +551,7 @@ class KanbanTest(unittest.TestCase):
         (self.repo / ".agent" / self.plan / "runs" / "run-a" / "reports" / "002-success.md").write_text("DONE\n", encoding="utf-8")
 
         def tmux_alive(session: str) -> str:
-            return "RUNNING" if session.endswith("001-running") else "IDLE_OR_DEAD"
+            return "RUNNING" if session.endswith("001-running-worker") else "IDLE_OR_DEAD"
 
         entries = KANBAN.collect_status(self.repo, tmux_alive=tmux_alive, stale_after=timedelta(minutes=30))
         states = {entry["task"]: entry["state"] for entry in entries}
@@ -540,6 +642,17 @@ class KanbanTest(unittest.TestCase):
                 subprocess.CompletedProcess([], 0, stdout="bash\n"),
             ]
             self.assertEqual("UNKNOWN", KANBAN.tmux_liveness("worker"))
+
+    def test_tmux_liveness_reports_a_missing_window_even_if_its_session_might_exist(self) -> None:
+        with patch.object(
+            KANBAN.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, stderr="can't find window")
+        ) as run:
+            self.assertEqual("IDLE_OR_DEAD", KANBAN.tmux_liveness("task-graph-first-plan:missing"))
+
+        self.assertEqual(
+            ["tmux", "display-message", "-p", "-t", "task-graph-first-plan:missing", "#{pane_id}"],
+            run.call_args.args[0],
+        )
 
         with patch.object(KANBAN.subprocess, "run") as run:
             run.side_effect = [
@@ -725,8 +838,11 @@ class KanbanTest(unittest.TestCase):
         )
         self.assertEqual("landed", delivery["result"])
 
-    def test_teardown_kills_recorded_tmux_session(self) -> None:
-        self.write_runtime("run-a", "001-work.md")
+    def test_teardown_kills_only_the_recorded_tmux_window(self) -> None:
+        self.write_runtime(
+            "run-a", "001-work.md", version=2, session="task-graph-first-plan",
+            window="run-a-001-work-worker", role="worker",
+        )
         KANBAN.command_record_delivery(self.repo, self.plan, "run-a", "001-work.md", "landed")
 
         with patch.object(KANBAN, "git_output", return_value=""), patch.object(
@@ -736,9 +852,17 @@ class KanbanTest(unittest.TestCase):
 
         calls = [call.args[0] for call in run.call_args_list]
         self.assertIn(["git", "worktree", "remove", "/tmp/worktree"], calls)
-        self.assertIn(
-            ["tmux", "kill-session", "-t", "task-graph-first-plan-run-a-001-work"], calls
-        )
+        self.assertIn(["tmux", "kill-window", "-t", "task-graph-first-plan:run-a-001-work-worker"], calls)
+        self.assertNotIn(["tmux", "kill-session", "-t", "task-graph-first-plan"], calls)
+
+    def test_teardown_rejects_runtime_records_without_a_window(self) -> None:
+        path = self.write_runtime("run-a", "001-work.md")
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record.pop("window")
+        path.write_text(json.dumps(record), encoding="utf-8")
+
+        with self.assertRaisesRegex(SystemExit, "valid runtime record"):
+            KANBAN.command_teardown(self.repo, self.plan, "run-a", "001-work.md", discard=False)
 
     def test_teardown_allows_already_absent_tmux_session(self) -> None:
         self.write_runtime("run-a", "001-work.md")

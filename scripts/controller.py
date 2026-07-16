@@ -332,7 +332,8 @@ def start_review(repo: Path, plan: str, wake: dict[str, object], state: dict[str
         repo, plan, run_id, task, str(prepared["base_commit"]), str(prepared["head_commit"]),
         str(prepared["branch"]), f"reviews/{task}",
     )
-    session = f"task-graph-review-{plan}-{run_id}-{Path(task).stem}"
+    session = KANBAN.tmux_plan_session_name(plan)
+    window = KANBAN.tmux_window_name(run_id, task, "review")
     log = run / "logs" / f"{Path(task).stem}.review.log"
     prompt = (
         f"Review the completed task {task} read-only. Inspect its diff and report. Write exactly one first line "
@@ -342,8 +343,11 @@ def start_review(repo: Path, plan: str, wake: dict[str, object], state: dict[str
         shlex.quote(value)
         for value in ["codex", "exec", "--sandbox", "read-only", "--output-last-message", str(review), prompt]
     )
-    tmux_start(session, Path(str(record["worktree"])), f"set -o pipefail; {command} 2>&1 | tee -a {shlex.quote(str(log))}")
-    return session
+    KANBAN.tmux_create_window(
+        repo, plan, session, window, Path(str(record["worktree"])),
+        f"set -o pipefail; {command} 2>&1 | tee -a {shlex.quote(str(log))}",
+    )
+    return f"{session}:{window}"
 
 
 def repair_run_id(parent_run: str, task: str, attempt: int) -> str:
@@ -389,7 +393,7 @@ def start_repair(repo: Path, plan: str, wake: dict[str, object], state: dict[str
             KANBAN.verified_worktree(repo, worktree, branch)
         else:
             KANBAN.create_child_worktree(repo, str(parent["branch"]), branch, worktree)
-        KANBAN.command_launch_exec(repo, plan, child_run_id, task, branch, worktree)
+        KANBAN.command_launch_exec(repo, plan, child_run_id, task, branch, worktree, role="repair")
     except SystemExit:
         if worktree.exists():
             return "INSPECTION_REQUIRED"
@@ -571,6 +575,22 @@ def deliver(repo: Path, plan: str, wake: dict[str, object], state: dict[str, Any
 
 
 def dispatch_wake(repo: Path, plan: str, wake: dict[str, object], state: dict[str, Any], *, claimed: bool = False) -> str:
+    """Dispatch one wake only while the controller lifecycle remains running.
+
+    The lease is the lifecycle fence shared with start/stop.  The plan lock
+    then makes wake claiming, launch, and durable dispatch state one atomic
+    transition relative to board/runtime mutations.
+    """
+    with controller_lease_lock(repo, plan):
+        with KANBAN.plan_mutation_lock(repo, plan):
+            latest = load_state(repo, plan)
+            if latest is None or latest.get("lifecycle") == "stopped":
+                return "STOPPED"
+            replace_state(state, latest)
+            return _dispatch_wake(repo, plan, wake, state, claimed=claimed)
+
+
+def _dispatch_wake(repo: Path, plan: str, wake: dict[str, object], state: dict[str, Any], *, claimed: bool = False) -> str:
     wake_id = str(wake["id"])
     if not claimed:
         wake = KANBAN.claim_wake(repo, plan, wake_id)
@@ -601,11 +621,14 @@ def dispatch_wake(repo: Path, plan: str, wake: dict[str, object], state: dict[st
     if result == "INSPECTION_REQUIRED":
         pause_for_alert(repo, plan, state, wake, result)
         return result
+    dispatch = {"state": "started", "wake": wake, "result": result}
+    if action in {"REVIEW_REQUIRED", "REPAIR_REQUIRED"} and isinstance(result, str) and ":" in result:
+        dispatch["tmux_window"] = result
     replace_state(
         state,
         mutate_state(
             repo, plan, lambda latest: latest.setdefault("dispatches", {}).__setitem__(
-                wake_id, {"state": "started", "wake": wake, "result": result}
+                wake_id, dispatch
             )
         ),
     )
@@ -776,6 +799,13 @@ def start_controller(repo: Path, plan: str, no_mistakes_command: str | None) -> 
 
         state = mutate_state(repo, plan, acquire_lease)
         command = " ".join(shlex.quote(value) for value in [sys.executable, str(Path(__file__).resolve()), "run", "--repo", str(repo), "--plan", plan])
+        # Recheck under the lifecycle lease immediately before tmux creation.
+        # A stop that acquired this lease first leaves the state stopped and
+        # prevents a late start from recreating the controller session.
+        latest = load_state(repo, plan)
+        if latest is None or latest.get("lifecycle") != "running":
+            raise SystemExit("Controller start was superseded by stop")
+        state = latest
         # Persist ownership before creating tmux so a crash cannot leave an unowned controller.
         state["pid"] = tmux_start(str(state["session"]), repo, command)
         pid = state["pid"]
@@ -806,18 +836,19 @@ def status_controller(repo: Path, plan: str) -> None:
 
 
 def stop_controller(repo: Path, plan: str) -> None:
-    with controller_state_lock(repo, plan):
-        state = load_state(repo, plan)
-        if state is None:
-            raise SystemExit("Controller has not been started")
-        subprocess.run(["tmux", "kill-session", "-t", str(state["session"])], text=True, capture_output=True)
-        if KANBAN.tmux_session_exists(str(state["session"])):
-            raise SystemExit("Controller session could not be terminated; lease retained")
-        state["lifecycle"] = "stopped"
-        state["lease"] = None
-        state["recovery_required"] = False
-        state["recovery_alert"] = None
-        persist_mutation(repo, plan, state)
+    with controller_lease_lock(repo, plan):
+        with controller_state_lock(repo, plan):
+            state = load_state(repo, plan)
+            if state is None:
+                raise SystemExit("Controller has not been started")
+            subprocess.run(["tmux", "kill-session", "-t", str(state["session"])], text=True, capture_output=True)
+            if KANBAN.tmux_session_exists(str(state["session"])):
+                raise SystemExit("Controller session could not be terminated; lease retained")
+            state["lifecycle"] = "stopped"
+            state["lease"] = None
+            state["recovery_required"] = False
+            state["recovery_alert"] = None
+            persist_mutation(repo, plan, state)
     print(f"Stopped controller: {state['session']}")
 
 

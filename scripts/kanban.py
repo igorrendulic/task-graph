@@ -14,6 +14,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -28,8 +29,9 @@ EXEC_WATCH_INTERVAL_SECONDS = 5
 PLAN_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 RUNTIME_FIELDS = {
     "version", "plan", "run_id", "task", "session", "pid", "command", "branch",
-    "worktree", "base_commit", "brief", "report", "log", "started_at", "finished_at", "exit_code",
+    "window", "role", "worktree", "base_commit", "brief", "report", "log", "started_at", "finished_at", "exit_code",
 }
+_mutation_local = threading.local()
 
 
 @dataclass(frozen=True)
@@ -348,6 +350,73 @@ def ensure_run_dirs(repo: Path, plan: str, run_id: str) -> Path:
     return directory
 
 
+def plan_mutation_lock_path(repo: Path, plan: str) -> Path:
+    return plan_dir(repo, plan) / "state" / "mutation.lock"
+
+
+@contextmanager
+def plan_mutation_lock(repo: Path, plan: str):
+    """Serialize every durable mutation for one plan.
+
+    This is deliberately separate from the wake queue and tmux locks: those
+    protect their own shared resources, while this lock protects the plan's
+    board, run state, and lifecycle transitions as one transaction boundary.
+    """
+    key = str(plan_mutation_lock_path(repo, plan))
+    held = getattr(_mutation_local, "held", {})
+    if key in held:
+        held[key][0] += 1
+        try:
+            yield
+        finally:
+            held[key][0] -= 1
+        return
+    path = Path(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="utf-8")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    held[key] = [1, handle]
+    _mutation_local.held = held
+    try:
+        yield
+    finally:
+        held[key][0] -= 1
+        if held[key][0] == 0:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+            del held[key]
+
+
+def execution_path(repo: Path, plan: str) -> Path:
+    return plan_dir(repo, plan) / "state" / "execution.json"
+
+
+def load_execution(repo: Path, plan: str) -> dict[str, object] | None:
+    path = execution_path(repo, plan)
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"Invalid execution record: {path}: {error.msg}") from error
+    if not isinstance(record, dict) or not isinstance(record.get("run_id"), str) or not isinstance(record.get("tasks"), list):
+        raise SystemExit(f"Invalid execution record: {path}")
+    if not all(isinstance(task, str) for task in record["tasks"]):
+        raise SystemExit(f"Invalid execution record: {path}")
+    return record
+
+
+def write_execution(repo: Path, plan: str, run_id: str, tasks: list[str]) -> None:
+    write_atomic(
+        execution_path(repo, plan),
+        json.dumps({"version": 1, "run_id": run_id, "tasks": sorted(set(tasks)), "updated_at": utc_now()}, indent=2) + "\n",
+    )
+
+
+def active_in_progress_tasks(repo: Path, plan: str) -> list[Task]:
+    return [task for task in read_tasks(repo, plan) if task.column == "in-progress"]
+
+
 def validate_run_policy(mode: str | None, yolo: bool) -> dict[str, object]:
     if mode not in DELIVERY_MODES:
         raise SystemExit("invalid delivery mode; reserve requires --delivery-mode no-mistakes|direct-pr|local-only")
@@ -365,25 +434,26 @@ def append_progress(repo: Path, plan: str, run_id: str, task: Task, status: str)
 
 
 def move_task(repo: Path, plan: str, source_column: str, dest_column: str, task_name: str | None = None) -> Path:
-    base = plan_dir(repo, plan)
-    source = base / source_column
-    dest = base / dest_column
-    dest.mkdir(parents=True, exist_ok=True)
+    with plan_mutation_lock(repo, plan):
+        base = plan_dir(repo, plan)
+        source = base / source_column
+        dest = base / dest_column
+        dest.mkdir(parents=True, exist_ok=True)
 
-    matches = sorted(source.glob(task_name or "*.md"))
-    if not matches:
-        label = task_name or "*.md"
-        raise SystemExit(f"No matching task in {source}: {label}")
-    if len(matches) > 1:
-        names = ", ".join(path.name for path in matches)
-        raise SystemExit(f"Task name is ambiguous: {names}")
+        matches = sorted(source.glob(task_name or "*.md"))
+        if not matches:
+            label = task_name or "*.md"
+            raise SystemExit(f"No matching task in {source}: {label}")
+        if len(matches) > 1:
+            names = ", ".join(path.name for path in matches)
+            raise SystemExit(f"Task name is ambiguous: {names}")
 
-    target = dest / matches[0].name
-    if target.exists():
-        raise SystemExit(f"Destination already exists: {target}")
-    shutil.move(str(matches[0]), str(target))
-    rewrite_board(repo, plan)
-    return target
+        target = dest / matches[0].name
+        if target.exists():
+            raise SystemExit(f"Destination already exists: {target}")
+        shutil.move(str(matches[0]), str(target))
+        rewrite_board(repo, plan)
+        return target
 
 
 def command_start(repo: Path, plan: str) -> None:
@@ -413,18 +483,36 @@ def command_reserve(
     repo: Path, plan: str, limit: int, run_id: str, delivery_mode: str | None, yolo: bool
 ) -> None:
     policy = validate_run_policy(delivery_mode, yolo)
-    ensure_run_dirs(repo, plan, run_id)
-    write_atomic(policy_path(repo, plan, run_id), json.dumps(policy) + "\n")
-    schedule = schedule_tasks(repo, plan, limit, run_id)
+    with plan_mutation_lock(repo, plan):
+        execution = load_execution(repo, plan)
+        in_progress = active_in_progress_tasks(repo, plan)
+        if in_progress and execution is None:
+            raise SystemExit("in-progress work has no execution record; reserve explicitly before launching")
+        if execution is not None and in_progress and execution["run_id"] != run_id:
+            raise SystemExit(f"active execution run {execution['run_id']} owns in-progress work")
+        if execution is not None and not in_progress:
+            execution = None
+
+        schedule = schedule_tasks(repo, plan, limit, run_id)
+        reserved = [task.path.name for task in in_progress]
+        reserved.extend(task.path.name for task in schedule.batch)
+        if schedule.batch:
+            ensure_run_dirs(repo, plan, run_id)
+            write_atomic(policy_path(repo, plan, run_id), json.dumps(policy) + "\n")
+            write_execution(repo, plan, run_id, reserved)
+            for task in schedule.batch:
+                source = plan_dir(repo, plan) / "todo" / task.path.name
+                target = plan_dir(repo, plan) / "in-progress" / task.path.name
+                shutil.move(str(source), str(target))
+                append_progress(repo, plan, run_id, task, "in-progress")
+            rewrite_board(repo, plan)
 
     print(f"Reserved launch batch (limit {limit}):")
     if not schedule.batch:
         print("- None")
         return
-
     for task in schedule.batch:
-        moved = move_task(repo, plan, "todo", "in-progress", task.path.name)
-        append_progress(repo, plan, run_id, task, "in-progress")
+        moved = plan_dir(repo, plan) / "in-progress" / task.path.name
         print(f"- {task.path.name}: {task.title} -> {moved}")
 
 
@@ -501,19 +589,44 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def tmux_session_name(plan: str, run_id: str, task_name: str) -> str:
-    parts = ("task-graph", plan, run_id, Path(task_name).stem)
+def tmux_plan_session_name(plan: str) -> str:
+    return "-".join(("task-graph", re.sub(r"[^a-zA-Z0-9_-]+", "-", plan).strip("-")))
+
+
+def tmux_window_name(run_id: str, task_name: str, role: str) -> str:
+    parts = (run_id, Path(task_name).stem, role)
     return "-".join(re.sub(r"[^a-zA-Z0-9_-]+", "-", part).strip("-") for part in parts)
+
+
+def tmux_target(record: dict[str, object]) -> str:
+    return f"{record['session']}:{record['window']}"
+
+
+def tmux_lock_path(repo: Path, plan: str) -> Path:
+    return plan_dir(repo, plan) / "state" / "tmux.lock"
+
+
+@contextmanager
+def tmux_window_lock(repo: Path, plan: str):
+    path = tmux_lock_path(repo, plan)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def new_runtime_record(
     *, task: Task, plan: str, run_id: str, branch: str, worktree: Path, brief: Path,
     report: Path, log: Path, command: list[str], started_at: str | None = None,
-    base_commit: str,
+    base_commit: str, role: str = "worker",
 ) -> dict[str, object]:
     return {
-        "version": 1, "plan": plan, "run_id": run_id, "task": task.path.name,
-        "session": tmux_session_name(plan, run_id, task.path.name), "pid": None,
+        "version": 2, "plan": plan, "run_id": run_id, "task": task.path.name,
+        "session": tmux_plan_session_name(plan),
+        "window": tmux_window_name(run_id, task.path.name, role), "role": role, "pid": None,
         "command": command, "branch": branch, "worktree": str(worktree),
         "base_commit": base_commit,
         "brief": str(brief), "report": str(report), "log": str(log),
@@ -525,10 +638,12 @@ def is_valid_runtime_record(record: object) -> bool:
     if not isinstance(record, dict) or not RUNTIME_FIELDS <= record.keys():
         return False
     return (
-        record.get("version") == 1
+        record.get("version") == 2
         and isinstance(record.get("command"), list)
         and isinstance(record.get("task"), str)
         and isinstance(record.get("session"), str)
+        and isinstance(record.get("window"), str)
+        and isinstance(record.get("role"), str)
     )
 
 
@@ -549,8 +664,22 @@ def tmux_session_exists(session: str) -> bool:
         return False
 
 
+def tmux_target_exists(target: str) -> bool:
+    """Check a named window target without mistaking a live session for that window."""
+    if ":" not in target:
+        return tmux_session_exists(target)
+    try:
+        return subprocess.run(
+            ["tmux", "display-message", "-p", "-t", target, "#{pane_id}"],
+            text=True,
+            capture_output=True,
+        ).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
 def tmux_liveness(session: str) -> str:
-    if not tmux_session_exists(session):
+    if not tmux_target_exists(session):
         return "IDLE_OR_DEAD"
     try:
         result = subprocess.run(
@@ -570,6 +699,35 @@ def tmux_liveness(session: str) -> str:
     if command in {"zsh", "sh", "dash", "ash", "ksh", "fish"}:
         return "IDLE_OR_DEAD"
     return "UNKNOWN"
+
+
+def tmux_create_window(
+    repo: Path, plan: str, session: str, window: str, cwd: Path, command: str,
+) -> int | None:
+    """Create one activity window in a detached shared plan session."""
+    with tmux_window_lock(repo, plan):
+        target = f"{session}:{window}"
+        if tmux_target_exists(target):
+            raise SystemExit(f"tmux target already exists: {target}")
+        if tmux_session_exists(session):
+            created = subprocess.run(
+                ["tmux", "new-window", "-d", "-t", session, "-n", window, "-c", str(cwd), "bash", "-lc", command],
+                text=True,
+                capture_output=True,
+            )
+        else:
+            created = subprocess.run(
+                ["tmux", "new-session", "-d", "-s", session, "-n", window, "-c", str(cwd), "bash", "-lc", command],
+                text=True,
+                capture_output=True,
+            )
+        if created.returncode:
+            raise SystemExit(created.stderr.strip() or created.stdout.strip() or "tmux failed to create activity window")
+        subprocess.run(["tmux", "set-option", "-t", target, "remain-on-exit", "on"], capture_output=True)
+        pane = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", target, "#{pane_pid}"], text=True, capture_output=True
+        )
+    return int(pane.stdout.strip()) if pane.returncode == 0 and pane.stdout.strip().isdigit() else None
 
 
 def verified_worktree(repo: Path, worktree: Path, branch: str) -> tuple[Path, str]:
@@ -592,81 +750,84 @@ def verified_worktree(repo: Path, worktree: Path, branch: str) -> tuple[Path, st
 
 
 def command_launch_exec(
-    repo: Path, plan: str, run_id: str, task_name: str, branch: str, worktree: Path
+    repo: Path, plan: str, run_id: str, task_name: str, branch: str, worktree: Path, *, role: str = "worker",
 ) -> None:
     if not shutil.which("tmux"):
         raise SystemExit("tmux is required for launch-exec")
-    worktree, base_commit = verified_worktree(repo, worktree, branch)
-    task = task_in_progress(repo, plan, task_name)
-    directory = ensure_run_dirs(repo, plan, run_id)
-    brief = directory / "briefs" / task.path.name
-    report = directory / "reports" / task.path.name
-    log = directory / "logs" / f"{task.path.stem}.log"
-    record_path = runtime_path(repo, plan, run_id, task.path.name)
-    if record_path.exists():
-        raise SystemExit(f"Runtime record already exists: {record_path}")
-    if not brief.exists():
-        raise SystemExit(f"Task brief does not exist: {brief}")
+    with plan_mutation_lock(repo, plan):
+        worktree, base_commit = verified_worktree(repo, worktree, branch)
+        execution = load_execution(repo, plan)
+        if execution is None or task_name not in execution["tasks"]:
+            raise SystemExit(f"Task is not reserved in the active execution: {task_name}")
+        if role == "worker" and execution["run_id"] != run_id:
+            raise SystemExit(f"active execution run {execution['run_id']} does not match launch run {run_id}")
+        task = task_in_progress(repo, plan, task_name)
+        directory = ensure_run_dirs(repo, plan, run_id)
+        brief = directory / "briefs" / task.path.name
+        report = directory / "reports" / task.path.name
+        log = directory / "logs" / f"{task.path.stem}.log"
+        record_path = runtime_path(repo, plan, run_id, task.path.name)
+        if record_path.exists():
+            raise SystemExit(f"Runtime record already exists: {record_path}")
+        if not brief.exists():
+            raise SystemExit(f"Task brief does not exist: {brief}")
 
-    command = [
-        "codex",
-        "exec",
-        "--sandbox",
-        "workspace-write",
-        "--output-last-message",
-        str(report),
-    ]
-    record = new_runtime_record(
-        task=task, plan=plan, run_id=run_id, branch=branch, worktree=worktree,
-        brief=brief, report=report, log=log, command=command, base_commit=base_commit,
-    )
-    write_runtime_record(record_path, record)
-    prompt = (
-        f"Read {brief}. Work only on the assigned task in the current worktree. "
-        "Do not write outside that worktree and do not run git commit. "
-        "Return the complete final report in your final response, including status, summary, "
-        "tests, concerns, and a suggested commit message."
-    )
-    codex_command = " ".join(shlex.quote(item) for item in [*command, prompt])
-    wrapper = (
-        f"set -o pipefail; {codex_command} 2>&1 | tee -a {shlex.quote(str(log))}; "
-        "exit_code=${PIPESTATUS[0]}; "
-        f"{shlex.quote(shutil.which('python3') or 'python3')} {shlex.quote(str(Path(__file__).resolve()))} "
-        f"finish-runtime --repo {shlex.quote(str(repo))} --plan {shlex.quote(plan)} "
-        f"--run-id {shlex.quote(run_id)} --task {shlex.quote(task.path.name)} --exit-code $exit_code; exit $exit_code"
-    )
-    session = str(record["session"])
-    created = subprocess.run(
-        ["tmux", "new-session", "-d", "-s", session, "-c", str(worktree), "bash", "-lc", wrapper],
-        text=True, capture_output=True,
-    )
-    if created.returncode:
-        record_path.unlink(missing_ok=True)
-        detail = created.stderr.strip() or created.stdout.strip()
-        raise SystemExit(detail or "tmux failed to start launch-exec")
-    subprocess.run(["tmux", "set-option", "-t", session, "remain-on-exit", "on"], capture_output=True)
-    pane = subprocess.run(
-        ["tmux", "display-message", "-p", "-t", session, "#{pane_pid}"], text=True, capture_output=True
-    )
-    if pane.returncode == 0 and pane.stdout.strip().isdigit():
-        record["pid"] = int(pane.stdout.strip())
+        command = [
+            "codex",
+            "exec",
+            "--sandbox",
+            "workspace-write",
+            "--output-last-message",
+            str(report),
+        ]
+        record = new_runtime_record(
+            task=task, plan=plan, run_id=run_id, branch=branch, worktree=worktree,
+            brief=brief, report=report, log=log, command=command, base_commit=base_commit, role=role,
+        )
+        if tmux_target_exists(tmux_target(record)):
+            raise SystemExit(f"tmux target already exists: {tmux_target(record)}")
         write_runtime_record(record_path, record)
+        prompt = (
+            f"Read {brief}. Work only on the assigned task in the current worktree. "
+            "Do not write outside that worktree and do not run git commit. "
+            "Return the complete final report in your final response, including status, summary, "
+            "tests, concerns, and a suggested commit message."
+        )
+        codex_command = " ".join(shlex.quote(item) for item in [*command, prompt])
+        wrapper = (
+            f"set -o pipefail; {codex_command} 2>&1 | tee -a {shlex.quote(str(log))}; "
+            "exit_code=${PIPESTATUS[0]}; "
+            f"{shlex.quote(shutil.which('python3') or 'python3')} {shlex.quote(str(Path(__file__).resolve()))} "
+            f"finish-runtime --repo {shlex.quote(str(repo))} --plan {shlex.quote(plan)} "
+            f"--run-id {shlex.quote(run_id)} --task {shlex.quote(task.path.name)} --exit-code $exit_code; exit $exit_code"
+        )
+        session = str(record["session"])
+        window = str(record["window"])
+        try:
+            pane_pid = tmux_create_window(repo, plan, session, window, worktree, wrapper)
+        except SystemExit:
+            record_path.unlink(missing_ok=True)
+            raise
+        if pane_pid is not None:
+            record["pid"] = pane_pid
+            write_runtime_record(record_path, record)
     print(f"Launched: {task.path.name}")
     print(f"Attach: tmux attach -t {session}")
     print(f"Log: {log}")
 
 
 def command_finish_runtime(repo: Path, plan: str, run_id: str, task_name: str, exit_code: int) -> None:
-    path = runtime_path(repo, plan, run_id, task_name)
-    try:
-        record = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raise SystemExit(f"Runtime record does not exist: {path}")
-    if not is_valid_runtime_record(record):
-        raise SystemExit(f"Invalid runtime record: {path}")
-    record["finished_at"] = utc_now()
-    record["exit_code"] = exit_code
-    write_runtime_record(path, record)
+    with plan_mutation_lock(repo, plan):
+        path = runtime_path(repo, plan, run_id, task_name)
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raise SystemExit(f"Runtime record does not exist: {path}")
+        if not is_valid_runtime_record(record):
+            raise SystemExit(f"Invalid runtime record: {path}")
+        record["finished_at"] = utc_now()
+        record["exit_code"] = exit_code
+        write_runtime_record(path, record)
 
 
 def prepare_completed_task(repo: Path, plan: str, run_id: str, task_name: str) -> dict[str, object]:
@@ -817,19 +978,21 @@ def reserve_repair_attempt(
         "worktree": str(worktree),
         "phase": "reserved",
     }
-    write_repair_attempt_state(repo, plan, task_name, record)
+    with plan_mutation_lock(repo, plan):
+        write_repair_attempt_state(repo, plan, task_name, record)
     return record
 
 
 def mark_repair_attempt_phase(repo: Path, plan: str, task_name: str, phase: str) -> dict[str, object]:
     if phase not in {"reserved", "launched", "failed"}:
         raise SystemExit(f"Invalid repair attempt phase: {phase}")
-    record = repair_attempt(repo, plan, task_name)
-    if record is None:
-        raise SystemExit(f"No repair attempt reserved for {task_name}")
-    record["phase"] = phase
-    write_repair_attempt_state(repo, plan, task_name, record)
-    return record
+    with plan_mutation_lock(repo, plan):
+        record = repair_attempt(repo, plan, task_name)
+        if record is None:
+            raise SystemExit(f"No repair attempt reserved for {task_name}")
+        record["phase"] = phase
+        write_repair_attempt_state(repo, plan, task_name, record)
+        return record
 
 
 def record_repair_attempt(repo: Path, plan: str, task_name: str) -> None:
@@ -976,6 +1139,11 @@ def escalate_wake(repo: Path, plan: str, wake_id: str) -> None:
 
 
 def supervise_once(repo: Path, plan: str) -> list[dict[str, object]]:
+    with plan_mutation_lock(repo, plan):
+        return _supervise_once(repo, plan)
+
+
+def _supervise_once(repo: Path, plan: str) -> list[dict[str, object]]:
     """Persist newly actionable controller work before returning it to a watcher."""
     actions = reconcile_actions(repo, plan)
     with wake_queue_lock(repo, plan):
@@ -1191,6 +1359,11 @@ def delivery_path(repo: Path, plan: str, run_id: str, task_name: str) -> Path:
 
 
 def command_record_delivery(repo: Path, plan: str, run_id: str, task_name: str, result: str) -> None:
+    with plan_mutation_lock(repo, plan):
+        _command_record_delivery(repo, plan, run_id, task_name, result)
+
+
+def _command_record_delivery(repo: Path, plan: str, run_id: str, task_name: str, result: str) -> None:
     if result != "landed":
         raise SystemExit("record-delivery requires --result landed")
     try:
@@ -1203,6 +1376,11 @@ def command_record_delivery(repo: Path, plan: str, run_id: str, task_name: str, 
 
 
 def command_teardown(repo: Path, plan: str, run_id: str, task_name: str, discard: bool) -> None:
+    with plan_mutation_lock(repo, plan):
+        _command_teardown(repo, plan, run_id, task_name, discard)
+
+
+def _command_teardown(repo: Path, plan: str, run_id: str, task_name: str, discard: bool) -> None:
     try:
         record = json.loads(runtime_path(repo, plan, run_id, task_name).read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -1222,12 +1400,14 @@ def command_teardown(repo: Path, plan: str, run_id: str, task_name: str, discard
     result = subprocess.run(["git", "worktree", "remove", str(worktree)], cwd=repo, text=True, capture_output=True)
     if result.returncode:
         raise SystemExit(result.stderr.strip() or "git worktree remove failed")
-    tmux = subprocess.run(
-        ["tmux", "kill-session", "-t", str(record["session"])],
-        cwd=repo,
-        text=True,
-        capture_output=True,
-    )
+    target = tmux_target(record)
+    with tmux_window_lock(repo, plan):
+        tmux = subprocess.run(
+            ["tmux", "kill-window", "-t", target],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+        )
     if tmux.returncode and "can't find session" not in tmux.stderr.lower():
         raise SystemExit(tmux.stderr.strip() or tmux.stdout.strip() or "tmux failed to remove session")
 
@@ -1247,7 +1427,7 @@ def runtime_health(
 ) -> tuple[str, datetime | None]:
     """Classify active worker health from tmux liveness and durable activity."""
     activity = runtime_activity_at(run, task_name, record)
-    liveness = tmux_alive(str(record["session"]))
+    liveness = tmux_alive(tmux_target(record))
     if liveness == "RUNNING":
         if activity is not None and now - activity <= stale_after:
             return "RUNNING", activity
@@ -1292,7 +1472,7 @@ def status_entry(
     else:
         state, hint = "UNKNOWN", f"Inspect runtime record and log: {log}"
     return {"plan": plan, "run_id": run_id, "task": task_name, "state": state,
-            "elapsed": elapsed_seconds, "session": record["session"], "report_status": report_status,
+            "elapsed": elapsed_seconds, "session": record["session"], "window": record.get("window"), "report_status": report_status,
             "last_activity": last_activity,
             "recovery_hint": hint}
 

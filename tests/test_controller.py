@@ -242,6 +242,34 @@ class ControllerStateTest(unittest.TestCase):
         start.assert_called_once()
         acknowledge.assert_called_once_with(self.repo, self.plan, "wake-1")
 
+    def test_stopped_controller_does_not_claim_or_dispatch_a_wake(self) -> None:
+        wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REVIEW_REQUIRED"}
+        state = CONTROLLER.create_state(self.repo, self.plan, None)
+        state["lifecycle"] = "stopped"
+        CONTROLLER.write_state(self.repo, self.plan, state)
+        with patch.object(CONTROLLER.KANBAN, "claim_wake") as claim, patch.object(CONTROLLER, "start_review") as review:
+            result = CONTROLLER.dispatch_wake(self.repo, self.plan, wake, state)
+
+        self.assertEqual("STOPPED", result)
+        claim.assert_not_called()
+        review.assert_not_called()
+
+    def test_review_dispatch_uses_a_named_window_in_the_plan_session(self) -> None:
+        wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REVIEW_REQUIRED"}
+        run = self.repo / ".agent" / self.plan / "runs" / "run-a"
+        record = {"worktree": "/work"}
+        prepared = {"record": record, "base_commit": "a" * 40, "head_commit": "b" * 40, "branch": "task-branch"}
+        with patch.object(CONTROLLER, "require_tmux"), patch.object(
+            CONTROLLER, "latest_runtime", return_value=("run-a", run, record)
+        ), patch.object(CONTROLLER.KANBAN, "prepare_completed_task", return_value=prepared), patch.object(
+            CONTROLLER.KANBAN, "command_archive_diff"
+        ), patch.object(CONTROLLER.KANBAN, "tmux_create_window", return_value=123) as create_window:
+            target = CONTROLLER.start_review(self.repo, self.plan, wake)
+
+        self.assertEqual("task-graph-sample-plan:run-a-001-work-review", target)
+        self.assertEqual("task-graph-sample-plan", create_window.call_args.args[2])
+        self.assertEqual("run-a-001-work-review", create_window.call_args.args[3])
+
     def test_failed_dispatch_leaves_claimed_wake_unacknowledged(self) -> None:
         wake = {"id": "wake-1", "task": "001-work.md", "run_id": "run-a", "action": "REVIEW_REQUIRED"}
         CONTROLLER.create_state(self.repo, self.plan, None)
