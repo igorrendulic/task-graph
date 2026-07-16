@@ -17,6 +17,7 @@ import kanban as KANBAN
 
 
 WATCH_INTERVAL_SECONDS = 5
+OBSERVATION_ERRORS = (OSError, ValueError)
 
 
 def select_entries(entries: list[dict[str, object]]) -> tuple[list[dict[str, object]], int]:
@@ -74,12 +75,31 @@ def render_exec(entries: list[dict[str, object]], hidden: int, elapsed: int, rem
     return "\n".join(lines)
 
 
+def render_observation_error(error: Exception, elapsed: int, remaining: int) -> str:
+    return "\n".join(
+        [
+            f"Task Graph exec monitor | elapsed {KANBAN.format_elapsed(elapsed)} | remaining {KANBAN.format_elapsed(remaining)}",
+            f"Observation error: {error}",
+        ]
+    )
+
+
 def watch_status(repo: Path, plan: str | None, run_id: str | None, task_name: str | None, interval: float, *, as_json: bool = False) -> None:
     if interval <= 0:
         raise SystemExit("--interval must be greater than zero")
     try:
         while True:
-            entries = KANBAN.collect_status(repo, plan, run_id, task_name)
+            try:
+                entries = KANBAN.collect_status(repo, plan, run_id, task_name)
+            except OBSERVATION_ERRORS as error:
+                if as_json:
+                    print(json.dumps({"observation_error": str(error)}, sort_keys=True))
+                    return
+                print("\033[2J\033[H", end="")
+                print("Task Graph status (Ctrl-C to stop)\n")
+                print(f"Observation error: {error}")
+                time.sleep(interval)
+                continue
             if as_json:
                 print(json.dumps({"tasks": entries}, indent=2, sort_keys=True))
                 return
@@ -97,7 +117,22 @@ def watch_exec(repo: Path, plan: str | None, run_id: str | None, task_name: str 
     started = time.monotonic()
     deadline = started + seconds
     while True:
-        entries = KANBAN.collect_status(repo, plan, run_id, task_name)
+        try:
+            entries = KANBAN.collect_status(repo, plan, run_id, task_name)
+        except OBSERVATION_ERRORS as error:
+            if checkpoint:
+                print(f"observation error: {error}")
+                return 2
+            now = time.monotonic()
+            remaining = deadline - now
+            if sys.stdout.isatty():
+                print("\033[2J\033[H", end="")
+            print(render_observation_error(error, int(now - started), max(0, int(remaining))))
+            if remaining <= 0:
+                print(f"monitor: finished after {seconds}s")
+                return 124
+            time.sleep(min(WATCH_INTERVAL_SECONDS, remaining))
+            continue
         actionable = [entry for entry in entries if entry["state"] in KANBAN.EXEC_ACTIONABLE_STATES]
         if checkpoint:
             if actionable:

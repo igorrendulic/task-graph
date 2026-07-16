@@ -50,6 +50,40 @@ class WatcherTest(unittest.TestCase):
         self.assertIn("signal: NEEDS_ATTENTION", output.getvalue())
         print_status.assert_called_once_with(entries)
 
+    def test_checkpoint_observation_error_returns_two_without_sleeping(self) -> None:
+        with patch.object(WATCHER.KANBAN, "collect_status", side_effect=OSError("runtime unavailable")), patch(
+            "time.sleep"
+        ) as sleep, patch("sys.stdout", new_callable=io.StringIO) as output:
+            result = WATCHER.watch_exec(Path("/repo"), "plan", "run", "001-work.md", 5, checkpoint=True)
+
+        self.assertEqual(2, result)
+        self.assertIn("observation error: runtime unavailable", output.getvalue())
+        sleep.assert_not_called()
+
+    def test_checkpoint_status_decoding_error_returns_two_without_sleeping(self) -> None:
+        with patch.object(WATCHER.KANBAN, "collect_status", side_effect=ValueError("invalid runtime status")), patch(
+            "time.sleep"
+        ) as sleep, patch("sys.stdout", new_callable=io.StringIO) as output:
+            result = WATCHER.watch_exec(Path("/repo"), "plan", "run", "001-work.md", 5, checkpoint=True)
+
+        self.assertEqual(2, result)
+        self.assertIn("observation error: invalid runtime status", output.getvalue())
+        sleep.assert_not_called()
+
+    def test_dashboard_retries_after_observation_error(self) -> None:
+        entries = []
+        with patch.object(
+            WATCHER.KANBAN, "collect_status", side_effect=[OSError("runtime unavailable"), entries]
+        ), patch("time.monotonic", side_effect=[0, 0, 5]), patch("time.sleep") as sleep, patch(
+            "sys.stdout", new_callable=io.StringIO
+        ) as output:
+            result = WATCHER.watch_exec(Path("/repo"), "plan", "run", "001-work.md", 5)
+
+        self.assertEqual(124, result)
+        self.assertIn("Observation error: runtime unavailable", output.getvalue())
+        self.assertIn("Task Graph exec monitor", output.getvalue())
+        sleep.assert_called_once_with(5)
+
     def test_legacy_kanban_watch_command_forwards_to_watcher(self) -> None:
         kanban_path = ROOT / "scripts" / "kanban.py"
         with tempfile.TemporaryDirectory() as directory:
