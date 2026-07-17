@@ -2,9 +2,26 @@
 
 > Turn an approved implementation plan into task files, a kanban board, and a conservative execution DAG.
 
+![Task Graph controller showing task status and worker progress](assets/task-graph-controller.jpg)
+
 ## What it creates
 
 Running `$task-graph tasks` writes plan-local artifacts below `.agent/<plan-slug>/`:
+
+For example, a generated plan directory can look like this:
+
+```text
+.agent/bookmark-json-storage/
+├── todo/
+├── in-progress/
+├── done/
+│   ├── 001-add-json-storage.md
+│   ├── 002-persist-and-filter-service.md
+│   ├── 003-add-cli-and-readme.md
+│   └── 004-verify-bookmark-workflow.md
+├── kanban.md
+└── dag.json
+```
 
 - `todo/*.md` contains focused, fresh-context-ready task briefs.
 - `kanban.md` summarizes the task folders.
