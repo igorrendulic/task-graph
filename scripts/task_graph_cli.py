@@ -169,6 +169,18 @@ def status(plan_slug: str, run_id: str | None = None) -> str:
     return f"{result}; notification: {outcome}{detail}"
 
 
+def _cleanup_integration_worktree(git: TaskGraphGit, run_dir: Path) -> str:
+    integration = run_dir / "integration"
+    if not integration.exists():
+        return ""
+    if not git.is_clean(integration):
+        return "; integration worktree is dirty; retained"
+    if input("Remove the clean integration worktree? [y/N] ").strip().lower() != "y":
+        return "; integration worktree retained"
+    git.remove_worktree_safely(integration)
+    return "; integration worktree removed"
+
+
 def merge(plan_slug: str, run_id: str) -> str:
     """Promote a completed run feature branch into its recorded base branch."""
     repository = _repository_root()
@@ -222,7 +234,11 @@ def merge(plan_slug: str, run_id: str) -> str:
             "mergedAt": time.time(),
         }
         write_state(run_dir, state)
-    return f"{run_id}: merged into {base_branch} ({result.merge_sha})"
+        try:
+            cleanup = _cleanup_integration_worktree(git, run_dir)
+        except TaskGraphGitError as exc:
+            raise TaskGraphRuntimeError(f"cannot merge Task Graph run: {exc}") from exc
+    return f"{run_id}: merged into {base_branch} ({result.merge_sha}){cleanup}"
 
 
 def checkout(plan_slug: str, run_id: str) -> str:

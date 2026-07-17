@@ -232,6 +232,104 @@ class TaskGraphCliTests(unittest.TestCase):
                 load_state(run_dir)["promotion"],
             )
 
+    @patch("builtins.input", return_value="y")
+    @patch("scripts.task_graph_cli.TaskGraphGit")
+    @patch("scripts.task_graph_cli._repository_root")
+    def test_merge_removes_a_clean_integration_worktree_after_confirmation(
+        self, repository_root, git_class, prompt
+    ):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_dir = self._state(root, "run-1")
+            integration = run_dir / "integration"
+            integration.mkdir()
+            repository_root.return_value = root
+            git = git_class.return_value
+            git.current_branch.return_value = "main"
+            git.is_clean.side_effect = [True, True]
+            git.branch_exists.return_value = True
+            git.merge_feature_branch.return_value = MergeResult("merged", "merge-sha")
+
+            result = task_graph_cli.merge("demo-plan", "run-1")
+
+            prompt.assert_called_once_with("Remove the clean integration worktree? [y/N] ")
+            git.remove_worktree_safely.assert_called_once_with(integration)
+            self.assertIn("integration worktree removed", result)
+
+    @patch("builtins.input", return_value="n")
+    @patch("scripts.task_graph_cli.TaskGraphGit")
+    @patch("scripts.task_graph_cli._repository_root")
+    def test_merge_keeps_a_clean_integration_worktree_when_cleanup_is_declined(
+        self, repository_root, git_class, prompt
+    ):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_dir = self._state(root, "run-1")
+            integration = run_dir / "integration"
+            integration.mkdir()
+            repository_root.return_value = root
+            git = git_class.return_value
+            git.current_branch.return_value = "main"
+            git.is_clean.side_effect = [True, True]
+            git.branch_exists.return_value = True
+            git.merge_feature_branch.return_value = MergeResult("merged", "merge-sha")
+
+            result = task_graph_cli.merge("demo-plan", "run-1")
+
+            prompt.assert_called_once_with("Remove the clean integration worktree? [y/N] ")
+            git.remove_worktree_safely.assert_not_called()
+            self.assertIn("integration worktree retained", result)
+
+    @patch("builtins.input")
+    @patch("scripts.task_graph_cli.TaskGraphGit")
+    @patch("scripts.task_graph_cli._repository_root")
+    def test_merge_retains_a_dirty_integration_worktree_without_prompt(
+        self, repository_root, git_class, prompt
+    ):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_dir = self._state(root, "run-1")
+            integration = run_dir / "integration"
+            integration.mkdir()
+            repository_root.return_value = root
+            git = git_class.return_value
+            git.current_branch.return_value = "main"
+            git.is_clean.side_effect = [True, False]
+            git.branch_exists.return_value = True
+            git.merge_feature_branch.return_value = MergeResult("merged", "merge-sha")
+
+            result = task_graph_cli.merge("demo-plan", "run-1")
+
+            prompt.assert_not_called()
+            git.remove_worktree_safely.assert_not_called()
+            self.assertIn("integration worktree is dirty; retained", result)
+
+    @patch("builtins.input", return_value="y")
+    @patch("scripts.task_graph_cli.TaskGraphGit")
+    @patch("scripts.task_graph_cli._repository_root")
+    def test_merge_wraps_cleanup_git_errors_after_persisting_promotion(
+        self, repository_root, git_class, _prompt
+    ):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_dir = self._state(root, "run-1")
+            (run_dir / "integration").mkdir()
+            repository_root.return_value = root
+            git = git_class.return_value
+            git.current_branch.return_value = "main"
+            git.is_clean.side_effect = [True, True]
+            git.branch_exists.return_value = True
+            git.merge_feature_branch.return_value = MergeResult("merged", "merge-sha")
+            git.remove_worktree_safely.side_effect = TaskGraphGitError("removal failed")
+
+            with self.assertRaisesRegex(TaskGraphRuntimeError, "cannot merge Task Graph run"):
+                task_graph_cli.merge("demo-plan", "run-1")
+
+            self.assertEqual(
+                {"targetBranch": "main", "mergeSha": "merge-sha", "mergedAt": ANY},
+                load_state(run_dir)["promotion"],
+            )
+
     @patch("scripts.task_graph_cli.TaskGraphGit")
     @patch("scripts.task_graph_cli._repository_root")
     def test_merge_reports_a_previously_promoted_run_without_calling_git(self, repository_root, git_class):
