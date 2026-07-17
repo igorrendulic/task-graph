@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import shlex
-import subprocess
 import sys
 import time
 import uuid
@@ -17,6 +16,7 @@ if __package__ in {None, ""}:
 from scripts.task_graph_controller import TaskGraphController
 from scripts.task_graph_display import TerminalDashboard
 from scripts.task_graph_git import TaskGraphGit, TaskGraphGitError
+from scripts.task_graph_notifications import notify_completion
 from scripts.task_graph_runtime import (
     RunLock,
     TaskGraphRuntimeError,
@@ -47,6 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
     resume = subcommands.add_parser("resume", help="reconnect or restart a plan controller")
     resume.add_argument("plan_slug")
     resume.add_argument("run_id")
+    status = subcommands.add_parser("status", help="report the state of a plan run")
+    status.add_argument("plan_slug")
+    status.add_argument("--run-id")
+    merge = subcommands.add_parser("merge", help="promote a successful plan run")
+    merge.add_argument("plan_slug")
+    merge.add_argument("--run-id", required=True)
     controller = subcommands.add_parser("controller", help=argparse.SUPPRESS)
     controller.add_argument("--run-dir", required=True, type=Path)
     return parser
@@ -77,9 +83,10 @@ def start(plan_slug: str, max_workers: int, worker_command: str = "codex") -> st
     git = TaskGraphGit(repository)
     try:
         git_common_dir = git.common_dir()
+        base_branch = git.current_branch(repository)
     except TaskGraphGitError as exc:
         raise TaskGraphRuntimeError(
-            f"cannot resolve shared Git metadata directory before startup: {exc}"
+            f"cannot resolve shared Git metadata directory or current branch before startup: {exc}"
         ) from exc
     base_commit = git.head_sha(repository)
     snapshot = create_run_snapshot(plan_dir, run_dir)
@@ -98,6 +105,7 @@ def start(plan_slug: str, max_workers: int, worker_command: str = "codex") -> st
         task_ids=[task["id"] for task in snapshot.dag["tasks"]],
         git_common_dir=str(git_common_dir),
         worker_command=worker_command,
+        base_branch=base_branch,
     )
     state["planDirectory"] = str(plan_dir)
     state["integrationWorktree"] = str(integration)
@@ -139,6 +147,70 @@ def resume(plan_slug: str, run_id: str) -> str:
         raise
 
 
+def status(plan_slug: str, run_id: str | None = None) -> str:
+    """Report the newest (or explicitly selected) persisted run."""
+    repository = _repository_root()
+    run_dir = _run_directory(repository, plan_slug, run_id)
+    state = load_state(run_dir)
+    return f"{state['runId']}: {_run_status(state)}"
+
+
+def merge(plan_slug: str, run_id: str) -> str:
+    """Promote a completed run feature branch into its recorded base branch."""
+    repository = _repository_root()
+    run_dir = _run_directory(repository, plan_slug, run_id)
+    with RunLock(run_dir):
+        state = load_state(run_dir)
+        if state.get("planSlug") != plan_slug or state.get("runId") != run_id:
+            raise TaskGraphRuntimeError("run state does not match the requested plan and run ID")
+        run_status = _run_status(state)
+        if run_status == "already merged":
+            return f"{run_id}: already merged"
+        if run_status != "succeeded":
+            raise TaskGraphRuntimeError("cannot merge until all tasks are integrated")
+        base_branch = state.get("baseBranch")
+        if not isinstance(base_branch, str) or not base_branch:
+            raise TaskGraphRuntimeError(
+                "run state lacks baseBranch; start a fresh run from a clean base"
+            )
+        feature_branch = state.get("featureBranch")
+        if not isinstance(feature_branch, str) or not feature_branch:
+            raise TaskGraphRuntimeError("run state lacks a feature branch")
+        git = TaskGraphGit(repository)
+        try:
+            current_branch = git.current_branch(repository)
+            if current_branch != base_branch:
+                raise TaskGraphRuntimeError(
+                    f"checked out branch is {current_branch}; expected recorded base branch {base_branch}"
+                )
+            if not git.is_clean(ignored_prefix=f".agent/{plan_slug}/runs/"):
+                raise TaskGraphRuntimeError(
+                    "repository is dirty outside controller-owned run artifacts"
+                )
+            if not git.branch_exists(feature_branch):
+                raise TaskGraphRuntimeError(f"feature branch does not exist: {feature_branch}")
+            result = git.merge_feature_branch(
+                repository,
+                feature_branch,
+                f"Task Graph {plan_slug} run {run_id}",
+            )
+        except TaskGraphGitError as exc:
+            raise TaskGraphRuntimeError(f"cannot merge Task Graph run: {exc}") from exc
+        if result.outcome == "already_merged":
+            return f"{run_id}: already merged"
+        if result.outcome == "conflict_aborted":
+            return f"{run_id}: merge conflict aborted; target branch unchanged"
+        if result.outcome != "merged" or not result.merge_sha:
+            raise TaskGraphRuntimeError("Git did not return a successful merge result")
+        state["promotion"] = {
+            "targetBranch": base_branch,
+            "mergeSha": result.merge_sha,
+            "mergedAt": time.time(),
+        }
+        write_state(run_dir, state)
+    return f"{run_id}: merged into {base_branch} ({result.merge_sha})"
+
+
 def run_controller(run_dir: Path) -> None:
     """Long-lived tmux service loop. The lock prevents duplicate schedulers."""
     with RunLock(run_dir, blocking=True):
@@ -154,6 +226,7 @@ def run_controller(run_dir: Path) -> None:
             dashboard.finish(controller.state, controller.tasks, _run_summary(controller.state))
         finally:
             dashboard.cleanup()
+    _notify_run_completion(controller.state)
 
 
 def _run_summary(state: dict[str, object]) -> str:
@@ -161,6 +234,59 @@ def _run_summary(state: dict[str, object]) -> str:
     assert isinstance(tasks, dict)
     counts = {status: sum(item["status"] == status for item in tasks.values()) for status in ("integrated", "failed", "blocked")}
     return f"run complete: {counts['integrated']} integrated, {counts['failed']} failed, {counts['blocked']} blocked"
+
+
+def _run_directory(repository: Path, plan_slug: str, run_id: str | None) -> Path:
+    runs_dir = repository / ".agent" / plan_slug / "runs"
+    if not runs_dir.is_dir():
+        raise TaskGraphRuntimeError(f"plan has no runs: {plan_slug}")
+    if run_id is None:
+        runs = sorted(path for path in runs_dir.iterdir() if path.is_dir())
+        if not runs:
+            raise TaskGraphRuntimeError(f"plan has no runs: {plan_slug}")
+        return runs[-1]
+    run_dir = runs_dir / run_id
+    if not run_dir.is_dir():
+        raise TaskGraphRuntimeError(f"run does not exist: {run_dir}")
+    return run_dir
+
+
+def _run_status(state: dict[str, object]) -> str:
+    if state.get("promotion"):
+        return "already merged"
+    tasks = state.get("tasks")
+    if not isinstance(tasks, dict):
+        raise TaskGraphRuntimeError("run state has invalid tasks")
+    statuses = [task.get("status") for task in tasks.values() if isinstance(task, dict)]
+    if len(statuses) != len(tasks):
+        raise TaskGraphRuntimeError("run state has invalid tasks")
+    if all(status == "integrated" for status in statuses):
+        return "succeeded"
+    if any(status in {"failed", "blocked"} for status in statuses):
+        return "failed"
+    return "running"
+
+
+def _notify_run_completion(state: dict[str, object]) -> None:
+    run_status = _run_status(state)
+    if run_status not in {"succeeded", "failed"}:
+        return
+    plan_slug = str(state.get("planSlug", "<plan-slug>"))
+    run_id = str(state.get("runId", "<run-id>"))
+    command = " ".join(
+        [
+            shlex.quote(sys.executable),
+            shlex.quote(str(Path(__file__).resolve())),
+            "merge" if run_status == "succeeded" else "status",
+            shlex.quote(plan_slug),
+            "--run-id",
+            shlex.quote(run_id),
+        ]
+    )
+    if run_status == "succeeded":
+        notify_completion(succeeded=True, message=f"Run {run_id} succeeded. Merge it with: {command}")
+    else:
+        notify_completion(succeeded=False, message=f"Run {run_id} failed. Check it with: {command}")
 
 
 def _resume_locked(run_dir: Path) -> str:
@@ -188,12 +314,10 @@ def _resume_locked(run_dir: Path) -> str:
 
 
 def _repository_root() -> Path:
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=False
-    )
-    if result.returncode != 0:
-        raise TaskGraphRuntimeError(result.stderr.strip() or "not inside a Git repository")
-    return Path(result.stdout.strip()).resolve()
+    try:
+        return TaskGraphGit.repository_root()
+    except TaskGraphGitError as exc:
+        raise TaskGraphRuntimeError(str(exc)) from exc
 
 
 def _validate_persisted_git_common_dir(state: dict[str, object]) -> Path:
@@ -228,6 +352,10 @@ def main() -> int:
             print(start(args.plan_slug, args.max_workers, args.worker_command))
         elif args.action == "resume":
             print(resume(args.plan_slug, args.run_id))
+        elif args.action == "status":
+            print(status(args.plan_slug, args.run_id))
+        elif args.action == "merge":
+            print(merge(args.plan_slug, args.run_id))
         else:
             run_controller(args.run_dir)
     except TaskGraphRuntimeError as exc:
