@@ -73,6 +73,37 @@ a `--no-ff` merge commit. Run it from the recorded base branch with a clean
 checkout (apart from run artifacts); if Git reports a conflict, Task Graph
 aborts safely and leaves the target branch unchanged.
 
+## Install without cloning
+
+Install the skill directly into Codex with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/igorrendulic/task-graph/main/install.sh | bash
+```
+
+Or download the installer first, inspect it, and then run it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/igorrendulic/task-graph/main/install.sh -o install-task-graph.sh
+less install-task-graph.sh
+bash install-task-graph.sh
+```
+
+The installer needs `curl`, `tar`, and `mktemp`, and installs to
+`${CODEX_HOME:-$HOME/.codex}/skills/task-graph`. To update or reinstall an
+existing copy, pass `--force`:
+
+```bash
+bash install-task-graph.sh --force
+```
+
+For a reproducible install, pin a release tag or commit with `--ref`:
+
+```bash
+bash install-task-graph.sh --ref v1.0.0
+bash install-task-graph.sh --ref 0123456789abcdef
+```
+
 ## Conservative scheduling
 
 `dependsOn` is authoritative: a task can begin only after all listed task IDs are complete. `parallelSafe` is explanatory evidence, not a second scheduler.
@@ -184,34 +215,3 @@ python3 -m unittest discover
 
 For opt-in behavior-case and controller evaluation workflows, see the contributor
 guide in [`evals/README.md`](evals/README.md).
-
-## Install without cloning
-
-Install the skill directly into Codex with:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/igorrendulic/task-graph/main/install.sh | bash
-```
-
-Or download the installer first, inspect it, and then run it:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/igorrendulic/task-graph/main/install.sh -o install-task-graph.sh
-less install-task-graph.sh
-bash install-task-graph.sh
-```
-
-The installer needs `curl`, `tar`, and `mktemp`, and installs to
-`${CODEX_HOME:-$HOME/.codex}/skills/task-graph`. To update or reinstall an
-existing copy, pass `--force`:
-
-```bash
-bash install-task-graph.sh --force
-```
-
-For a reproducible install, pin a release tag or commit with `--ref`:
-
-```bash
-bash install-task-graph.sh --ref v1.0.0
-bash install-task-graph.sh --ref 0123456789abcdef
-```
