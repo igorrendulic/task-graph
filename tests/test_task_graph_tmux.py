@@ -1,6 +1,7 @@
 import subprocess
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.task_graph_tmux import PaneInfo, TmuxClient
 
@@ -43,3 +44,21 @@ class TmuxClientTests(unittest.TestCase):
 
         self.assertEqual("%11", pane_id)
         self.assertEqual(PaneInfo(pane_id="%10", pid=1234), info)
+
+    def test_pane_is_not_live_when_tmux_no_longer_lists_it(self):
+        def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 1, "", "no such pane")
+
+        self.assertFalse(TmuxClient(runner=runner).pane_is_live("%10", 1234))
+
+    @patch("scripts.task_graph_tmux.os.kill", side_effect=ProcessLookupError)
+    def test_pane_is_not_live_when_tmux_retains_a_dead_pane(self, kill):
+        self.assertFalse(TmuxClient(runner=FakeRunner()).pane_is_live("%10", 1234))
+
+        kill.assert_called_once_with(1234, 0)
+
+    @patch("scripts.task_graph_tmux.os.kill")
+    def test_pane_is_live_when_tmux_pid_and_process_match(self, kill):
+        self.assertTrue(TmuxClient(runner=FakeRunner()).pane_is_live("%10", 1234))
+
+        kill.assert_called_once_with(1234, 0)

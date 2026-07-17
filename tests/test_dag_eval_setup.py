@@ -20,6 +20,20 @@ class MaterializeDagEvalCaseTests(unittest.TestCase):
         self.assertIn("Each taskFile must be only its .md filename", _CODEX_PROMPT)
         self.assertIn("not a path", _CODEX_PROMPT)
 
+    def test_generation_prompt_maps_dag_ids_to_task_file_dependency_filenames(self):
+        self.assertIn("dag.json dependsOn arrays contain task IDs", _CODEX_PROMPT)
+        self.assertRegex(
+            _CODEX_PROMPT,
+            r"## Dependencies section contains the matching taskFile\s+\.md filenames",
+        )
+        self.assertRegex(
+            _CODEX_PROMPT,
+            r"validate every task-file dependency against the referenced task's\s+taskFile",
+        )
+        self.assertIn(
+            "correct the artifacts and revalidate before reporting success", _CODEX_PROMPT
+        )
+
     def test_creates_a_clean_git_repository_from_a_case_fixture(self):
         with tempfile.TemporaryDirectory() as temp:
             repo_dir = materialize_case(CASES / "001-disjoint", Path(temp) / "repo")

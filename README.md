@@ -65,6 +65,18 @@ python3 scripts/task_graph_cli.py resume <plan-slug> <run-id>
 scheduling. It reattaches to the live controller when possible and otherwise
 starts exactly one replacement in the plan tmux session.
 
+For an opt-in integration check of the controller itself, run:
+
+```bash
+python3 scripts/task_graph_cli.py eval-controller
+```
+
+This command creates temporary Git repositories and isolated tmux sessions. It
+uses a persisted absolute scripted-worker command to verify parallel and serial
+integration, retry and terminal-failure handling, and live/dead-controller
+resume behavior. All temporary repositories and sessions are removed after each
+scenario; the regular unit-test command below does not run these evals.
+
 ## Evaluation
 
 Run deterministic validation and behavior-case tests with:

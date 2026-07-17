@@ -24,9 +24,18 @@ Read plan.md, inspect the repository source and current Git status, then create
 .agent/<plan-slug>/dag.json. You are explicitly authorized to create .agent/.
 Do not modify plan.md or source files.
 
-You must use filesystem tools to write the artifacts. Before your final answer,
-verify that the canonical dag.json exists and that its task-file dependencies
-match its dependsOn values.
+You must use filesystem tools to write the artifacts. Dependency naming is a
+strict ID-to-filename mapping: dag.json dependsOn arrays contain task IDs,
+while each task brief's ## Dependencies section contains the matching taskFile
+.md filenames. For example, a DAG value of
+"dependsOn": ["001-add-config-parser"] requires the dependent task brief to
+list "- 001-add-config-parser.md" under ## Dependencies.
+
+Before your final answer, verify that the canonical dag.json exists. For every
+dependsOn ID, validate every task-file dependency against the referenced task's
+taskFile: find the task with that ID and confirm its .md filename, rather than
+its bare ID, appears in the dependent brief. If any artifact is inconsistent,
+correct the artifacts and revalidate before reporting success.
 
 Each task file must contain Type, Goal, Context, Scope, Out Of Scope,
 Dependencies, Parallel, Predicted Paths and Symbols, Acceptance Criteria, and
@@ -40,7 +49,8 @@ surfaces are demonstrably disjoint. Serialize shared files, symbols, contracts,
 tests, generated artifacts, or uncertain surfaces. Preserve source-plan order
 when serialization has no natural prerequisite. If dirty local changes overlap
 a task, mark it non-parallel-safe and explain that it requires a clean base.
-Task-file Dependencies must match dag.json dependsOn.\
+Task-file Dependencies must use the corresponding taskFile filenames for each
+dag.json dependsOn task ID.\
 """
 
 
