@@ -47,7 +47,6 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("run_id")
     controller = subcommands.add_parser("controller", help=argparse.SUPPRESS)
     controller.add_argument("--run-dir", required=True, type=Path)
-    subcommands.add_parser("eval-controller", help="run opt-in controller integration evals")
     return parser
 
 
@@ -188,10 +187,6 @@ def main() -> int:
             print(start(args.plan_slug, args.max_workers, args.worker_command))
         elif args.action == "resume":
             print(resume(args.plan_slug, args.run_id))
-        elif args.action == "eval-controller":
-            from scripts.task_graph_controller_eval import run_controller_evals
-
-            run_controller_evals()
         else:
             run_controller(args.run_dir)
     except TaskGraphRuntimeError as exc:

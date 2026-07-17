@@ -65,36 +65,13 @@ python3 scripts/task_graph_cli.py resume <plan-slug> <run-id>
 scheduling. It reattaches to the live controller when possible and otherwise
 starts exactly one replacement in the plan tmux session.
 
-For an opt-in integration check of the controller itself, run:
-
-```bash
-python3 scripts/task_graph_cli.py eval-controller
-```
-
-This command creates temporary Git repositories and isolated tmux sessions. It
-uses a persisted absolute scripted-worker command to verify parallel and serial
-integration, retry and terminal-failure handling, and live/dead-controller
-resume behavior. All temporary repositories and sessions are removed after each
-scenario; the regular unit-test command below does not run these evals.
-
 ## Evaluation
 
-Run deterministic validation and behavior-case tests with:
+Run deterministic validation with:
 
 ```bash
 python3 -m unittest discover
 ```
 
-Use `scripts/dag_validation.py` to validate a generated DAG and its task-file dependencies. Behavior cases under `evals/cases/` pair an agent prompt and repository fixture with explicit scheduling assertions; score an agent-produced plan directory with:
-
-```bash
-python3 scripts/dag_eval_setup.py --case evals/cases/001-disjoint
-```
-
-By default, the setup script materializes the case in a cleaned temporary repository,
-runs `codex exec`, loads the generated `dag.json` into memory, validates it against
-the generated task files, and removes the temporary repository before exiting.
-
-`--repo PATH` is only for debugging a failed run; it intentionally keeps the generated repository and the path must not already exist.
-
-The tracked `repository/` directories are templates. The setup command copies one into a new destination, initializes and commits a baseline Git repository, then applies the case's declared uncommitted changes.
+For opt-in behavior-case and controller evaluation workflows, see the contributor
+guide in [`evals/README.md`](evals/README.md).

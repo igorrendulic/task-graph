@@ -10,10 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-try:
-    from scripts.dag_case_evaluator import evaluate_case_dag
-except ModuleNotFoundError:  # Direct execution: python3 scripts/dag_eval_setup.py
-    from dag_case_evaluator import evaluate_case_dag
+from evals.case_evaluator import evaluate_case_dag
 
 
 _CODEX_PROMPT = """\
@@ -43,12 +40,20 @@ Test Notes. The DAG must use schemaVersion 1. Each task needs id, taskFile,
 title, instructions, predictedPaths, predictedSymbols, dependsOn, parallelSafe,
 and schedulingRationale. Each taskFile must be only its .md filename (for
 example, "001-add-schema.md"), not a path.
+The root-level planSlug must be non-empty and equal the .agent/<plan-slug>/
+directory name containing dag.json.
 
 Schedule conservatively: tasks are parallel only when their complete edit
 surfaces are demonstrably disjoint. Serialize shared files, symbols, contracts,
 tests, generated artifacts, or uncertain surfaces. Preserve source-plan order
 when serialization has no natural prerequisite. If dirty local changes overlap
 a task, mark it non-parallel-safe and explain that it requires a clean base.
+Each schedulingRationale must name the basis for serialization or parallel
+safety. For overlapping edits, use `shared` and name the shared file, symbol,
+contract, test, or artifact. For example: "It depends on task 001 because both tasks modify the shared `src/config.py` module and configuration tests." Use
+`disjoint` for demonstrably separate surfaces, `uncertain` when the surface
+cannot be established confidently, and `clean base` when dirty local changes
+require one.
 Task-file Dependencies must use the corresponding taskFile filenames for each
 dag.json dependsOn task ID.\
 """

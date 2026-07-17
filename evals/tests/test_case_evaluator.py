@@ -5,13 +5,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.dag_case_evaluator import evaluate_case
+from evals.case_evaluator import evaluate_case
 
 
 class EvaluateDagCaseTests(unittest.TestCase):
-    def test_cli_runs_as_a_script(self):
+    def test_cli_runs_as_a_module(self):
         result = subprocess.run(
-            [sys.executable, "scripts/dag_case_evaluator.py", "--help"],
+            [sys.executable, "-m", "evals.case_evaluator", "--help"],
             capture_output=True,
             text=True,
         )

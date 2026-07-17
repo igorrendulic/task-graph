@@ -6,18 +6,19 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.task_graph_controller_eval import (
+from evals.run_controller import (
     _controller_is_live,
     _scenario_diagnostics,
     _write_worker,
+    main,
     run_controller_evals,
 )
 
 
 class TaskGraphControllerEvalTests(unittest.TestCase):
-    @patch("scripts.task_graph_controller_eval._run_scenario")
-    @patch("scripts.task_graph_controller_eval._require_executables")
-    @patch("scripts.task_graph_controller_eval.time.monotonic")
+    @patch("evals.run_controller._run_scenario")
+    @patch("evals.run_controller._require_executables")
+    @patch("evals.run_controller.time.monotonic")
     def test_reports_each_scenario_and_a_passing_summary(self, monotonic, require_executables, run_scenario):
         monotonic.side_effect = [10.0, 10.25, 11.0, 11.5, 12.0, 12.75, 13.0, 14.0, 15.0, 16.25]
         output = StringIO()
@@ -35,9 +36,9 @@ class TaskGraphControllerEvalTests(unittest.TestCase):
         self.assertIn("Summary: 5 passed, 0 failed\n", output.getvalue())
         require_executables.assert_called_once_with()
 
-    @patch("scripts.task_graph_controller_eval._run_scenario", side_effect=RuntimeError("boom"))
-    @patch("scripts.task_graph_controller_eval._require_executables")
-    @patch("scripts.task_graph_controller_eval.time.monotonic", side_effect=[10.0, 10.5])
+    @patch("evals.run_controller._run_scenario", side_effect=RuntimeError("boom"))
+    @patch("evals.run_controller._require_executables")
+    @patch("evals.run_controller.time.monotonic", side_effect=[10.0, 10.5])
     def test_reports_a_failed_scenario_without_a_successful_summary(
         self, monotonic, require_executables, run_scenario
     ):
@@ -62,13 +63,13 @@ class TaskGraphControllerEvalTests(unittest.TestCase):
 
             self.assertTrue(worker.read_text(encoding="utf-8").startswith(f"#!{sys.executable}\n"))
 
-    @patch("scripts.task_graph_controller_eval.TmuxClient.pane_is_live", return_value=False)
+    @patch("evals.run_controller.TmuxClient.pane_is_live", return_value=False)
     def test_controller_liveness_uses_the_saved_pane_pid_pair(self, pane_is_live):
         self.assertFalse(_controller_is_live({"paneId": "%10", "pid": 1234}))
 
         pane_is_live.assert_called_once_with("%10", 1234)
 
-    @patch("scripts.task_graph_controller_eval._tmux")
+    @patch("evals.run_controller._tmux")
     def test_failure_diagnostics_include_scenario_tmux_and_controller_state(self, tmux):
         tmux.side_effect = [
             subprocess.CompletedProcess(["tmux"], 0, "", ""),
@@ -85,3 +86,10 @@ class TaskGraphControllerEvalTests(unittest.TestCase):
         self.assertIn("tmux has-session: returncode=0", diagnostics)
         self.assertIn("tmux list-windows: returncode=1, stderr='no such session'", diagnostics)
         self.assertIn('controller={"paneId": "%10", "pid": 1234}', diagnostics)
+
+    @patch("evals.run_controller.run_controller_evals")
+    @patch.object(sys, "argv", ["run_controller.py"])
+    def test_module_entry_point_runs_controller_evals(self, run_evals):
+        self.assertEqual(0, main())
+
+        run_evals.assert_called_once_with()

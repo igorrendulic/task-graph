@@ -24,6 +24,7 @@ Use this reference only for the `tasks` workflow. It defines how to create task 
    - Serialize tasks that share a file, symbol, public contract, test, generated artifact, or any uncertain surface.
    - When overlapping tasks have no natural prerequisite, preserve source-plan order: the later task depends on the earlier task.
    - If dirty local changes overlap a task's predicted surface, still generate the DAG, but set `parallelSafe: false` and explain that a clean base is required before it can be safely executed. Serialize it against potentially overlapping work in source-plan order.
+   - Every `schedulingRationale` must explicitly identify the applicable scheduling category: a `shared` surface (and the shared file, symbol, contract, test, or artifact), a `disjoint` surface, `uncertain` overlap, or a `clean base` requirement. For example: "It depends on task 001 because both tasks modify the shared `src/config.py` module and configuration tests."
 7. Keep task-file `Dependencies` and DAG `dependsOn` consistent using the task ID-to-filename mapping. `dag.json.dependsOn` contains prerequisite task IDs, while each task brief's `## Dependencies` section contains the corresponding prerequisite `taskFile` filenames. For example, if task `002-add-serializer` depends on task `001-add-config-parser`, write `"dependsOn": ["001-add-config-parser"]` in `dag.json` and `- 001-add-config-parser.md` in `002-add-serializer.md`.
 8. Before replacing the canonical DAG or reporting success, validate the staged graph: every task ID is unique, every task filename is unique, each dependency names a known task, no task depends on itself, and the graph is acyclic. Use `python3 <skill-dir>/scripts/dag_validation.py --dag <staged-dag.json> --plan-dir <plan-dir>` when the validator is available. Invalid references or cycles must fail the run without writing a successful `dag.json`.
 9. Write or refresh all task files first, then regenerate `kanban.md` from the task folders and generate or replace `.agent/<plan-slug>/dag.json` in the same `tasks` run. On rerun, refresh the DAG from the current approved plan and repository state rather than merging stale scheduling data.
@@ -70,7 +71,7 @@ Rules:
   - 001-add-config-parser.md
   ```
 - `parallelSafe` describes whether the task has a demonstrably disjoint edit surface. It never authorizes execution that violates `dependsOn`.
-- `schedulingRationale` explains the dependency and parallel-safety decision, including shared surfaces, uncertainty, preserved source order, or dirty-worktree requirements.
+- `schedulingRationale` explains the dependency and parallel-safety decision. Its wording explicitly identifies the applicable `shared` surface, `disjoint` surface, `uncertain` overlap, or `clean base` requirement, including the concrete shared file, symbol, contract, test, or artifact when applicable.
 
 ## v1 boundary
 

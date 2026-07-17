@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import unittest
+from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -24,21 +25,18 @@ class TaskGraphCliTests(unittest.TestCase):
 
         self.assertEqual("/tmp/controller-eval-worker", args.worker_command)
 
-    def test_controller_eval_is_a_dedicated_cli_command(self):
-        args = build_parser().parse_args(["eval-controller"])
+    def test_eval_controller_is_not_a_runtime_cli_command(self):
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit) as error:
+            build_parser().parse_args(["eval-controller"])
 
-        self.assertEqual("eval-controller", args.action)
+        self.assertEqual(2, error.exception.code)
 
-    @patch("scripts.task_graph_controller_eval.run_controller_evals")
-    @patch.object(sys, "argv", ["task_graph_cli.py", "eval-controller"])
-    def test_controller_eval_command_runs_the_opt_in_harness(self, run_evals):
-        output = StringIO()
+    def test_resume_remains_a_runtime_cli_command(self):
+        args = build_parser().parse_args(["resume", "demo-plan", "run-1"])
 
-        with patch("sys.stdout", output):
-            self.assertEqual(0, task_graph_cli.main())
-
-        run_evals.assert_called_once_with()
-        self.assertEqual("", output.getvalue())
+        self.assertEqual("resume", args.action)
+        self.assertEqual("demo-plan", args.plan_slug)
+        self.assertEqual("run-1", args.run_id)
 
     def test_controller_command_uses_the_immutable_run_directory(self):
         command = controller_command(Path("/repo/.agent/demo/runs/run-1"))
@@ -55,3 +53,6 @@ class TaskGraphCliTests(unittest.TestCase):
         )
 
         self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("start", result.stdout)
+        self.assertIn("resume", result.stdout)
+        self.assertNotIn("eval-controller", result.stdout)

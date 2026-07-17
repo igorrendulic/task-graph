@@ -9,7 +9,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.dag_eval_setup import _CODEX_PROMPT, _run_codex, materialize_case, run_case
+from evals.run_case import _CODEX_PROMPT, _run_codex, materialize_case, run_case
 
 
 CASES = Path("evals/cases")
@@ -19,6 +19,14 @@ class MaterializeDagEvalCaseTests(unittest.TestCase):
     def test_generation_prompt_requires_task_file_basenames(self):
         self.assertIn("Each taskFile must be only its .md filename", _CODEX_PROMPT)
         self.assertIn("not a path", _CODEX_PROMPT)
+
+    def test_generation_prompt_requires_plan_slug_to_match_artifact_directory(self):
+        self.assertIn("root-level planSlug", _CODEX_PROMPT)
+        self.assertRegex(
+            _CODEX_PROMPT,
+            r"(?s)root-level planSlug must be non-empty.*equal the "
+            r"\.agent/<plan-slug>/\s*directory name",
+        )
 
     def test_generation_prompt_maps_dag_ids_to_task_file_dependency_filenames(self):
         self.assertIn("dag.json dependsOn arrays contain task IDs", _CODEX_PROMPT)
@@ -32,6 +40,17 @@ class MaterializeDagEvalCaseTests(unittest.TestCase):
         )
         self.assertIn(
             "correct the artifacts and revalidate before reporting success", _CODEX_PROMPT
+        )
+
+    def test_generation_prompt_requires_shared_scheduling_rationales(self):
+        self.assertRegex(
+            _CODEX_PROMPT,
+            r"Each schedulingRationale must name the basis for serialization",
+        )
+        self.assertIn("shared", _CODEX_PROMPT)
+        self.assertRegex(
+            _CODEX_PROMPT,
+            r"both\s+tasks modify the shared `src/config\.py` module and configuration tests",
         )
 
     def test_creates_a_clean_git_repository_from_a_case_fixture(self):
@@ -77,7 +96,7 @@ class MaterializeDagEvalCaseTests(unittest.TestCase):
                 settings.validate_port("0")
             self.assertIn("# existing local edit", (dirty / "src" / "settings.py").read_text())
 
-    @patch("scripts.dag_eval_setup._run_codex")
+    @patch("evals.run_case._run_codex")
     def test_runs_codex_then_prints_and_scores_generated_dag(self, run_codex):
         def write_generated_artifacts(repo_dir: Path, codex_bin: str) -> list[str]:
             artifacts = repo_dir / ".agent" / "disjoint-changes"
@@ -107,7 +126,7 @@ class MaterializeDagEvalCaseTests(unittest.TestCase):
         self.assertIn('"planSlug": "disjoint-changes"', output.getvalue())
         run_codex.assert_called_once()
 
-    @patch("scripts.dag_eval_setup._run_codex")
+    @patch("evals.run_case._run_codex")
     def test_run_case_without_repo_uses_cleaned_temporary_repository(self, run_codex):
         generated_repo_dirs: list[Path] = []
 
@@ -140,7 +159,7 @@ class MaterializeDagEvalCaseTests(unittest.TestCase):
         self.assertEqual(1, len(generated_repo_dirs))
         self.assertFalse(generated_repo_dirs[0].exists())
 
-    @patch("scripts.dag_eval_setup._run_codex", return_value=[])
+    @patch("evals.run_case._run_codex", return_value=[])
     def test_reports_when_codex_exits_without_a_dag(self, run_codex):
         with tempfile.TemporaryDirectory() as temp:
             errors = run_case(CASES / "001-disjoint", Path(temp) / "repo")
@@ -150,7 +169,7 @@ class MaterializeDagEvalCaseTests(unittest.TestCase):
         self.assertIn("Inspect", errors[0])
         run_codex.assert_called_once()
 
-    @patch("scripts.dag_eval_setup._run_codex", return_value=[])
+    @patch("evals.run_case._run_codex", return_value=[])
     def test_ephemeral_missing_dag_error_does_not_reference_deleted_repo(self, run_codex):
         errors = run_case(CASES / "001-disjoint")
 
@@ -160,7 +179,7 @@ class MaterializeDagEvalCaseTests(unittest.TestCase):
         self.assertNotIn("codex-output.txt", errors[0])
         run_codex.assert_called_once()
 
-    @patch("scripts.dag_eval_setup.subprocess.Popen")
+    @patch("evals.run_case.subprocess.Popen")
     def test_streams_codex_output_and_saves_the_transcript(self, popen):
         process = popen.return_value
         process.stdout = ["planning tasks\n", "writing dag.json\n"]

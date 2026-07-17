@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 import subprocess
@@ -537,3 +538,18 @@ def _tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     if check and result.returncode != 0:
         raise TaskGraphRuntimeError(result.stderr.strip() or "tmux command failed")
     return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run Task Graph controller integration evals")
+    parser.parse_args()
+    try:
+        run_controller_evals()
+    except TaskGraphRuntimeError as exc:
+        print(f"task-graph eval: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

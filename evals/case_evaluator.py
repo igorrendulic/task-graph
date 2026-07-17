@@ -7,14 +7,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-try:
-    from scripts.dag_validation import (
-        DagValidationError,
-        validate_dag_artifacts,
-        validate_dag_file,
-    )
-except ModuleNotFoundError:  # Direct execution: python3 scripts/dag_case_evaluator.py
-    from dag_validation import DagValidationError, validate_dag_artifacts, validate_dag_file
+from scripts.dag_validation import (
+    DagValidationError,
+    validate_dag_artifacts,
+    validate_dag_file,
+)
 
 
 def evaluate_case(case_dir: Path, artifacts_dir: Path) -> list[str]:

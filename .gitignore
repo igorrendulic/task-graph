@@ -3,3 +3,28 @@ graphify-out/
 .worktrees/
 .vscode/
 docs/
+
+# Python environments and generated files
+.venv/
+venv/
+env/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+
+# Test, coverage, and analysis caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and editor/OS metadata
+.env
+.env.*
+!.env.example
+.idea/
+.DS_Store
