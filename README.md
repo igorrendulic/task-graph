@@ -83,13 +83,15 @@ branch to inspect it or run local commands:
 
 > Invoke `$task-graph checkout` for `<plan-slug>` run `<run-id>`.
 
-`checkout` accepts only succeeded, unmerged runs and requires both checkouts
-clean (except for that plan's run artifacts in the primary checkout). It removes
-the integration worktree without force, releases and checks out the feature
+`checkout` accepts only succeeded, unmerged runs and requires the primary
+checkout to be clean (except for that plan's run artifacts). It leaves the
+integration worktree intact and switches the primary checkout to the feature
 branch, then prints the command to return to the recorded base branch. Run it,
 then invoke `$task-graph merge` for the same plan and run to create the `--no-ff`
-promotion commit. On conflict, Task Graph aborts safely and leaves the target
-branch unchanged.
+promotion commit. After a successful merge, a clean existing integration
+worktree prompts `Remove the clean integration worktree? [y/N]`; only explicit
+`y` removes it without force, while declining or local changes retain it. On
+conflict, Task Graph aborts safely and leaves the target branch unchanged.
 
 ## Install without cloning
 
@@ -206,11 +208,10 @@ python3 scripts/task_graph_cli.py checkout <plan-slug> --run-id <run-id>
 ```
 
 Checkout is available only for succeeded, unmerged runs. It requires the
-primary checkout to be clean except for `.agent/<plan-slug>/runs/` artifacts;
-if the generated integration worktree exists, it must also be clean. The
-command removes that integration worktree without force before switching the
-primary checkout to the feature branch, then prints exact commands to return to
-the recorded base branch and merge.
+primary checkout to be clean except for `.agent/<plan-slug>/runs/` artifacts,
+leaves the integration worktree intact, and switches the primary checkout to
+the feature branch. It then prints exact commands to return to the recorded
+base branch and merge.
 
 After returning to the base branch printed by `checkout`, promote the run with:
 
@@ -226,6 +227,9 @@ creates a `--no-ff` merge commit with a Task Graph message. If Git reports a
 conflict, Task Graph aborts the merge and leaves the target branch unchanged.
 Successful promotions persist the target branch, merge SHA, and timestamp, so
 repeating the command reports `already merged` without creating another merge.
+After a successful merge, a clean existing integration worktree prompts `Remove
+the clean integration worktree? [y/N]`; only explicit `y` removes it without
+force. Declining the prompt or having local changes retains the worktree.
 
 When a controller completes, it makes one best-effort macOS desktop alert. A
 successful run's alert includes the exact `checkout` command first, followed by
