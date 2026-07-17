@@ -3,6 +3,7 @@ graphify-out/
 .worktrees/
 .vscode/
 docs/
+.superpowers/
 
 # Python environments and generated files
 .venv/
