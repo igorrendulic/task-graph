@@ -19,6 +19,10 @@ fail() {
   exit 1
 }
 
+path_exists() {
+  [ -e "$1" ] || [ -L "$1" ]
+}
+
 ref="$DEFAULT_REF"
 force=0
 
@@ -56,7 +60,7 @@ codex_home="${CODEX_HOME:-$HOME/.codex}"
 target_parent="$codex_home/skills"
 target="$target_parent/task-graph"
 
-if [ -e "$target" ] && [ "$force" -ne 1 ]; then
+if path_exists "$target" && [ "$force" -ne 1 ]; then
   fail "Task Graph is already installed at $target; rerun with --force to replace it"
 fi
 
@@ -66,11 +70,11 @@ backup=""
 
 cleanup() {
   status=$?
-  if [ -n "$backup" ] && [ -e "$backup" ] && [ ! -e "$target" ]; then
+  if [ -n "$backup" ] && path_exists "$backup" && ! path_exists "$target"; then
     mv "$backup" "$target" || true
   fi
   [ -n "$candidate" ] && [ -e "$candidate" ] && rm -rf "$candidate"
-  [ -n "$backup" ] && [ -e "$backup" ] && rm -rf "$backup"
+  [ -n "$backup" ] && path_exists "$backup" && rm -rf "$backup"
   rm -rf "$temporary_root"
   exit "$status"
 }
@@ -102,7 +106,7 @@ candidate="$(mktemp -d "$target_parent/.task-graph-new.XXXXXX")"
 rmdir "$candidate"
 mv "$staged_skill" "$candidate"
 
-if [ -e "$target" ]; then
+if path_exists "$target"; then
   backup="$(mktemp -d "$target_parent/.task-graph-backup.XXXXXX")"
   rmdir "$backup"
   mv "$target" "$backup"

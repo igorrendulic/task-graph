@@ -106,6 +106,10 @@ cp -R "$MOCK_ARCHIVE_SOURCE"/. "$destination/task-graph-fixture/"
         self.target.mkdir(parents=True)
         (self.target / "existing.txt").write_text("preserve me\n")
 
+    def _write_dangling_install_link(self):
+        self.target.parent.mkdir(parents=True)
+        self.target.symlink_to(self.root / "missing-install")
+
     def test_clean_install_copies_the_required_skill_tree(self):
         result = self._run_installer()
 
@@ -124,12 +128,35 @@ cp -R "$MOCK_ARCHIVE_SOURCE"/. "$destination/task-graph-fixture/"
         self.assertIn("--force", result.stderr)
         self.assertEqual("preserve me\n", (self.target / "existing.txt").read_text())
 
+    def test_dangling_install_link_requires_force(self):
+        self._write_dangling_install_link()
+
+        result = self._run_installer()
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("--force", result.stderr)
+        self.assertTrue(self.target.is_symlink())
+
+    def test_force_replaces_a_dangling_install_link(self):
+        self._write_dangling_install_link()
+
+        result = self._run_installer("--force")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertFalse(self.target.is_symlink())
+        self.assertTrue((self.target / "SKILL.md").is_file())
+
     def test_force_replaces_an_existing_install_only_after_staging_succeeds(self):
         self._write_existing_install()
 
         failed_result = self._run_installer("--force", MOCK_CURL_FAIL="1")
 
         self.assertNotEqual(0, failed_result.returncode)
+        self.assertEqual("preserve me\n", (self.target / "existing.txt").read_text())
+
+        extraction_failed_result = self._run_installer("--force", MOCK_TAR_FAIL="1")
+
+        self.assertNotEqual(0, extraction_failed_result.returncode)
         self.assertEqual("preserve me\n", (self.target / "existing.txt").read_text())
 
         result = self._run_installer("--force")
