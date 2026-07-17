@@ -43,14 +43,19 @@ integration worktree, then returns a command such as:
 tmux attach-session -t task-graph-<plan-slug>-<run-id>
 ```
 
-Run that command to observe the controller and worker windows. The controller
-is the only process that writes state or cherry-picks worker commits. It runs
-only dependency-ready tasks, uses fresh worktrees for both the first attempt and
-one repair attempt, and blocks only descendants after a second failure.
+Run that command to observe the controller and worker windows. Each worker pane
+shows readable live progress for commands, file changes, agent messages, and
+completion or error events. Completed and failed worker panes remain visible so
+their final output and tmux exit-status indicator can be inspected. The
+controller is the only process that writes state or cherry-picks worker commits.
+It runs only dependency-ready tasks, uses fresh worktrees for both the first
+attempt and one repair attempt, and blocks only descendants after a second
+failure.
 
 State is written to `runs/<run-id>/state.json` with a run lock and durable
-atomic replacement. Each attempt retains stdout, stderr, and a combined log in
-`runs/<run-id>/logs/`; failed worktrees remain available for investigation.
+atomic replacement. Each attempt retains raw stdout, raw stderr, and a
+chronological combined log in `runs/<run-id>/logs/`; failed worktrees remain
+available for investigation.
 Workers run focused tests from their task briefs and must make exactly one
 non-merge commit. The controller deliberately does not run a final full suite
 in this MVP.

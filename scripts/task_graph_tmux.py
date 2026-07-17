@@ -62,7 +62,7 @@ class TmuxClient:
                 name,
                 "-c",
                 str(cwd),
-                command,
+                f"tmux set-option -p remain-on-exit on && exec {command}",
             ]
         )
 
