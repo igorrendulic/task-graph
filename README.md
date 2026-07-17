@@ -26,6 +26,45 @@ Each `tasks` run validates unique task IDs and filenames, known dependencies, se
 
 Task Graph v1 plans work only. It does not create feature branches, task branches, worktrees, worker sessions, merges, or pull requests. Future execution tooling can consume `dependsOn` to run and integrate tasks in dependency order.
 
+## Execution MVP
+
+The execution controller consumes a validated planning DAG without changing its
+schema. Start a clean, committed plan with a fixed worker limit:
+
+```bash
+python3 scripts/task_graph_cli.py start <plan-slug> --max-workers 4
+```
+
+`start` snapshots `dag.json` and every resolved task brief below
+`.agent/<plan-slug>/runs/<run-id>/input/`, creates a feature branch and an
+integration worktree, then returns a command such as:
+
+```bash
+tmux attach-session -t task-graph-<plan-slug>-<run-id>
+```
+
+Run that command to observe the controller and worker windows. The controller
+is the only process that writes state or cherry-picks worker commits. It runs
+only dependency-ready tasks, uses fresh worktrees for both the first attempt and
+one repair attempt, and blocks only descendants after a second failure.
+
+State is written to `runs/<run-id>/state.json` with a run lock and durable
+atomic replacement. Each attempt retains stdout, stderr, and a combined log in
+`runs/<run-id>/logs/`; failed worktrees remain available for investigation.
+Workers run focused tests from their task briefs and must make exactly one
+non-merge commit. The controller deliberately does not run a final full suite
+in this MVP.
+
+To recover after interruption:
+
+```bash
+python3 scripts/task_graph_cli.py resume <plan-slug> <run-id>
+```
+
+`resume` uses the saved input snapshot and reconciles integration state before
+scheduling. It reattaches to the live controller when possible and otherwise
+starts exactly one replacement in the plan tmux session.
+
 ## Evaluation
 
 Run deterministic validation and behavior-case tests with:
