@@ -44,6 +44,7 @@ class TmuxClientTests(unittest.TestCase):
 
         self.assertEqual("%11", pane_id)
         self.assertEqual(PaneInfo(pane_id="%10", pid=1234), info)
+        self.assertIn("tmux set-option -p remain-on-exit on && exec worker command", runner.calls[0])
 
     def test_pane_is_not_live_when_tmux_no_longer_lists_it(self):
         def runner(command: list[str]) -> subprocess.CompletedProcess[str]:

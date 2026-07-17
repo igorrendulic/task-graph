@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shlex
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -221,6 +222,8 @@ the Task Graph controller/runtime artifacts.
         stderr = Path(attempt["stderrLog"])
         combined = Path(attempt["combinedLog"])
         exit_file = Path(attempt["exitFile"])
+        formatter = Path(__file__).with_name("task_graph_jsonl.py")
+        stream_template = combined.parent / ".task-graph-stream.XXXXXX"
         codex = " ".join(
             [
                 shlex.quote(self.codex_bin),
@@ -233,12 +236,23 @@ the Task Graph controller/runtime artifacts.
                 shlex.quote(self.build_worker_prompt(task_id, repair_context)),
             ]
         )
-        return (
-            f"{codex} >{shlex.quote(str(stdout))} 2>{shlex.quote(str(stderr))}; code=$?; "
-            f"{{ printf '[stdout] %s\\n' \"$(date -u +%FT%TZ)\"; cat {shlex.quote(str(stdout))}; "
-            f"printf '[stderr] %s\\n' \"$(date -u +%FT%TZ)\"; cat {shlex.quote(str(stderr))}; }} "
-            f">{shlex.quote(str(combined))}; printf '%s\\n' \"$code\" >{shlex.quote(str(exit_file))}; exit \"$code\""
+        script = (
+            f"stream_dir=$(mktemp -d {shlex.quote(str(stream_template))}) || exit 1; "
+            "stdout_pipe=\"$stream_dir/stdout\"; stderr_pipe=\"$stream_dir/stderr\"; "
+            "combined_pipe=\"$stream_dir/combined\"; "
+            "trap 'rm -f -- \"$stdout_pipe\" \"$stderr_pipe\" \"$combined_pipe\"; rmdir \"$stream_dir\"' EXIT; "
+            "mkfifo \"$stdout_pipe\" \"$stderr_pipe\" \"$combined_pipe\" || exit 1; "
+            f"cat <\"$combined_pipe\" >{shlex.quote(str(combined))} & combined_pid=$!; "
+            f"tee {shlex.quote(str(stdout))} <\"$stdout_pipe\" "
+            "| tee \"$combined_pipe\" "
+            f"| {shlex.quote(sys.executable)} {shlex.quote(str(formatter))} & stdout_pid=$!; "
+            f"tee {shlex.quote(str(stderr))} <\"$stderr_pipe\" "
+            "| tee \"$combined_pipe\" >&2 & stderr_pid=$!; "
+            f"{codex} >\"$stdout_pipe\" 2>\"$stderr_pipe\"; code=$?; "
+            "wait \"$stdout_pid\"; wait \"$stderr_pid\"; wait \"$combined_pid\"; "
+            f"printf '%s\\n' \"$code\" >{shlex.quote(str(exit_file))}; exit \"$code\""
         )
+        return f"bash -o pipefail -c {shlex.quote(script)}"
 
     def _record_failure(self, task_id: str, summary: str) -> None:
         task_state = self.state["tasks"][task_id]

@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -80,6 +82,61 @@ def _make_plan(root: Path) -> Path:
 
 
 class TaskGraphControllerTests(unittest.TestCase):
+    def test_worker_command_streams_formatted_output_and_preserves_raw_logs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plan = _make_plan(root)
+            run = plan / "runs" / "run-1"
+            snapshot = create_run_snapshot(plan, run)
+            state = create_state(
+                run_id="run-1", plan_slug="demo", repository=str(root),
+                feature_branch="task-graph/demo/run-1/feature", base_commit="base",
+                snapshot_digest=snapshot.dag_digest, task_digests=snapshot.task_digests,
+                max_workers=1, task_ids=["001-first", "002-second"],
+            )
+            state["integrationWorktree"] = str(run / "integration")
+            write_state(run, state)
+            worker = root / "worker.py"
+            worker.write_text(
+                f"#!{sys.executable}\n"
+                "import json\n"
+                "import sys\n"
+                "print(json.dumps({'type': 'turn.started'}), flush=True)\n"
+                "print('worker diagnostic', file=sys.stderr, flush=True)\n"
+                "print(json.dumps({'type': 'turn.completed'}), flush=True)\n"
+                "raise SystemExit(7)\n",
+                encoding="utf-8",
+            )
+            worker.chmod(worker.stat().st_mode | 0o111)
+            logs = run / "logs"
+            logs.mkdir(parents=True)
+            attempt = {
+                "stdoutLog": str(logs / "worker.stdout"),
+                "stderrLog": str(logs / "worker.stderr"),
+                "combinedLog": str(logs / "worker.log"),
+                "exitFile": str(logs / "worker.exit"),
+            }
+            controller = TaskGraphController(run, git=FakeGit(), tmux=FakeTmux(), codex_bin=str(worker))
+
+            result = subprocess.run(
+                controller._worker_command(root, "001-first", attempt, None),
+                shell=True,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(7, result.returncode, result.stderr)
+            self.assertEqual("[task] started\n[task] completed\n", result.stdout)
+            self.assertEqual("worker diagnostic\n", result.stderr)
+            self.assertIn('"type": "turn.started"', Path(attempt["stdoutLog"]).read_text(encoding="utf-8"))
+            self.assertEqual("worker diagnostic\n", Path(attempt["stderrLog"]).read_text(encoding="utf-8"))
+            combined = Path(attempt["combinedLog"]).read_text(encoding="utf-8")
+            self.assertIn('"type": "turn.started"', combined)
+            self.assertIn("worker diagnostic", combined)
+            self.assertIn('"type": "turn.completed"', combined)
+            self.assertEqual("7\n", Path(attempt["exitFile"]).read_text(encoding="utf-8"))
+
     def test_worker_prompt_embeds_snapshot_dependency_sha_and_repair_context(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -170,7 +227,16 @@ class TaskGraphControllerTests(unittest.TestCase):
             self.assertTrue(Path(attempt["stdoutLog"]).is_file() is False)
             self.assertIn("worker/002-second/attempt-1", git.worker_calls[0][1])
             self.assertTrue((plan / "in-progress" / "002-second.md").is_file())
-            self.assertIn("--json", tmux.commands[0])
+            command = tmux.commands[0]
+            self.assertIn("--json", command)
+            self.assertIn(str(Path(attempt["stdoutLog"])), command)
+            self.assertIn(str(Path(attempt["stderrLog"])), command)
+            self.assertIn(str(Path(attempt["combinedLog"])), command)
+            self.assertIn("task_graph_jsonl.py", command)
+            self.assertIn("mkfifo", command)
+            self.assertIn("combined_pipe", command)
+            self.assertIn("code=$?", command)
+            self.assertIn(str(Path(attempt["exitFile"])), command)
 
     def test_worker_command_comes_from_persisted_run_state(self):
         with tempfile.TemporaryDirectory() as temp:
