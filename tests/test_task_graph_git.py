@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from scripts.task_graph_git import (
+    MergeResult,
     TaskGraphGit,
     TaskGraphGitError,
 )
@@ -25,6 +26,96 @@ def _repo(root: Path) -> None:
 
 
 class TaskGraphGitTests(unittest.TestCase):
+    def test_current_branch_and_branch_existence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            root.mkdir()
+            _repo(root)
+            git = TaskGraphGit(root)
+
+            self.assertEqual(_git(root, "branch", "--show-current"), git.current_branch())
+            self.assertTrue(git.branch_exists(git.current_branch()))
+            self.assertFalse(git.branch_exists("does-not-exist"))
+
+    def test_clean_check_ignores_controller_run_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            root.mkdir()
+            _repo(root)
+            git = TaskGraphGit(root)
+            runtime_file = root / ".agent" / "demo" / "runs" / "run-1" / "state.json"
+            runtime_file.parent.mkdir(parents=True)
+            runtime_file.write_text("{}")
+
+            self.assertTrue(git.is_clean(ignored_prefix=".agent/demo/runs/"))
+            (root / "unrelated.txt").write_text("dirty")
+            self.assertFalse(git.is_clean(ignored_prefix=".agent/demo/runs/"))
+
+    def test_merge_feature_branch_creates_a_no_ff_merge_commit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            root.mkdir()
+            _repo(root)
+            git = TaskGraphGit(root)
+            feature = "task-graph/demo/run-1/feature"
+            feature_worktree = root.parent / "feature"
+            git.create_branch(feature, git.head_sha())
+            git.add_worktree(feature_worktree, feature)
+            (feature_worktree / "feature.txt").write_text("feature")
+            _git(feature_worktree, "add", "feature.txt")
+            _git(feature_worktree, "commit", "--quiet", "-m", "feature")
+
+            result = git.merge_feature_branch(root, feature, "Task Graph demo run run-1")
+
+            self.assertEqual("merged", result.outcome)
+            self.assertEqual(git.head_sha(), result.merge_sha)
+            self.assertEqual(2, len(_git(root, "show", "-s", "--format=%P", "HEAD").split()))
+
+    def test_merge_feature_branch_reports_already_merged_without_second_commit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            root.mkdir()
+            _repo(root)
+            git = TaskGraphGit(root)
+            feature = "task-graph/demo/run-1/feature"
+            feature_worktree = root.parent / "feature"
+            git.create_branch(feature, git.head_sha())
+            git.add_worktree(feature_worktree, feature)
+            (feature_worktree / "feature.txt").write_text("feature")
+            _git(feature_worktree, "add", "feature.txt")
+            _git(feature_worktree, "commit", "--quiet", "-m", "feature")
+            git.merge_feature_branch(root, feature, "Task Graph demo run run-1")
+            head_before = git.head_sha()
+
+            result = git.merge_feature_branch(root, feature, "Task Graph demo run run-1")
+
+            self.assertEqual(MergeResult("already_merged"), result)
+            self.assertEqual(head_before, git.head_sha())
+
+    def test_conflicting_merge_is_aborted_and_leaves_target_unchanged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            root.mkdir()
+            _repo(root)
+            git = TaskGraphGit(root)
+            feature = "task-graph/demo/run-1/feature"
+            feature_worktree = root.parent / "feature"
+            git.create_branch(feature, git.head_sha())
+            git.add_worktree(feature_worktree, feature)
+            (feature_worktree / "baseline.txt").write_text("feature")
+            _git(feature_worktree, "add", "baseline.txt")
+            _git(feature_worktree, "commit", "--quiet", "-m", "feature")
+            (root / "baseline.txt").write_text("base")
+            _git(root, "add", "baseline.txt")
+            _git(root, "commit", "--quiet", "-m", "base")
+            target_head = git.head_sha()
+
+            result = git.merge_feature_branch(root, feature, "Task Graph demo run run-1")
+
+            self.assertEqual("conflict_aborted", result.outcome)
+            self.assertEqual(target_head, git.head_sha())
+            self.assertTrue(git.is_clean())
+
     def test_common_dir_returns_owning_repository_metadata_from_linked_worktree(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "repo"

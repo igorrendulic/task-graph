@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
@@ -15,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.dag_validation import DagValidationError, validate_dag_file
+from scripts.task_graph_git import TaskGraphGit, TaskGraphGitError
 
 
 STATE_SCHEMA_VERSION = 1
@@ -75,13 +75,14 @@ class RunLock:
 
 def ensure_clean_base(repository: Path, plan_slug: str) -> None:
     """Reject changes outside this plan's controller-owned runtime directory."""
-    output = _git(repository, "status", "--porcelain", "--untracked-files=all")
     ignored_prefix = f".agent/{plan_slug}/runs/"
-    dirty = [line for line in output.splitlines() if not _is_runtime_path(line, ignored_prefix)]
-    if dirty:
+    try:
+        clean = TaskGraphGit(repository).is_clean(ignored_prefix=ignored_prefix)
+    except TaskGraphGitError as exc:
+        raise TaskGraphRuntimeError(str(exc)) from exc
+    if not clean:
         raise TaskGraphRuntimeError(
-            "repository is dirty; commit, stash, or remove changes before starting: "
-            + ", ".join(dirty)
+            "repository is dirty; commit, stash, or remove changes before starting"
         )
 
 
@@ -154,6 +155,7 @@ def create_state(
     task_ids: list[str],
     git_common_dir: str,
     worker_command: str = "codex",
+    base_branch: str | None = None,
 ) -> dict[str, Any]:
     """Create the only allowed initial task state for a controller run."""
     if max_workers < 1:
@@ -169,6 +171,7 @@ def create_state(
         "gitCommonDir": str(common_dir),
         "featureBranch": feature_branch,
         "baseCommit": base_commit,
+        "baseBranch": base_branch,
         "dagDigest": snapshot_digest,
         "taskDigests": task_digests,
         "maxWorkers": max_workers,
@@ -237,25 +240,5 @@ def _resolve_task_file(plan_dir: Path, task_file: str) -> Path:
     return found[0]
 
 
-def _is_runtime_path(status_line: str, ignored_prefix: str) -> bool:
-    path = status_line[3:].strip()
-    if " -> " in path:
-        path = path.split(" -> ", 1)[1]
-    return path.replace("\\", "/").startswith(ignored_prefix)
-
-
 def _sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
-
-
-def _git(repository: Path, *args: str) -> str:
-    try:
-        return subprocess.run(
-            ["git", *args],
-            cwd=repository,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-    except subprocess.CalledProcessError as exc:
-        raise TaskGraphRuntimeError(exc.stderr.strip() or "Git command failed") from exc

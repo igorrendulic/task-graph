@@ -22,9 +22,11 @@ Tasks are parallel only when their predicted edit surfaces are demonstrably disj
 
 Each `tasks` run validates unique task IDs and filenames, known dependencies, self-dependencies, and graph acyclicity before it replaces the canonical `dag.json`. Rerunning the command refreshes the per-plan DAG and keeps task-file dependencies aligned with it.
 
-## v1 scope
+## Planning scope
 
-Task Graph v1 plans work only. It does not create feature branches, task branches, worktrees, worker sessions, merges, or pull requests. Future execution tooling can consume `dependsOn` to run and integrate tasks in dependency order.
+The `tasks` workflow plans work only. The execution controller described below
+creates run-scoped branches and worktrees; promotion is always an explicit,
+separate action.
 
 ## Execution MVP
 
@@ -37,7 +39,8 @@ python3 scripts/task_graph_cli.py start <plan-slug> --max-workers 4
 
 `start` snapshots `dag.json` and every resolved task brief below
 `.agent/<plan-slug>/runs/<run-id>/input/`, creates a feature branch and an
-integration worktree, then returns a command such as:
+integration worktree, and records both the base commit and checked-out base
+branch. It then returns a command such as:
 
 ```bash
 tmux attach-session -t task-graph-<plan-slug>-<run-id>
@@ -76,6 +79,38 @@ python3 scripts/task_graph_cli.py resume <plan-slug> <run-id>
 `resume` uses the saved input snapshot and reconciles integration state before
 scheduling. It reattaches to the live controller when possible and otherwise
 starts exactly one replacement in the plan tmux session.
+
+## Inspect and promote a run
+
+Check the newest run for a plan, or select one explicitly:
+
+```bash
+python3 scripts/task_graph_cli.py status <plan-slug>
+python3 scripts/task_graph_cli.py status <plan-slug> --run-id <run-id>
+```
+
+Status is `running`, `succeeded`, `failed`, or `already merged`. Promotion
+always requires the run ID, which avoids accidentally merging a concurrent
+run:
+
+```bash
+python3 scripts/task_graph_cli.py merge <plan-slug> --run-id <run-id>
+```
+
+Only the run's `task-graph/<plan-slug>/<run-id>/feature` branch is eligible for
+promotion. Worker-attempt branches are never merge candidates. The command
+requires every task to be integrated, the recorded base branch to be checked
+out, and a clean checkout except for `.agent/<plan-slug>/runs/` artifacts. It
+creates a `--no-ff` merge commit with a Task Graph message. If Git reports a
+conflict, Task Graph aborts the merge and leaves the target branch unchanged.
+Successful promotions persist the target branch, merge SHA, and timestamp, so
+repeating the command reports `already merged` without creating another merge.
+
+When a controller completes, it makes a best-effort macOS desktop alert. A
+successful run's alert includes the exact `merge` command; a failed run's alert
+includes the exact `status` command. Desktop alerts cannot safely paste or
+execute terminal commands, so run the displayed command yourself from the
+repository.
 
 ## Evaluation
 
