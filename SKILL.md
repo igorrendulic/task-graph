@@ -82,7 +82,10 @@ branch recorded at `start`, and leave the checkout clean except for
 on conflict it aborts safely and leaves the target branch unchanged. A completed
 promotion is recorded in run state, so later attempts report `already merged`.
 
-On macOS the controller sends a best-effort desktop alert when a run completes.
-Success alerts include the exact merge command and failure alerts include the
-status command. Alerts cannot safely paste or execute terminal commands; the
-operator must run the displayed command in a terminal.
+On macOS the controller sends one best-effort desktop alert when a run
+completes. Success alerts include the exact merge command and failure alerts
+include the status command. macOS permissions and user-session availability
+can prevent delivery; Task Graph records the alert outcome and any safe OS
+error in run state, which `status` displays for diagnosis. Alerts cannot safely
+paste or execute terminal commands; the operator must run the displayed command
+in a terminal.

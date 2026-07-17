@@ -4,6 +4,21 @@
 
 ![Task Graph controller showing task status and worker progress](assets/task-graph-controller.jpg)
 
+## Prerequisites
+
+Codex is required to use this skill. macOS is optional; it only enables the
+best-effort desktop notification after a controller-run plan implementation
+finishes. Notification delivery still depends on macOS notification permissions
+and an active user session.
+
+## Use from Codex
+
+Start with an approved implementation plan, then prompt Codex:
+
+> Invoke `$task-graph tasks` to turn this approved implementation plan into Task Graph artifacts.
+
+This creates the plan-local task briefs, kanban board, and DAG described below.
+
 ## What it creates
 
 Running `$task-graph tasks` writes plan-local artifacts below `.agent/<plan-slug>/`:
@@ -123,11 +138,14 @@ conflict, Task Graph aborts the merge and leaves the target branch unchanged.
 Successful promotions persist the target branch, merge SHA, and timestamp, so
 repeating the command reports `already merged` without creating another merge.
 
-When a controller completes, it makes a best-effort macOS desktop alert. A
+When a controller completes, it makes one best-effort macOS desktop alert. A
 successful run's alert includes the exact `merge` command; a failed run's alert
-includes the exact `status` command. Desktop alerts cannot safely paste or
-execute terminal commands, so run the displayed command yourself from the
-repository.
+includes the exact `status` command. Delivery depends on macOS notification
+permissions and the active user session, so it is not guaranteed. Task Graph
+records the attempted alert outcome (including a safe OS error when delivery
+fails) in the run state; use `status` to diagnose a missed alert. Desktop
+alerts cannot safely paste or execute terminal commands, so run the displayed
+command yourself from the repository.
 
 ## Evaluation
 

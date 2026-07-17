@@ -86,6 +86,25 @@ class TaskGraphCliTests(unittest.TestCase):
             self.assertEqual("running: running", task_graph_cli.status("demo-plan", "running"))
             self.assertEqual("failed: failed", task_graph_cli.status("demo-plan", "failed"))
 
+    def test_status_includes_persisted_notification_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temp, patch("scripts.task_graph_cli._repository_root") as repository_root:
+            root = Path(temp)
+            run_dir = self._state(root, "run-1")
+            state = load_state(run_dir)
+            state["notification"] = {
+                "completionStatus": "succeeded",
+                "attemptedAt": 1.0,
+                "outcome": "failed",
+                "error": "osascript exited 1: notifications are disabled",
+            }
+            write_state(run_dir, state)
+            repository_root.return_value = root
+
+            self.assertEqual(
+                "run-1: succeeded; notification: failed (osascript exited 1: notifications are disabled)",
+                task_graph_cli.status("demo-plan", "run-1"),
+            )
+
     def test_merge_rejects_a_run_that_is_not_fully_integrated(self):
         with tempfile.TemporaryDirectory() as temp, patch("scripts.task_graph_cli._repository_root") as repository_root:
             root = Path(temp)
@@ -184,18 +203,67 @@ class TaskGraphCliTests(unittest.TestCase):
             self.assertTrue((root / "run-1.txt").is_file())
             self.assertTrue((root / "run-2.txt").is_file())
 
-    @patch("scripts.task_graph_cli.notify_completion")
-    def test_completion_alerts_include_the_follow_up_command(self, notify):
-        task_graph_cli._notify_run_completion(
-            {"planSlug": "demo-plan", "runId": "run-1", "tasks": {"001": {"status": "integrated"}}}
-        )
-        task_graph_cli._notify_run_completion(
-            {"planSlug": "demo-plan", "runId": "run-2", "tasks": {"001": {"status": "failed"}}}
-        )
+    @patch("scripts.task_graph_cli.notify_completion", return_value={"outcome": "delivered"})
+    def test_completion_alerts_include_the_follow_up_command_and_persist_delivery(self, notify):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            successful_run = self._state(root, "run-1")
+            failed_run = self._state(root, "run-2", status="failed")
+            successful_state = load_state(successful_run)
+            failed_state = load_state(failed_run)
 
-        self.assertEqual(2, notify.call_count)
-        self.assertIn("merge demo-plan --run-id run-1", notify.call_args_list[0].kwargs["message"])
-        self.assertIn("status demo-plan --run-id run-2", notify.call_args_list[1].kwargs["message"])
+            task_graph_cli._notify_run_completion(successful_run, successful_state)
+            task_graph_cli._notify_run_completion(failed_run, failed_state)
+
+            self.assertEqual(2, notify.call_count)
+            self.assertIn("merge demo-plan --run-id run-1", notify.call_args_list[0].kwargs["message"])
+            self.assertIn("status demo-plan --run-id run-2", notify.call_args_list[1].kwargs["message"])
+            self.assertEqual(
+                {"completionStatus": "succeeded", "attemptedAt": ANY, "outcome": "delivered"},
+                load_state(successful_run)["notification"],
+            )
+            self.assertEqual(
+                {"completionStatus": "failed", "attemptedAt": ANY, "outcome": "delivered"},
+                load_state(failed_run)["notification"],
+            )
+
+    @patch("scripts.task_graph_cli.notify_completion", return_value={"outcome": "delivered"})
+    def test_existing_completion_notification_is_not_delivered_twice(self, notify):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_dir = self._state(root, "run-1")
+            state = load_state(run_dir)
+
+            task_graph_cli._notify_run_completion(run_dir, state)
+            task_graph_cli._notify_run_completion(run_dir, state)
+
+            notify.assert_called_once()
+
+    @patch("scripts.task_graph_cli.notify_completion")
+    @patch("scripts.task_graph_cli.TerminalDashboard")
+    @patch("scripts.task_graph_cli.TaskGraphController")
+    def test_recovered_completed_controller_does_not_repeat_a_persisted_alert(
+        self, controller_class, dashboard_class, notify
+    ):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_dir = self._state(root, "run-1")
+            state = load_state(run_dir)
+            state["notification"] = {
+                "completionStatus": "succeeded",
+                "attemptedAt": 1.0,
+                "outcome": "delivered",
+            }
+            write_state(run_dir, state)
+            controller = controller_class.return_value
+            controller.is_complete.return_value = True
+            controller.state = load_state(run_dir)
+            controller.tasks = {"001": {"instructions": "Finish."}}
+
+            task_graph_cli.run_controller(run_dir)
+
+            notify.assert_not_called()
+            dashboard_class.return_value.finish.assert_called_once()
 
     @patch("scripts.task_graph_cli.TerminalDashboard")
     @patch("scripts.task_graph_cli.TaskGraphController")
@@ -212,19 +280,38 @@ class TaskGraphCliTests(unittest.TestCase):
 
     @patch("scripts.task_graph_cli.TerminalDashboard")
     @patch("scripts.task_graph_cli.TaskGraphController")
+    @patch(
+        "scripts.task_graph_cli.notify_completion",
+        return_value={"outcome": "failed", "error": "osascript exited 1: notifications are disabled"},
+    )
     @patch("scripts.task_graph_cli.time.sleep")
-    def test_controller_lifecycle_uses_dashboard_and_leaves_final_summary(self, sleep, controller_class, dashboard_class):
+    def test_notification_failure_does_not_change_completed_run_or_prevent_shutdown(
+        self, sleep, notify, controller_class, dashboard_class
+    ):
         with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_dir = self._state(root, "run-1")
             controller = controller_class.return_value
             controller.is_complete.side_effect = [False, True, True]
-            controller.state = {"tasks": {"001": {"status": "integrated"}}}
+            controller.state = load_state(run_dir)
             controller.tasks = {"001": {"instructions": "Finish."}}
-            task_graph_cli.run_controller(Path(temp))
+            task_graph_cli.run_controller(run_dir)
 
             dashboard_class.return_value.start.assert_called_once()
             controller.run_once.assert_called_once()
             dashboard_class.return_value.finish.assert_called_once()
+            dashboard_class.return_value.cleanup.assert_called_once()
             sleep.assert_not_called()
+            self.assertEqual("integrated", load_state(run_dir)["tasks"]["001-first"]["status"])
+            self.assertEqual(
+                {
+                    "completionStatus": "succeeded",
+                    "attemptedAt": ANY,
+                    "outcome": "failed",
+                    "error": "osascript exited 1: notifications are disabled",
+                },
+                load_state(run_dir)["notification"],
+            )
     def test_start_accepts_fixed_max_worker_limit(self):
         args = build_parser().parse_args(["start", "demo-plan", "--max-workers", "3"])
 

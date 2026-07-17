@@ -152,7 +152,16 @@ def status(plan_slug: str, run_id: str | None = None) -> str:
     repository = _repository_root()
     run_dir = _run_directory(repository, plan_slug, run_id)
     state = load_state(run_dir)
-    return f"{state['runId']}: {_run_status(state)}"
+    result = f"{state['runId']}: {_run_status(state)}"
+    notification = state.get("notification")
+    if not isinstance(notification, dict):
+        return result
+    outcome = notification.get("outcome")
+    if not isinstance(outcome, str):
+        return result
+    error = notification.get("error")
+    detail = f" ({error})" if isinstance(error, str) and error else ""
+    return f"{result}; notification: {outcome}{detail}"
 
 
 def merge(plan_slug: str, run_id: str) -> str:
@@ -226,7 +235,7 @@ def run_controller(run_dir: Path) -> None:
             dashboard.finish(controller.state, controller.tasks, _run_summary(controller.state))
         finally:
             dashboard.cleanup()
-    _notify_run_completion(controller.state)
+        _notify_run_completion(run_dir, controller.state)
 
 
 def _run_summary(state: dict[str, object]) -> str:
@@ -267,7 +276,10 @@ def _run_status(state: dict[str, object]) -> str:
     return "running"
 
 
-def _notify_run_completion(state: dict[str, object]) -> None:
+def _notify_run_completion(run_dir: Path, state: dict[str, object]) -> None:
+    """Deliver and persist one completion notification while the run is locked."""
+    if "notification" in state:
+        return
     run_status = _run_status(state)
     if run_status not in {"succeeded", "failed"}:
         return
@@ -283,10 +295,24 @@ def _notify_run_completion(state: dict[str, object]) -> None:
             shlex.quote(run_id),
         ]
     )
+    attempted_at = time.time()
     if run_status == "succeeded":
-        notify_completion(succeeded=True, message=f"Run {run_id} succeeded. Merge it with: {command}")
+        outcome = notify_completion(
+            succeeded=True, message=f"Run {run_id} succeeded. Merge it with: {command}"
+        )
     else:
-        notify_completion(succeeded=False, message=f"Run {run_id} failed. Check it with: {command}")
+        outcome = notify_completion(
+            succeeded=False, message=f"Run {run_id} failed. Check it with: {command}"
+        )
+    notification: dict[str, object] = {
+        "completionStatus": run_status,
+        "attemptedAt": attempted_at,
+        "outcome": outcome["outcome"],
+    }
+    if "error" in outcome:
+        notification["error"] = outcome["error"]
+    state["notification"] = notification
+    write_state(run_dir, state)
 
 
 def _resume_locked(run_dir: Path) -> str:
