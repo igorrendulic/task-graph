@@ -101,9 +101,15 @@ class TaskGraphGit:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._run(self.repository, "worktree", "add", str(path), branch)
 
-    def switch_branch(self, worktree: Path, branch: str) -> None:
+    def switch_branch(
+        self, worktree: Path, branch: str, *, ignore_other_worktrees: bool = False
+    ) -> None:
         """Switch an existing worktree to an existing local branch."""
-        self._run(worktree, "switch", branch)
+        args = ["switch"]
+        if ignore_other_worktrees:
+            args.append("--ignore-other-worktrees")
+        args.append(branch)
+        self._run(worktree, *args)
 
     def create_worker_worktree(self, path: Path, branch: str, launch_base_sha: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

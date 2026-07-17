@@ -116,7 +116,7 @@ class TaskGraphCliTests(unittest.TestCase):
 
     @patch("scripts.task_graph_cli.TaskGraphGit")
     @patch("scripts.task_graph_cli._repository_root")
-    def test_checkout_releases_clean_integration_worktree_then_switches_to_feature(
+    def test_checkout_keeps_integration_worktree_and_switches_to_feature(
         self, repository_root, git_class
     ):
         with tempfile.TemporaryDirectory() as temp:
@@ -125,23 +125,21 @@ class TaskGraphCliTests(unittest.TestCase):
             (run_dir / "integration").mkdir()
             repository_root.return_value = root
             git = git_class.return_value
-            git.is_clean.side_effect = [True, True]
+            git.is_clean.return_value = True
             git.branch_exists.return_value = True
 
             result = task_graph_cli.checkout("demo-plan", "run-1")
 
-            integration = run_dir / "integration"
             self.assertIn("task-graph/demo-plan/run-1/feature", result)
             self.assertIn("git switch main", result)
             self.assertIn("merge demo-plan --run-id run-1", result)
-            git.is_clean.assert_has_calls(
-                [
-                    unittest.mock.call(ignored_prefix=".agent/demo-plan/runs/"),
-                    unittest.mock.call(integration),
-                ]
+            git.is_clean.assert_called_once_with(ignored_prefix=".agent/demo-plan/runs/")
+            git.remove_worktree_safely.assert_not_called()
+            git.switch_branch.assert_called_once_with(
+                root,
+                "task-graph/demo-plan/run-1/feature",
+                ignore_other_worktrees=True,
             )
-            git.remove_worktree_safely.assert_called_once_with(integration)
-            git.switch_branch.assert_called_once_with(root, "task-graph/demo-plan/run-1/feature")
             self.assertNotIn("promotion", load_state(run_dir))
 
     @patch("scripts.task_graph_cli.TaskGraphGit")
@@ -165,13 +163,10 @@ class TaskGraphCliTests(unittest.TestCase):
 
     @patch("scripts.task_graph_cli.TaskGraphGit")
     @patch("scripts.task_graph_cli._repository_root")
-    def test_checkout_rejects_dirty_primary_missing_branch_or_dirty_integration(
-        self, repository_root, git_class
-    ):
+    def test_checkout_rejects_dirty_primary_or_missing_branch(self, repository_root, git_class):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             run_dir = self._state(root, "run-1")
-            (run_dir / "integration").mkdir()
             repository_root.return_value = root
             git = git_class.return_value
             git.is_clean.return_value = False
@@ -184,13 +179,6 @@ class TaskGraphCliTests(unittest.TestCase):
             with self.assertRaisesRegex(TaskGraphRuntimeError, "feature branch does not exist"):
                 task_graph_cli.checkout("demo-plan", "run-1")
 
-            git.reset_mock()
-            git.is_clean.side_effect = [True, False]
-            git.branch_exists.return_value = True
-            with self.assertRaisesRegex(TaskGraphRuntimeError, "integration worktree is dirty"):
-                task_graph_cli.checkout("demo-plan", "run-1")
-
-            git.remove_worktree_safely.assert_not_called()
             git.switch_branch.assert_not_called()
 
     @patch("scripts.task_graph_cli.TaskGraphGit")

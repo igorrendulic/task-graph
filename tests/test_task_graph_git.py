@@ -126,7 +126,7 @@ class TaskGraphGitTests(unittest.TestCase):
 
             self.assertEqual((root / ".git").resolve(), TaskGraphGit(linked).common_dir())
 
-    def test_safe_worktree_removal_releases_branch_for_primary_checkout(self):
+    def test_switch_branch_can_ignore_another_registered_worktree(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "repo"
             root.mkdir()
@@ -137,12 +137,9 @@ class TaskGraphGitTests(unittest.TestCase):
             git.create_branch(feature, git.head_sha())
             git.add_worktree(integration, feature)
 
-            with self.assertRaises(TaskGraphGitError):
-                git.switch_branch(root, feature)
+            git.switch_branch(root, feature, ignore_other_worktrees=True)
 
-            git.remove_worktree_safely(integration)
-            git.switch_branch(root, feature)
-
+            self.assertTrue(integration.exists())
             self.assertEqual(feature, git.current_branch(root))
 
     def test_safe_worktree_removal_refuses_local_changes(self):

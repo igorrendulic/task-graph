@@ -247,7 +247,6 @@ def checkout(plan_slug: str, run_id: str) -> str:
         if not isinstance(feature_branch, str) or not feature_branch:
             raise TaskGraphRuntimeError("run state lacks a feature branch")
         git = TaskGraphGit(repository)
-        integration = run_dir / "integration"
         try:
             if not git.is_clean(ignored_prefix=f".agent/{plan_slug}/runs/"):
                 raise TaskGraphRuntimeError(
@@ -255,11 +254,7 @@ def checkout(plan_slug: str, run_id: str) -> str:
                 )
             if not git.branch_exists(feature_branch):
                 raise TaskGraphRuntimeError(f"feature branch does not exist: {feature_branch}")
-            if integration.exists():
-                if not git.is_clean(integration):
-                    raise TaskGraphRuntimeError("integration worktree is dirty")
-                git.remove_worktree_safely(integration)
-            git.switch_branch(repository, feature_branch)
+            git.switch_branch(repository, feature_branch, ignore_other_worktrees=True)
         except TaskGraphGitError as exc:
             raise TaskGraphRuntimeError(f"cannot check out Task Graph run: {exc}") from exc
     switch_back = " ".join(["git", "switch", shlex.quote(base_branch)])
