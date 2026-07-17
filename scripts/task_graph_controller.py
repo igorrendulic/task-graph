@@ -144,7 +144,7 @@ the Task Graph controller/runtime artifacts.
             )
             if exit_code == 0 and inspection.valid and inspection.commit_sha:
                 task_state["commitSha"] = inspection.commit_sha
-                task_state["status"] = "awaiting_integration"
+                self._transition(task_id, "awaiting_integration", "worker_exit", f"exit {exit_code}")
             else:
                 reason = f"worker exit {exit_code}; commits={inspection.commit_count}; merge={inspection.has_merge}"
                 self._record_failure(task_id, reason)

@@ -21,7 +21,7 @@ def _state():
 TASKS = {
     "001-first": {"instructions": "Finish the foundation."},
     "002-second": {"instructions": "Build the live dashboard interface."},
-    "003-third": {"instructions": "Write the documentation."},
+    "003-third": {"instructions": "Write the documentation.", "dependsOn": ["002-second"]},
     "004-fourth": {"instructions": "Retry the worker."},
     "005-fifth": {"instructions": "Resolve the conflict."},
     "006-sixth": {"instructions": "Ship the dependent task."},
@@ -38,7 +38,9 @@ class TaskGraphDisplayTests(unittest.TestCase):
         self.assertIn("16%", panel)
         self.assertIn("elapsed 00:15", panel)
         self.assertIn("✓ 001-first", panel)
+        self.assertIn("integrated", panel)
         self.assertIn("● 002-second", panel)
+        self.assertIn("running", panel)
         self.assertIn("running 00:10", panel)
         self.assertIn("○ 003-third", panel)
         self.assertIn("waiting for 002-second", panel)
@@ -49,6 +51,15 @@ class TaskGraphDisplayTests(unittest.TestCase):
         self.assertIn("⊘ 006-sixth", panel)
         self.assertIn("blocked by 005-fifth", panel)
         self.assertIn("\x1b[", panel)
+
+    def test_formatter_truncates_instructions_and_does_not_accept_events(self):
+        tasks = {**TASKS, "002-second": {"instructions": "Build a dashboard with a deliberately long instruction that cannot fit."}}
+
+        panel = format_dashboard(_state(), tasks, now=105.0, width=40)
+
+        self.assertIn("…", panel)
+        with self.assertRaises(TypeError):
+            format_dashboard(_state(), tasks, now=105.0, width=40, events=[])
 
     def test_formatter_uses_compact_two_line_rows_under_eighty_columns(self):
         panel = format_dashboard(_state(), TASKS, now=105.0, width=60)
@@ -75,3 +86,15 @@ class TaskGraphDisplayTests(unittest.TestCase):
         self.assertIn("run complete: 1 integrated, 2 failed/blocked", sequence)
         self.assertIn("\x1b[r", sequence)
         self.assertTrue(sequence.endswith("\x1b[?25h"))
+
+    def test_terminal_adapter_appends_events_below_the_panel(self):
+        output = io.StringIO()
+        dashboard = TerminalDashboard(output, size_provider=lambda: (100, 30))
+
+        dashboard.start(_state(), TASKS, now=105.0)
+        dashboard.record_event({"kind": "launch", "taskId": "002-second"})
+        event_output = output.getvalue()
+        dashboard.redraw(_state(), TASKS, now=106.0)
+
+        self.assertIn("launch 002-second", event_output)
+        self.assertNotIn("launch 002-second", format_dashboard(_state(), TASKS, now=106.0, width=100))

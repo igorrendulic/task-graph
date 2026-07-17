@@ -24,7 +24,7 @@ STYLES = {
 
 def format_dashboard(
     state: Mapping[str, Any], tasks: Mapping[str, Mapping[str, Any]], *, now: float | None = None,
-    width: int = 80, events: list[Mapping[str, str]] | None = None,
+    width: int = 80,
 ) -> str:
     """Return a complete dashboard panel from persisted state and frozen DAG tasks."""
     current = time.time() if now is None else now
@@ -38,20 +38,18 @@ def format_dashboard(
     summary = f"{integrated}/{total} complete  |  {running} running  |  {percent}%  |  elapsed {elapsed}"
     lines = [f"{CSI}1m{title}{RESET}", summary, "─" * max(1, width)]
     compact = width < 80
-    unfinished = [task_id for task_id, item in task_states.items() if item["status"] != "integrated"]
     for task_id, task_state in task_states.items():
         task = tasks.get(task_id, {})
+        status = _display_status(task_state["status"])
         symbol, colour = STYLES.get(task_state["status"], ("?", "37"))
-        label = f"{CSI}{colour}m{symbol} {task_id}{RESET}"
+        label = f"{symbol} {task_id} {status}"
+        styled_label = f"{CSI}{colour}m{label}{RESET}"
         instruction = _shorten(str(task.get("instructions", "")), max(12, width - len(task_id) - 8))
-        detail = _task_detail(task_id, task_state, task, task_states, unfinished, current)
+        detail = _task_detail(task_state, task, task_states, current)
         if compact:
-            lines.extend([f"{label}  {instruction}", f"  {detail}"])
+            lines.extend([f"{styled_label}  {instruction}", f"  {detail}"])
         else:
-            lines.append(f"{label:<20} {instruction:<{max(12, width // 2)}} {detail}")
-    if events:
-        lines.append("─" * max(1, width))
-        lines.extend(f"{CSI}2m{_event_text(event)}{RESET}" for event in events[-3:])
+            lines.append(f"{styled_label}  {instruction:<{max(12, width // 2)}} {detail}")
     return "\n".join(lines)
 
 
@@ -63,7 +61,6 @@ class TerminalDashboard:
     ) -> None:
         self.output = output
         self.size_provider = size_provider or _terminal_size
-        self.events: list[dict[str, str]] = []
         self._started = False
         self._closed = False
         self._panel_height = 0
@@ -75,25 +72,32 @@ class TerminalDashboard:
         self.redraw(state, tasks, now=now)
 
     def record_event(self, event: Mapping[str, str]) -> None:
-        """Store an append-only event emitted by a real controller transition."""
-        self.events.append(dict(event))
+        """Append a real lifecycle transition in the reserved scrollback region."""
+        if not self._started or self._closed:
+            return
+        self.output.write(f"{CSI}2m{_event_text(event)}{RESET}\n")
+        self.output.flush()
 
     def redraw(self, state: Mapping[str, Any], tasks: Mapping[str, Mapping[str, Any]], *, now: float | None = None) -> None:
         if not self._started or self._closed:
             return
         columns, rows = self.size_provider()
-        panel = format_dashboard(state, tasks, now=now, width=max(20, columns), events=self.events)
+        panel = format_dashboard(state, tasks, now=now, width=max(20, columns))
         lines = panel.splitlines()
-        self._panel_height = min(len(lines), max(1, rows - 1))
-        self.output.write(f"{CSI}H{CSI}J")
-        self.output.write("\n".join(lines[:self._panel_height]))
-        self.output.write(f"{CSI}{self._panel_height + 1};{max(self._panel_height + 1, rows)}r")
-        self.output.write(f"{CSI}{self._panel_height + 1};1H")
+        previous_height = self._panel_height
+        self._panel_height = len(lines)
+        self.output.write(f"{CSI}r")
+        for row in range(1, max(previous_height, self._panel_height) + 1):
+            self.output.write(f"{CSI}{row};1H{CSI}2K")
+        for row, line in enumerate(lines, start=1):
+            self.output.write(f"{CSI}{row};1H{line}")
+        scroll_top = min(self._panel_height + 1, max(1, rows))
+        self.output.write(f"{CSI}{scroll_top};{max(scroll_top, rows)}r")
+        self.output.write(f"{CSI}{max(scroll_top, rows)};1H")
         self.output.flush()
 
     def finish(self, state: Mapping[str, Any], tasks: Mapping[str, Mapping[str, Any]], summary: str, *, now: float | None = None) -> None:
         self.record_event({"kind": "completion", "detail": summary})
-        self.output.write(f"{CSI}{self._panel_height + 1};1H{CSI}r{summary}\n")
         self.cleanup()
 
     def cleanup(self) -> None:
@@ -104,14 +108,14 @@ class TerminalDashboard:
         self._closed = True
 
 
-def _task_detail(task_id: str, task_state: Mapping[str, Any], task: Mapping[str, Any], task_states: Mapping[str, Any], unfinished: list[str], now: float) -> str:
+def _task_detail(task_state: Mapping[str, Any], task: Mapping[str, Any], task_states: Mapping[str, Any], now: float) -> str:
     status = task_state["status"]
     attempts = task_state.get("attempts", [])
     if status in {"running", "awaiting_integration", "integrating"}:
         started = attempts[-1].get("startedAt") if attempts else None
         return f"running {_duration(now - float(started))}" if started else "running"
     if status == "pending":
-        dependencies = task.get("dependsOn") or [candidate for candidate in unfinished if candidate != task_id][:1]
+        dependencies = task.get("dependsOn") or []
         waiting = next((dependency for dependency in dependencies if task_states.get(dependency, {}).get("status") != "integrated"), None)
         return f"waiting for {waiting}" if waiting else "ready"
     if status in {"retrying", "failed"}:
@@ -120,6 +124,10 @@ def _task_detail(task_id: str, task_state: Mapping[str, Any], task: Mapping[str,
     if status == "blocked":
         return f"blocked by {task_state.get('blockedBy', 'failed dependency')}"
     return status
+
+
+def _display_status(status: str) -> str:
+    return "running" if status in {"awaiting_integration", "integrating"} else status
 
 
 def _duration(seconds: float) -> str:

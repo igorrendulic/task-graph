@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from scripts.task_graph_controller import TaskGraphController
 from scripts.task_graph_runtime import (
@@ -235,6 +236,45 @@ class TaskGraphControllerTests(unittest.TestCase):
             saved = load_state(run)
             self.assertEqual("retrying", saved["tasks"]["001-first"]["status"])
             self.assertIn("without completion", saved["tasks"]["001-first"]["attempts"][0]["failureSummary"])
+
+    def test_successful_worker_exit_emits_its_lifecycle_event_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plan = _make_plan(root)
+            run = plan / "runs" / "run-1"
+            snapshot = create_run_snapshot(plan, run)
+            state = create_state(
+                run_id="run-1", plan_slug="demo", repository=str(root),
+                feature_branch="task-graph/demo/run-1/feature", base_commit="base",
+                snapshot_digest=snapshot.dag_digest, task_digests=snapshot.task_digests,
+                max_workers=1, task_ids=["001-first", "002-second"],
+                git_common_dir="/repo/.git",
+            )
+            state["integrationWorktree"] = str(run / "integration")
+            exit_file = run / "logs" / "first.exit"
+            exit_file.parent.mkdir(parents=True)
+            exit_file.write_text("0\n", encoding="utf-8")
+            state["tasks"]["001-first"].update(
+                status="running",
+                attempts=[{
+                    "worktree": str(run / "worktrees" / "first"),
+                    "launchBaseSha": "base",
+                    "exitFile": str(exit_file),
+                }],
+            )
+            write_state(run, state)
+            git = FakeGit()
+            git.inspect_one_task_commit = lambda *_: SimpleNamespace(
+                valid=True, commit_sha="abc123", commit_count=1, has_merge=False
+            )
+            events = []
+
+            controller = TaskGraphController(run, git=git, tmux=FakeTmux(), event_sink=events.append)
+            controller.poll_running_attempts()
+            controller.poll_running_attempts()
+
+            self.assertEqual("awaiting_integration", controller.state["tasks"]["001-first"]["status"])
+            self.assertEqual(["worker_exit"], [event["kind"] for event in events])
 
     def test_ready_dependent_creates_a_fresh_observable_attempt(self):
         with tempfile.TemporaryDirectory() as temp:
