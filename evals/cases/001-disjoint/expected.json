@@ -2,11 +2,13 @@
   "planSlug": "disjoint-changes",
   "tasks": {
     "001-add-schema": {
+      "titleContains": "schema",
       "dependsOn": [],
       "parallelSafe": true,
       "rationaleContains": ["disjoint"]
     },
     "002-add-formatter": {
+      "titleContains": "formatter",
       "dependsOn": [],
       "parallelSafe": true,
       "rationaleContains": ["disjoint"]

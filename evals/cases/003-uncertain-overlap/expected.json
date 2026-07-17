@@ -2,11 +2,13 @@
   "planSlug": "uncertain-overlap",
   "tasks": {
     "001-add-cache-invalidation": {
+      "titleContains": "cache invalidation",
       "dependsOn": [],
       "parallelSafe": false,
       "rationaleContains": ["uncertain"]
     },
     "002-update-integration-boundary": {
+      "titleContains": "integration boundary",
       "dependsOn": ["001-add-cache-invalidation"],
       "parallelSafe": false,
       "rationaleContains": ["uncertain"]

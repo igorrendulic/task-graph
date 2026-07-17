@@ -2,6 +2,7 @@
   "planSlug": "dirty-overlap",
   "tasks": {
     "001-update-settings-validation": {
+      "titleContains": "settings validation",
       "dependsOn": [],
       "parallelSafe": false,
       "rationaleContains": ["clean base"]

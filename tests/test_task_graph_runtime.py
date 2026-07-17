@@ -52,6 +52,21 @@ def _make_plan(root: Path) -> Path:
 
 
 class TaskGraphRuntimeTests(unittest.TestCase):
+    def test_state_persists_the_default_worker_command(self):
+        state = create_state(
+            run_id="run-1",
+            plan_slug="demo-plan",
+            repository="/repo",
+            feature_branch="task-graph/demo-plan/run-1",
+            base_commit="abc123",
+            snapshot_digest="digest",
+            task_digests={"001-first": "task-digest"},
+            max_workers=2,
+            task_ids=["001-first"],
+        )
+
+        self.assertEqual("codex", state["workerCommand"])
+
     def test_snapshot_uses_original_dag_and_task_content_after_plan_changes(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

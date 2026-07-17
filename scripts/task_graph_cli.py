@@ -37,11 +37,17 @@ def build_parser() -> argparse.ArgumentParser:
     start = subcommands.add_parser("start", help="start a new plan run")
     start.add_argument("plan_slug")
     start.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
+    start.add_argument(
+        "--worker-command",
+        default="codex",
+        help="worker executable recorded in run state (default: codex)",
+    )
     resume = subcommands.add_parser("resume", help="reconnect or restart a plan controller")
     resume.add_argument("plan_slug")
     resume.add_argument("run_id")
     controller = subcommands.add_parser("controller", help=argparse.SUPPRESS)
     controller.add_argument("--run-dir", required=True, type=Path)
+    subcommands.add_parser("eval-controller", help="run opt-in controller integration evals")
     return parser
 
 
@@ -57,7 +63,7 @@ def controller_command(run_dir: Path) -> str:
     )
 
 
-def start(plan_slug: str, max_workers: int) -> str:
+def start(plan_slug: str, max_workers: int, worker_command: str = "codex") -> str:
     if max_workers < 1:
         raise TaskGraphRuntimeError("max_workers must be at least 1")
     repository = _repository_root()
@@ -83,6 +89,7 @@ def start(plan_slug: str, max_workers: int) -> str:
         task_digests=snapshot.task_digests,
         max_workers=max_workers,
         task_ids=[task["id"] for task in snapshot.dag["tasks"]],
+        worker_command=worker_command,
     )
     state["planDirectory"] = str(plan_dir)
     state["integrationWorktree"] = str(integration)
@@ -178,9 +185,14 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         if args.action == "start":
-            print(start(args.plan_slug, args.max_workers))
+            print(start(args.plan_slug, args.max_workers, args.worker_command))
         elif args.action == "resume":
             print(resume(args.plan_slug, args.run_id))
+        elif args.action == "eval-controller":
+            from scripts.task_graph_controller_eval import run_controller_evals
+
+            run_controller_evals()
+            print("controller integration evals passed")
         else:
             run_controller(args.run_dir)
     except TaskGraphRuntimeError as exc:

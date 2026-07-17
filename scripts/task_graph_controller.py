@@ -22,7 +22,7 @@ class TaskGraphController:
         *,
         git: TaskGraphGit | None = None,
         tmux: TmuxClient | None = None,
-        codex_bin: str = "codex",
+        codex_bin: str | None = None,
     ) -> None:
         self.run_dir = run_dir.resolve()
         self.snapshot = load_snapshot(self.run_dir)
@@ -30,7 +30,7 @@ class TaskGraphController:
         self.tasks = {task["id"]: task for task in self.snapshot.dag["tasks"]}
         self.git = git or TaskGraphGit(Path(self.state["repository"]))
         self.tmux = tmux or TmuxClient()
-        self.codex_bin = codex_bin
+        self.codex_bin = codex_bin or self.state.get("workerCommand", "codex")
         self.integration_worktree = Path(self.state["integrationWorktree"])
 
     def build_worker_prompt(self, task_id: str, repair_context: str | None = None) -> str:

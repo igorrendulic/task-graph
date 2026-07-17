@@ -171,3 +171,27 @@ class TaskGraphControllerTests(unittest.TestCase):
             self.assertIn("worker/002-second/attempt-1", git.worker_calls[0][1])
             self.assertTrue((plan / "in-progress" / "002-second.md").is_file())
             self.assertIn("--json", tmux.commands[0])
+
+    def test_worker_command_comes_from_persisted_run_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plan = _make_plan(root)
+            run = plan / "runs" / "run-1"
+            snapshot = create_run_snapshot(plan, run)
+            state = create_state(
+                run_id="run-1", plan_slug="demo", repository=str(root),
+                feature_branch="task-graph/demo/run-1/feature", base_commit="base",
+                snapshot_digest=snapshot.dag_digest, task_digests=snapshot.task_digests,
+                max_workers=1, task_ids=["001-first", "002-second"],
+            )
+            state["workerCommand"] = "/tmp/controller-eval-worker"
+            state["integrationWorktree"] = str(run / "integration")
+            state["planDirectory"] = str(plan)
+            state["session"] = "task-graph-demo-run-1"
+            state["tasks"]["001-first"].update(status="integrated", commitSha="abc123")
+            write_state(run, state)
+            tmux = FakeTmux()
+
+            TaskGraphController(run, git=FakeGit(), tmux=tmux).schedule_ready_tasks()
+
+            self.assertIn("/tmp/controller-eval-worker", tmux.commands[0])

@@ -46,22 +46,35 @@ def evaluate_case_dag(case_dir: Path, dag: dict[str, Any], artifacts_dir: Path) 
     if not isinstance(expected_tasks, dict):
         return errors + ["case expectation tasks must be an object keyed by task ID"]
     actual_tasks = {task["id"]: task for task in dag["tasks"]}
-    if set(actual_tasks) != set(expected_tasks):
-        errors.append(
-            f"task IDs: expected {sorted(expected_tasks)}, got {sorted(actual_tasks)}"
-        )
+    resolved_tasks, resolution_errors = _resolve_expected_tasks(
+        expected_tasks, actual_tasks
+    )
+    if resolution_errors:
+        return errors + resolution_errors
 
     for task_id, task_expectation in expected_tasks.items():
-        task = actual_tasks.get(task_id)
-        if task is None:
-            continue
         if not isinstance(task_expectation, dict):
             errors.append(f"case expectation for {task_id} must be an object")
             continue
+        task = resolved_tasks[task_id]
         for field in ("dependsOn", "parallelSafe"):
-            if field in task_expectation and task[field] != task_expectation[field]:
+            if field not in task_expectation:
+                continue
+            expected_value = task_expectation[field]
+            if field == "dependsOn":
+                try:
+                    expected_value = [
+                        resolved_tasks[dependency]["id"]
+                        for dependency in expected_value
+                    ]
+                except KeyError as exc:
+                    errors.append(
+                        f"{task_id}.dependsOn references unknown expected task ID: {exc.args[0]}"
+                    )
+                    continue
+            if task[field] != expected_value:
                 errors.append(
-                    f"{task_id}.{field}: expected {task_expectation[field]!r}, got {task[field]!r}"
+                    f"{task_id}.{field}: expected {expected_value!r}, got {task[field]!r}"
                 )
         rationale = task["schedulingRationale"].lower()
         for phrase in task_expectation.get("rationaleContains", []):
@@ -70,6 +83,69 @@ def evaluate_case_dag(case_dir: Path, dag: dict[str, Any], artifacts_dir: Path) 
                     f"{task_id}.schedulingRationale must contain {phrase!r}"
                 )
     return errors
+
+
+def _resolve_expected_tasks(
+    expected_tasks: dict[str, Any], actual_tasks: dict[str, dict[str, Any]]
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Match fixture task aliases to generated DAG tasks."""
+    if not any(
+        isinstance(expectation, dict) and "titleContains" in expectation
+        for expectation in expected_tasks.values()
+    ):
+        if set(actual_tasks) != set(expected_tasks):
+            return {}, [
+                f"task IDs: expected {sorted(expected_tasks)}, got {sorted(actual_tasks)}"
+            ]
+        return {task_id: actual_tasks[task_id] for task_id in expected_tasks}, []
+
+    resolved: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    matched_ids: set[str] = set()
+    for task_id, expectation in expected_tasks.items():
+        if not isinstance(expectation, dict):
+            errors.append(f"case expectation for {task_id} must be an object")
+            continue
+        has_title_matcher = "titleContains" in expectation
+        title_contains = expectation.get("titleContains")
+        if not has_title_matcher:
+            candidates = [actual_tasks[task_id]] if task_id in actual_tasks else []
+        elif not isinstance(title_contains, str) or not title_contains.strip():
+            errors.append(f"{task_id}.titleContains must be a non-empty string")
+            continue
+        else:
+            needle = title_contains.lower()
+            candidates = [
+                task
+                for task in actual_tasks.values()
+                if needle in task["title"].lower()
+            ]
+        if not candidates:
+            label = "task ID" if not has_title_matcher else "titleContains"
+            expected_value = task_id if not has_title_matcher else title_contains
+            errors.append(f"{task_id}.{label} did not match a generated task: {expected_value!r}")
+            continue
+        if len(candidates) > 1:
+            errors.append(
+                f"{task_id}.titleContains matched multiple generated tasks: "
+                f"{', '.join(task['id'] for task in candidates)}"
+            )
+            continue
+        task = candidates[0]
+        if task["id"] in matched_ids:
+            errors.append(
+                f"{task_id} resolves to generated task already matched by another expectation: "
+                f"{task['id']}"
+            )
+            continue
+        resolved[task_id] = task
+        matched_ids.add(task["id"])
+    unmatched_ids = sorted(set(actual_tasks) - matched_ids)
+    if not errors and unmatched_ids:
+        errors.append(
+            f"generated task IDs were not matched by the case: {', '.join(unmatched_ids)}"
+        )
+    return resolved, errors
 
 
 def _read_json(path: Path, label: str) -> dict[str, Any]:

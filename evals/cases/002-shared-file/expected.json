@@ -2,11 +2,13 @@
   "planSlug": "shared-file",
   "tasks": {
     "001-add-parser": {
+      "titleContains": "configuration parser",
       "dependsOn": [],
       "parallelSafe": false,
       "rationaleContains": ["shared"]
     },
     "002-add-serializer": {
+      "titleContains": "configuration serializer",
       "dependsOn": ["001-add-parser"],
       "parallelSafe": false,
       "rationaleContains": ["shared"]

@@ -152,10 +152,13 @@ def create_state(
     task_digests: dict[str, str],
     max_workers: int,
     task_ids: list[str],
+    worker_command: str = "codex",
 ) -> dict[str, Any]:
     """Create the only allowed initial task state for a controller run."""
     if max_workers < 1:
         raise TaskGraphRuntimeError("max_workers must be at least 1")
+    if not worker_command.strip():
+        raise TaskGraphRuntimeError("worker command must not be empty")
     return {
         "schemaVersion": STATE_SCHEMA_VERSION,
         "runId": run_id,
@@ -166,6 +169,7 @@ def create_state(
         "dagDigest": snapshot_digest,
         "taskDigests": task_digests,
         "maxWorkers": max_workers,
+        "workerCommand": worker_command,
         "createdAt": time.time(),
         "controller": {},
         "tasks": {
