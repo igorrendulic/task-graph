@@ -62,6 +62,17 @@ Run that command to observe the controller and worker windows. The panes show
 live task progress, commands, file changes, agent messages, and completion or
 error output; finished worker panes remain available for inspection.
 
+## Merge completed implementation
+
+After a run succeeds and all its tasks are integrated, prompt Codex:
+
+> Invoke `$task-graph merge` for `<plan-slug>` run `<run-id>`.
+
+The command merges that run's feature branch into the recorded base branch with
+a `--no-ff` merge commit. Run it from the recorded base branch with a clean
+checkout (apart from run artifacts); if Git reports a conflict, Task Graph
+aborts safely and leaves the target branch unchanged.
+
 ## Conservative scheduling
 
 `dependsOn` is authoritative: a task can begin only after all listed task IDs are complete. `parallelSafe` is explanatory evidence, not a second scheduler.
