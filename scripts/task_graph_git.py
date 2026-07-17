@@ -66,8 +66,12 @@ class TaskGraphGit:
         self._raise_git_error(result)
         raise AssertionError("unreachable")
 
-    def is_clean(self, *, ignored_prefix: str | None = None) -> bool:
-        output = self._run(self.repository, "status", "--porcelain", "--untracked-files=all")
+    def is_clean(
+        self, worktree: Path | None = None, *, ignored_prefix: str | None = None
+    ) -> bool:
+        output = self._run(
+            worktree or self.repository, "status", "--porcelain", "--untracked-files=all"
+        )
         if not ignored_prefix:
             return not output.strip()
         return all(
@@ -96,6 +100,10 @@ class TaskGraphGit:
     def add_worktree(self, path: Path, branch: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._run(self.repository, "worktree", "add", str(path), branch)
+
+    def switch_branch(self, worktree: Path, branch: str) -> None:
+        """Switch an existing worktree to an existing local branch."""
+        self._run(worktree, "switch", branch)
 
     def create_worker_worktree(self, path: Path, branch: str, launch_base_sha: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -167,6 +175,10 @@ class TaskGraphGit:
 
     def remove_worktree(self, path: Path) -> None:
         self._run(self.repository, "worktree", "remove", "--force", str(path))
+
+    def remove_worktree_safely(self, path: Path) -> None:
+        """Remove a clean worktree without discarding any local changes."""
+        self._run(self.repository, "worktree", "remove", str(path))
 
     @staticmethod
     def _is_ignored_runtime_path(status_line: str, ignored_prefix: str) -> bool:

@@ -126,6 +126,42 @@ class TaskGraphGitTests(unittest.TestCase):
 
             self.assertEqual((root / ".git").resolve(), TaskGraphGit(linked).common_dir())
 
+    def test_safe_worktree_removal_releases_branch_for_primary_checkout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            root.mkdir()
+            _repo(root)
+            git = TaskGraphGit(root)
+            feature = "task-graph/demo/run-1/feature"
+            integration = root / ".agent" / "demo" / "runs" / "run-1" / "integration"
+            git.create_branch(feature, git.head_sha())
+            git.add_worktree(integration, feature)
+
+            with self.assertRaises(TaskGraphGitError):
+                git.switch_branch(root, feature)
+
+            git.remove_worktree_safely(integration)
+            git.switch_branch(root, feature)
+
+            self.assertEqual(feature, git.current_branch(root))
+
+    def test_safe_worktree_removal_refuses_local_changes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            root.mkdir()
+            _repo(root)
+            git = TaskGraphGit(root)
+            integration = root / "integration"
+            feature = "task-graph/demo/run-1/feature"
+            git.create_branch(feature, git.head_sha())
+            git.add_worktree(integration, feature)
+            (integration / "uncommitted.txt").write_text("preserve me")
+
+            with self.assertRaises(TaskGraphGitError):
+                git.remove_worktree_safely(integration)
+
+            self.assertTrue((integration / "uncommitted.txt").is_file())
+
     def test_worker_commit_is_one_non_merge_commit_from_launch_base(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "repo"

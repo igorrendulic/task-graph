@@ -53,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
     merge = subcommands.add_parser("merge", help="promote a successful plan run")
     merge.add_argument("plan_slug")
     merge.add_argument("--run-id", required=True)
+    checkout = subcommands.add_parser(
+        "checkout", help="check out a successful plan run for local inspection"
+    )
+    checkout.add_argument("plan_slug")
+    checkout.add_argument("--run-id", required=True)
     controller = subcommands.add_parser("controller", help=argparse.SUPPRESS)
     controller.add_argument("--run-dir", required=True, type=Path)
     return parser
@@ -220,6 +225,60 @@ def merge(plan_slug: str, run_id: str) -> str:
     return f"{run_id}: merged into {base_branch} ({result.merge_sha})"
 
 
+def checkout(plan_slug: str, run_id: str) -> str:
+    """Switch the primary checkout to a succeeded run's feature branch."""
+    repository = _repository_root()
+    run_dir = _run_directory(repository, plan_slug, run_id)
+    with RunLock(run_dir):
+        state = load_state(run_dir)
+        if state.get("planSlug") != plan_slug or state.get("runId") != run_id:
+            raise TaskGraphRuntimeError("run state does not match the requested plan and run ID")
+        run_status = _run_status(state)
+        if run_status == "already merged":
+            raise TaskGraphRuntimeError("cannot check out a run that is already merged")
+        if run_status != "succeeded":
+            raise TaskGraphRuntimeError("only succeeded runs can be checked out")
+        base_branch = state.get("baseBranch")
+        if not isinstance(base_branch, str) or not base_branch:
+            raise TaskGraphRuntimeError(
+                "run state lacks baseBranch; start a fresh run from a clean base"
+            )
+        feature_branch = state.get("featureBranch")
+        if not isinstance(feature_branch, str) or not feature_branch:
+            raise TaskGraphRuntimeError("run state lacks a feature branch")
+        git = TaskGraphGit(repository)
+        integration = run_dir / "integration"
+        try:
+            if not git.is_clean(ignored_prefix=f".agent/{plan_slug}/runs/"):
+                raise TaskGraphRuntimeError(
+                    "repository is dirty outside controller-owned run artifacts"
+                )
+            if not git.branch_exists(feature_branch):
+                raise TaskGraphRuntimeError(f"feature branch does not exist: {feature_branch}")
+            if integration.exists():
+                if not git.is_clean(integration):
+                    raise TaskGraphRuntimeError("integration worktree is dirty")
+                git.remove_worktree_safely(integration)
+            git.switch_branch(repository, feature_branch)
+        except TaskGraphGitError as exc:
+            raise TaskGraphRuntimeError(f"cannot check out Task Graph run: {exc}") from exc
+    switch_back = " ".join(["git", "switch", shlex.quote(base_branch)])
+    merge_command = " ".join(
+        [
+            shlex.quote(sys.executable),
+            shlex.quote(str(Path(__file__).resolve())),
+            "merge",
+            shlex.quote(plan_slug),
+            "--run-id",
+            shlex.quote(run_id),
+        ]
+    )
+    return (
+        f"{run_id}: checked out {feature_branch}. "
+        f"Return to {base_branch}: {switch_back}. Then merge: {merge_command}"
+    )
+
+
 def run_controller(run_dir: Path) -> None:
     """Long-lived tmux service loop. The lock prevents duplicate schedulers."""
     with RunLock(run_dir, blocking=True):
@@ -297,8 +356,22 @@ def _notify_run_completion(run_dir: Path, state: dict[str, object]) -> None:
     )
     attempted_at = time.time()
     if run_status == "succeeded":
+        checkout_command = " ".join(
+            [
+                shlex.quote(sys.executable),
+                shlex.quote(str(Path(__file__).resolve())),
+                "checkout",
+                shlex.quote(plan_slug),
+                "--run-id",
+                shlex.quote(run_id),
+            ]
+        )
         outcome = notify_completion(
-            succeeded=True, message=f"Run {run_id} succeeded. Merge it with: {command}"
+            succeeded=True,
+            message=(
+                f"Run {run_id} succeeded. Inspect it with: {checkout_command}. "
+                f"After switching back to the recorded base branch, merge it with: {command}"
+            ),
         )
     else:
         outcome = notify_completion(
@@ -382,6 +455,8 @@ def main() -> int:
             print(status(args.plan_slug, args.run_id))
         elif args.action == "merge":
             print(merge(args.plan_slug, args.run_id))
+        elif args.action == "checkout":
+            print(checkout(args.plan_slug, args.run_id))
         else:
             run_controller(args.run_dir)
     except TaskGraphRuntimeError as exc:

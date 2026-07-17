@@ -19,6 +19,20 @@ Start with an approved implementation plan, then prompt Codex:
 
 This creates the plan-local task briefs, kanban board, and DAG described below.
 
+### Automate the handoff from planning
+
+Add this instruction to your repository's `AGENTS.md` to offer Task Graph when
+an approved plan moves into implementation:
+
+```md
+When the user has approved an implementation plan and asks to implement it,
+offer to generate Task Graph artifacts first. Explain that this creates focused
+task briefs, a kanban board, and a dependency-safe DAG. If the user accepts,
+immediately invoke `$task-graph tasks` with the approved plan. Otherwise,
+continue with the normal implementation workflow. Do not start the Task Graph
+execution controller as part of this handoff.
+```
+
 ## What it creates
 
 Running `$task-graph tasks` writes plan-local artifacts below `.agent/<plan-slug>/`:
@@ -62,16 +76,20 @@ Run that command to observe the controller and worker windows. The panes show
 live task progress, commands, file changes, agent messages, and completion or
 error output; finished worker panes remain available for inspection.
 
-## Merge completed implementation
+## Inspect and merge completed implementation
 
-After a run succeeds and all its tasks are integrated, prompt Codex:
+After a run succeeds and all its tasks are integrated, check out its feature
+branch to inspect it or run local commands:
 
-> Invoke `$task-graph merge` for `<plan-slug>` run `<run-id>`.
+> Invoke `$task-graph checkout` for `<plan-slug>` run `<run-id>`.
 
-The command merges that run's feature branch into the recorded base branch with
-a `--no-ff` merge commit. Run it from the recorded base branch with a clean
-checkout (apart from run artifacts); if Git reports a conflict, Task Graph
-aborts safely and leaves the target branch unchanged.
+`checkout` accepts only succeeded, unmerged runs and requires both checkouts
+clean (except for that plan's run artifacts in the primary checkout). It removes
+the integration worktree without force, releases and checks out the feature
+branch, then prints the command to return to the recorded base branch. Run it,
+then invoke `$task-graph merge` for the same plan and run to create the `--no-ff`
+promotion commit. On conflict, Task Graph aborts safely and leaves the target
+branch unchanged.
 
 ## Install without cloning
 
@@ -184,6 +202,19 @@ always requires the run ID, which avoids accidentally merging a concurrent
 run:
 
 ```bash
+python3 scripts/task_graph_cli.py checkout <plan-slug> --run-id <run-id>
+```
+
+Checkout is available only for succeeded, unmerged runs. It requires the
+primary checkout to be clean except for `.agent/<plan-slug>/runs/` artifacts;
+if the generated integration worktree exists, it must also be clean. The
+command removes that integration worktree without force before switching the
+primary checkout to the feature branch, then prints exact commands to return to
+the recorded base branch and merge.
+
+After returning to the base branch printed by `checkout`, promote the run with:
+
+```bash
 python3 scripts/task_graph_cli.py merge <plan-slug> --run-id <run-id>
 ```
 
@@ -197,13 +228,14 @@ Successful promotions persist the target branch, merge SHA, and timestamp, so
 repeating the command reports `already merged` without creating another merge.
 
 When a controller completes, it makes one best-effort macOS desktop alert. A
-successful run's alert includes the exact `merge` command; a failed run's alert
-includes the exact `status` command. Delivery depends on macOS notification
-permissions and the active user session, so it is not guaranteed. Task Graph
-records the attempted alert outcome (including a safe OS error when delivery
-fails) in the run state; use `status` to diagnose a missed alert. Desktop
-alerts cannot safely paste or execute terminal commands, so run the displayed
-command yourself from the repository.
+successful run's alert includes the exact `checkout` command first, followed by
+the `merge` command to use after returning to the recorded base branch; a
+failed run's alert includes the exact `status` command. Delivery depends on
+macOS notification permissions and the active user session, so it is not
+guaranteed. Task Graph records the attempted alert outcome (including a safe OS
+error when delivery fails) in the run state; use `status` to diagnose a missed
+alert. Desktop alerts cannot safely paste or execute terminal commands, so run
+the displayed command yourself from the repository.
 
 ## Evaluation
 

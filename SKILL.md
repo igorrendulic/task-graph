@@ -13,6 +13,7 @@ Use Task Graph only when an approved implementation plan is available.
 - To execute a validated DAG from a clean repository, use `start`.
 - To continue an interrupted run, use `resume`.
 - To inspect a run, use `status`.
+- To inspect the completed implementation locally, use `checkout`.
 - To explicitly promote a successful run, use `merge`.
 - If the user has not yet approved an implementation plan, use the appropriate planning or brainstorming workflow first; do not create Task Graph artifacts.
 
@@ -56,7 +57,7 @@ replacement controller from the persisted snapshot:
 python3 scripts/task_graph_cli.py resume <plan-slug> <run-id>
 ```
 
-## `status` and `merge` workflows
+## `status`, `checkout`, and `merge` workflows
 
 Use `status` to inspect the newest run, or pass a run ID for a specific run:
 
@@ -69,6 +70,20 @@ It reports `running`, `succeeded`, `failed`, or `already merged`. Do not infer
 that a worker branch is promotable: only the run's
 `task-graph/<plan-slug>/<run-id>/feature` branch can be merged. Worker-attempt
 branches are never merged directly.
+
+To inspect or run commands against a succeeded, unmerged run locally, check it
+out explicitly:
+
+```sh
+python3 scripts/task_graph_cli.py checkout <plan-slug> --run-id <run-id>
+```
+
+`checkout` requires the primary checkout to be clean except for that plan's
+`.agent/<plan-slug>/runs/` artifacts. It also requires the generated
+integration worktree to be clean, then removes it without force so Git can
+release the run feature branch to the primary checkout. It does not change run
+state. The command prints the exact `git switch <base-branch>` and `merge`
+commands to use after inspection.
 
 Promotion must name the run explicitly:
 
@@ -83,9 +98,10 @@ on conflict it aborts safely and leaves the target branch unchanged. A completed
 promotion is recorded in run state, so later attempts report `already merged`.
 
 On macOS the controller sends one best-effort desktop alert when a run
-completes. Success alerts include the exact merge command and failure alerts
-include the status command. macOS permissions and user-session availability
-can prevent delivery; Task Graph records the alert outcome and any safe OS
-error in run state, which `status` displays for diagnosis. Alerts cannot safely
-paste or execute terminal commands; the operator must run the displayed command
-in a terminal.
+completes. Success alerts include the exact `checkout` command first, then the
+follow-up merge command after returning to the recorded base branch; failure
+alerts include the status command. macOS permissions and user-session
+availability can prevent delivery; Task Graph records the alert outcome and any
+safe OS error in run state, which `status` displays for diagnosis. Alerts
+cannot safely paste or execute terminal commands; the operator must run the
+displayed command in a terminal.

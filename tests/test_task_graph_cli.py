@@ -116,6 +116,85 @@ class TaskGraphCliTests(unittest.TestCase):
 
     @patch("scripts.task_graph_cli.TaskGraphGit")
     @patch("scripts.task_graph_cli._repository_root")
+    def test_checkout_releases_clean_integration_worktree_then_switches_to_feature(
+        self, repository_root, git_class
+    ):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_dir = self._state(root, "run-1")
+            (run_dir / "integration").mkdir()
+            repository_root.return_value = root
+            git = git_class.return_value
+            git.is_clean.side_effect = [True, True]
+            git.branch_exists.return_value = True
+
+            result = task_graph_cli.checkout("demo-plan", "run-1")
+
+            integration = run_dir / "integration"
+            self.assertIn("task-graph/demo-plan/run-1/feature", result)
+            self.assertIn("git switch main", result)
+            self.assertIn("merge demo-plan --run-id run-1", result)
+            git.is_clean.assert_has_calls(
+                [
+                    unittest.mock.call(ignored_prefix=".agent/demo-plan/runs/"),
+                    unittest.mock.call(integration),
+                ]
+            )
+            git.remove_worktree_safely.assert_called_once_with(integration)
+            git.switch_branch.assert_called_once_with(root, "task-graph/demo-plan/run-1/feature")
+            self.assertNotIn("promotion", load_state(run_dir))
+
+    @patch("scripts.task_graph_cli.TaskGraphGit")
+    @patch("scripts.task_graph_cli._repository_root")
+    def test_checkout_rejects_non_succeeded_and_already_merged_runs(self, repository_root, git_class):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository_root.return_value = root
+            self._state(root, "failed", status="failed")
+            merged = self._state(root, "merged")
+            state = load_state(merged)
+            state["promotion"] = {"targetBranch": "main", "mergeSha": "sha", "mergedAt": 1.0}
+            write_state(merged, state)
+
+            with self.assertRaisesRegex(TaskGraphRuntimeError, "only succeeded"):
+                task_graph_cli.checkout("demo-plan", "failed")
+            with self.assertRaisesRegex(TaskGraphRuntimeError, "already merged"):
+                task_graph_cli.checkout("demo-plan", "merged")
+
+            git_class.assert_not_called()
+
+    @patch("scripts.task_graph_cli.TaskGraphGit")
+    @patch("scripts.task_graph_cli._repository_root")
+    def test_checkout_rejects_dirty_primary_missing_branch_or_dirty_integration(
+        self, repository_root, git_class
+    ):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_dir = self._state(root, "run-1")
+            (run_dir / "integration").mkdir()
+            repository_root.return_value = root
+            git = git_class.return_value
+            git.is_clean.return_value = False
+            with self.assertRaisesRegex(TaskGraphRuntimeError, "repository is dirty"):
+                task_graph_cli.checkout("demo-plan", "run-1")
+
+            git.reset_mock()
+            git.is_clean.return_value = True
+            git.branch_exists.return_value = False
+            with self.assertRaisesRegex(TaskGraphRuntimeError, "feature branch does not exist"):
+                task_graph_cli.checkout("demo-plan", "run-1")
+
+            git.reset_mock()
+            git.is_clean.side_effect = [True, False]
+            git.branch_exists.return_value = True
+            with self.assertRaisesRegex(TaskGraphRuntimeError, "integration worktree is dirty"):
+                task_graph_cli.checkout("demo-plan", "run-1")
+
+            git.remove_worktree_safely.assert_not_called()
+            git.switch_branch.assert_not_called()
+
+    @patch("scripts.task_graph_cli.TaskGraphGit")
+    @patch("scripts.task_graph_cli._repository_root")
     def test_merge_rejects_the_wrong_checked_out_branch(self, repository_root, git_class):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -216,7 +295,10 @@ class TaskGraphCliTests(unittest.TestCase):
             task_graph_cli._notify_run_completion(failed_run, failed_state)
 
             self.assertEqual(2, notify.call_count)
-            self.assertIn("merge demo-plan --run-id run-1", notify.call_args_list[0].kwargs["message"])
+            successful_message = notify.call_args_list[0].kwargs["message"]
+            self.assertIn("checkout demo-plan --run-id run-1", successful_message)
+            self.assertIn("merge demo-plan --run-id run-1", successful_message)
+            self.assertLess(successful_message.index("checkout"), successful_message.index("merge"))
             self.assertIn("status demo-plan --run-id run-2", notify.call_args_list[1].kwargs["message"])
             self.assertEqual(
                 {"completionStatus": "succeeded", "attemptedAt": ANY, "outcome": "delivered"},
@@ -339,14 +421,23 @@ class TaskGraphCliTests(unittest.TestCase):
         self.assertEqual("demo-plan", args.plan_slug)
         self.assertEqual("run-1", args.run_id)
 
-    def test_status_and_merge_are_runtime_cli_commands(self):
+    def test_status_merge_and_checkout_are_runtime_cli_commands(self):
         status_args = build_parser().parse_args(["status", "demo-plan"])
         merge_args = build_parser().parse_args(["merge", "demo-plan", "--run-id", "run-1"])
+        checkout_args = build_parser().parse_args(["checkout", "demo-plan", "--run-id", "run-1"])
 
         self.assertEqual("status", status_args.action)
         self.assertIsNone(status_args.run_id)
         self.assertEqual("merge", merge_args.action)
         self.assertEqual("run-1", merge_args.run_id)
+        self.assertEqual("checkout", checkout_args.action)
+        self.assertEqual("run-1", checkout_args.run_id)
+
+    def test_checkout_requires_a_run_id(self):
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit) as error:
+            build_parser().parse_args(["checkout", "demo-plan"])
+
+        self.assertEqual(2, error.exception.code)
 
     def test_controller_command_uses_the_immutable_run_directory(self):
         command = controller_command(Path("/repo/.agent/demo/runs/run-1"))
@@ -365,6 +456,7 @@ class TaskGraphCliTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("start", result.stdout)
         self.assertIn("resume", result.stdout)
+        self.assertIn("checkout", result.stdout)
         self.assertNotIn("eval-controller", result.stdout)
 
     @patch("scripts.task_graph_cli.ensure_clean_base")
