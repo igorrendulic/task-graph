@@ -34,8 +34,10 @@ def format_dashboard(
     running = sum(task["status"] in {"running", "awaiting_integration", "integrating"} for task in task_states.values())
     percent = int(integrated * 100 / total) if total else 100
     elapsed = _duration(current - float(state.get("createdAt", current)))
-    title = f"Task Graph  {state.get('planSlug', '?')} / {state.get('runId', '?')}"
-    summary = f"{integrated}/{total} complete  |  {running} running  |  {percent}%  |  elapsed {elapsed}"
+    title = _shorten(f"Task Graph  {state.get('planSlug', '?')} / {state.get('runId', '?')}", width)
+    summary = _shorten(
+        f"{integrated}/{total} complete  |  {running} running  |  {percent}%  |  elapsed {elapsed}", width
+    )
     lines = [f"{CSI}1m{title}{RESET}", summary, "─" * max(1, width)]
     compact = width < 80
     for task_id, task_state in task_states.items():
@@ -44,12 +46,20 @@ def format_dashboard(
         symbol, colour = STYLES.get(task_state["status"], ("?", "37"))
         label = f"{symbol} {task_id} {status}"
         styled_label = f"{CSI}{colour}m{label}{RESET}"
-        instruction = _shorten(str(task.get("instructions", "")), max(12, width - len(task_id) - 8))
         detail = _task_detail(task_state, task, task_states, current)
         if compact:
+            instruction = _shorten(str(task.get("instructions", "")), max(1, width - len(label) - 2))
+            detail = _shorten(detail, max(1, width - 2))
             lines.extend([f"{styled_label}  {instruction}", f"  {detail}"])
         else:
-            lines.append(f"{styled_label}  {instruction:<{max(12, width // 2)}} {detail}")
+            remaining = max(2, width - len(label) - 4)
+            instruction_width = remaining // 2
+            detail_width = remaining - instruction_width
+            instruction = _shorten(str(task.get("instructions", "")), instruction_width)
+            lines.append(
+                f"{styled_label}  {instruction:<{instruction_width}}  "
+                f"{_shorten(detail, detail_width)}"
+            )
     return "\n".join(lines)
 
 
@@ -64,6 +74,7 @@ class TerminalDashboard:
         self._started = False
         self._closed = False
         self._panel_height = 0
+        self._page_start = 0
 
     def start(self, state: Mapping[str, Any], tasks: Mapping[str, Mapping[str, Any]], *, now: float | None = None) -> None:
         self._started = True
@@ -82,8 +93,7 @@ class TerminalDashboard:
         if not self._started or self._closed:
             return
         columns, rows = self.size_provider()
-        panel = format_dashboard(state, tasks, now=now, width=max(20, columns))
-        lines = panel.splitlines()
+        lines = self._visible_panel(state, tasks, max(20, columns), max(1, rows), now)
         previous_height = self._panel_height
         self._panel_height = len(lines)
         self.output.write(f"{CSI}r")
@@ -95,6 +105,44 @@ class TerminalDashboard:
         self.output.write(f"{CSI}{scroll_top};{max(scroll_top, rows)}r")
         self.output.write(f"{CSI}{max(scroll_top, rows)};1H")
         self.output.flush()
+
+    def _visible_panel(
+        self,
+        state: Mapping[str, Any],
+        tasks: Mapping[str, Mapping[str, Any]],
+        columns: int,
+        rows: int,
+        now: float | None,
+    ) -> list[str]:
+        """Fit a rotating task page above one line reserved for append-only events."""
+        lines = format_dashboard(state, tasks, now=now, width=columns).splitlines()
+        maximum_height = max(1, rows - 1)
+        if len(lines) <= maximum_height:
+            self._page_start = 0
+            return lines
+
+        header = lines[:3]
+        task_lines = lines[3:]
+        task_height = 2 if columns < 80 else 1
+        capacity = maximum_height - len(header) - 1
+        capacity -= capacity % task_height
+        if capacity < task_height:
+            return header[:maximum_height]
+
+        task_count = len(task_lines) // task_height
+        visible_count = capacity // task_height
+        start = self._page_start % task_count
+        indexes = [(start + offset) % task_count for offset in range(visible_count)]
+        visible = [
+            line
+            for index in indexes
+            for line in task_lines[index * task_height:(index + 1) * task_height]
+        ]
+        self._page_start = (start + visible_count) % task_count
+        first = start + 1
+        last = indexes[-1] + 1
+        notice = f"… showing tasks {first}-{last} of {task_count}; refresh rotates pages"
+        return [*header, *visible, _shorten(notice, columns)]
 
     def finish(self, state: Mapping[str, Any], tasks: Mapping[str, Mapping[str, Any]], summary: str, *, now: float | None = None) -> None:
         self.record_event({"kind": "completion", "detail": summary})

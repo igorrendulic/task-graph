@@ -1,4 +1,5 @@
 import io
+import re
 import unittest
 
 from scripts.task_graph_display import TerminalDashboard, format_dashboard
@@ -69,6 +70,13 @@ class TaskGraphDisplayTests(unittest.TestCase):
         self.assertIn("Build the live dashboard", lines[running_index])
         self.assertIn("running 00:10", lines[running_index + 1])
 
+    def test_formatter_bounds_wide_rows_to_the_terminal_width(self):
+        panel = format_dashboard(_state(), TASKS, now=105.0, width=80)
+
+        visible_lines = [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in panel.splitlines()]
+
+        self.assertTrue(all(len(line) <= 80 for line in visible_lines))
+
     def test_terminal_adapter_reserves_panel_redraws_for_resize_and_cleans_up(self):
         output = io.StringIO()
         size = [(100, 30), (60, 20)]
@@ -98,3 +106,18 @@ class TaskGraphDisplayTests(unittest.TestCase):
 
         self.assertIn("launch 002-second", event_output)
         self.assertNotIn("launch 002-second", format_dashboard(_state(), TASKS, now=106.0, width=100))
+
+    def test_terminal_adapter_pages_an_oversized_task_list_without_clipping(self):
+        output = io.StringIO()
+        dashboard = TerminalDashboard(output, size_provider=lambda: (100, 7))
+
+        dashboard.start(_state(), TASKS, now=105.0)
+        first_page = output.getvalue()
+        dashboard.redraw(_state(), TASKS, now=106.0)
+        second_page = output.getvalue()[len(first_page):]
+
+        self.assertIn("showing tasks", first_page)
+        self.assertIn("001-first", first_page)
+        self.assertIn("003-third", second_page)
+        self.assertNotIn("\x1b[8;1H", output.getvalue())
+        self.assertIn(";7r", output.getvalue())
