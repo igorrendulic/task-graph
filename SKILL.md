@@ -5,6 +5,15 @@ description: Turn approved implementation plans into plan-isolated task files an
 
 # Task Graph
 
+## When to use this skill
+
+Use Task Graph only when an approved implementation plan is available.
+
+- To convert that plan into task briefs, a kanban board, and a dependency-safe DAG, use `tasks`.
+- To execute a validated DAG from a clean repository, use `start`.
+- To continue an interrupted run, use `resume`.
+- If the user has not yet approved an implementation plan, use the appropriate planning or brainstorming workflow first; do not create Task Graph artifacts.
+
 ## Board Paths
 
 Assume the repository root is the current working directory unless the user gives another path.
