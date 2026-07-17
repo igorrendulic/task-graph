@@ -1,8 +1,11 @@
 import subprocess
 import sys
 import unittest
+from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
+from scripts import task_graph_cli
 from scripts.task_graph_cli import build_parser, controller_command
 
 
@@ -25,6 +28,17 @@ class TaskGraphCliTests(unittest.TestCase):
         args = build_parser().parse_args(["eval-controller"])
 
         self.assertEqual("eval-controller", args.action)
+
+    @patch("scripts.task_graph_controller_eval.run_controller_evals")
+    @patch.object(sys, "argv", ["task_graph_cli.py", "eval-controller"])
+    def test_controller_eval_command_runs_the_opt_in_harness(self, run_evals):
+        output = StringIO()
+
+        with patch("sys.stdout", output):
+            self.assertEqual(0, task_graph_cli.main())
+
+        run_evals.assert_called_once_with()
+        self.assertEqual("", output.getvalue())
 
     def test_controller_command_uses_the_immutable_run_directory(self):
         command = controller_command(Path("/repo/.agent/demo/runs/run-1"))

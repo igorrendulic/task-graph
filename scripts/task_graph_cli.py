@@ -192,7 +192,6 @@ def main() -> int:
             from scripts.task_graph_controller_eval import run_controller_evals
 
             run_controller_evals()
-            print("controller integration evals passed")
         else:
             run_controller(args.run_dir)
     except TaskGraphRuntimeError as exc:
