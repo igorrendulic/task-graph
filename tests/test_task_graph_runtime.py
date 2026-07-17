@@ -63,9 +63,11 @@ class TaskGraphRuntimeTests(unittest.TestCase):
             task_digests={"001-first": "task-digest"},
             max_workers=2,
             task_ids=["001-first"],
+            git_common_dir="/repo/.git",
         )
 
         self.assertEqual("codex", state["workerCommand"])
+        self.assertEqual("/repo/.git", state["gitCommonDir"])
 
     def test_snapshot_uses_original_dag_and_task_content_after_plan_changes(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -99,12 +101,34 @@ class TaskGraphRuntimeTests(unittest.TestCase):
                 task_digests={"001-first": "task-digest"},
                 max_workers=2,
                 task_ids=["001-first"],
+                git_common_dir="/repo/.git",
             )
             write_state(run_dir, state)
             state["tasks"]["001-first"]["status"] = "running"
             write_state(run_dir, state)
 
             self.assertEqual("running", load_state(run_dir)["tasks"]["001-first"]["status"])
+
+    def test_legacy_state_without_git_common_dir_requires_a_fresh_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp)
+            state = create_state(
+                run_id="run-1",
+                plan_slug="demo-plan",
+                repository="/repo",
+                feature_branch="task-graph/demo-plan/run-1",
+                base_commit="abc123",
+                snapshot_digest="digest",
+                task_digests={"001-first": "task-digest"},
+                max_workers=2,
+                task_ids=["001-first"],
+                git_common_dir="/repo/.git",
+            )
+            del state["gitCommonDir"]
+            write_state(run_dir, state)
+
+            with self.assertRaisesRegex(TaskGraphRuntimeError, "start a fresh run from a clean base"):
+                load_state(run_dir)
 
     def test_second_lock_holder_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:

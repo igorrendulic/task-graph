@@ -30,6 +30,21 @@ class TaskGraphGit:
     def head_sha(self, worktree: Path | None = None) -> str:
         return self._run(worktree or self.repository, "rev-parse", "HEAD").strip()
 
+    def common_dir(self) -> Path:
+        """Return the absolute shared Git metadata directory for this repository."""
+        raw_path = self._run(
+            self.repository,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ).strip()
+        common_dir = Path(raw_path)
+        if not raw_path or not common_dir.is_absolute() or not common_dir.is_dir():
+            raise TaskGraphGitError(
+                "Git did not return an existing absolute shared metadata directory"
+            )
+        return common_dir.resolve()
+
     def create_branch(self, branch: str, base_commit: str) -> None:
         self._run(self.repository, "branch", branch, base_commit)
 

@@ -152,6 +152,7 @@ def create_state(
     task_digests: dict[str, str],
     max_workers: int,
     task_ids: list[str],
+    git_common_dir: str,
     worker_command: str = "codex",
 ) -> dict[str, Any]:
     """Create the only allowed initial task state for a controller run."""
@@ -159,11 +160,13 @@ def create_state(
         raise TaskGraphRuntimeError("max_workers must be at least 1")
     if not worker_command.strip():
         raise TaskGraphRuntimeError("worker command must not be empty")
+    common_dir = require_git_common_dir({"gitCommonDir": git_common_dir})
     return {
         "schemaVersion": STATE_SCHEMA_VERSION,
         "runId": run_id,
         "planSlug": plan_slug,
         "repository": repository,
+        "gitCommonDir": str(common_dir),
         "featureBranch": feature_branch,
         "baseCommit": base_commit,
         "dagDigest": snapshot_digest,
@@ -187,7 +190,22 @@ def load_state(run_dir: Path) -> dict[str, Any]:
         raise TaskGraphRuntimeError(f"cannot load run state: {exc}") from exc
     if not isinstance(value, dict) or value.get("schemaVersion") != STATE_SCHEMA_VERSION:
         raise TaskGraphRuntimeError("invalid run state schema")
+    require_git_common_dir(value)
     return value
+
+
+def require_git_common_dir(state: dict[str, Any]) -> Path:
+    """Return the persisted shared Git metadata path or reject an unsafe run."""
+    value = state.get("gitCommonDir")
+    if value is None:
+        raise TaskGraphRuntimeError(
+            "run state lacks gitCommonDir; start a fresh run from a clean base"
+        )
+    if not isinstance(value, str) or not value.strip() or not Path(value).is_absolute():
+        raise TaskGraphRuntimeError(
+            "run state has an invalid gitCommonDir; start a fresh run from a clean base"
+        )
+    return Path(value).resolve()
 
 
 def write_state(run_dir: Path, state: dict[str, Any]) -> None:

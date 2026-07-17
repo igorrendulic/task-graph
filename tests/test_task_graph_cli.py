@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr
 from io import StringIO
@@ -8,6 +9,8 @@ from unittest.mock import patch
 
 from scripts import task_graph_cli
 from scripts.task_graph_cli import build_parser, controller_command
+from scripts.task_graph_git import TaskGraphGitError
+from scripts.task_graph_runtime import TaskGraphRuntimeError, create_state, write_state
 
 
 class TaskGraphCliTests(unittest.TestCase):
@@ -56,3 +59,47 @@ class TaskGraphCliTests(unittest.TestCase):
         self.assertIn("start", result.stdout)
         self.assertIn("resume", result.stdout)
         self.assertNotIn("eval-controller", result.stdout)
+
+    @patch("scripts.task_graph_cli.ensure_clean_base")
+    @patch("scripts.task_graph_cli.TaskGraphGit")
+    @patch("scripts.task_graph_cli._repository_root")
+    def test_start_rejects_unresolvable_git_common_dir_before_creating_resources(
+        self, repository_root, git_class, ensure_clean
+    ):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / ".agent" / "demo-plan").mkdir(parents=True)
+            repository_root.return_value = root
+            git = git_class.return_value
+            git.common_dir.side_effect = TaskGraphGitError("not a git repository")
+
+            with self.assertRaisesRegex(TaskGraphRuntimeError, "cannot resolve shared Git metadata directory"):
+                task_graph_cli.start("demo-plan", 1)
+
+            git.create_branch.assert_not_called()
+            git.add_worktree.assert_not_called()
+            git.head_sha.assert_not_called()
+
+    @patch("scripts.task_graph_cli._repository_root")
+    def test_resume_rejects_legacy_state_without_git_common_dir(self, repository_root):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_dir = root / ".agent" / "demo-plan" / "runs" / "run-1"
+            state = create_state(
+                run_id="run-1",
+                plan_slug="demo-plan",
+                repository=str(root),
+                feature_branch="task-graph/demo-plan/run-1",
+                base_commit="abc123",
+                snapshot_digest="digest",
+                task_digests={"001-first": "task-digest"},
+                max_workers=1,
+                task_ids=["001-first"],
+                git_common_dir="/repo/.git",
+            )
+            del state["gitCommonDir"]
+            write_state(run_dir, state)
+            repository_root.return_value = root
+
+            with self.assertRaisesRegex(TaskGraphRuntimeError, "start a fresh run from a clean base"):
+                task_graph_cli.resume("demo-plan", "run-1")

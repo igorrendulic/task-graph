@@ -15,7 +15,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.task_graph_controller import TaskGraphController
-from scripts.task_graph_git import TaskGraphGit
+from scripts.task_graph_git import TaskGraphGit, TaskGraphGitError
 from scripts.task_graph_runtime import (
     RunLock,
     TaskGraphRuntimeError,
@@ -23,6 +23,7 @@ from scripts.task_graph_runtime import (
     create_state,
     ensure_clean_base,
     load_state,
+    require_git_common_dir,
     write_state,
 )
 from scripts.task_graph_tmux import TmuxClient
@@ -73,6 +74,12 @@ def start(plan_slug: str, max_workers: int, worker_command: str = "codex") -> st
     run_id = _run_id()
     run_dir = plan_dir / "runs" / run_id
     git = TaskGraphGit(repository)
+    try:
+        git_common_dir = git.common_dir()
+    except TaskGraphGitError as exc:
+        raise TaskGraphRuntimeError(
+            f"cannot resolve shared Git metadata directory before startup: {exc}"
+        ) from exc
     base_commit = git.head_sha(repository)
     snapshot = create_run_snapshot(plan_dir, run_dir)
     feature_branch = f"task-graph/{plan_slug}/{run_id}/feature"
@@ -88,6 +95,7 @@ def start(plan_slug: str, max_workers: int, worker_command: str = "codex") -> st
         task_digests=snapshot.task_digests,
         max_workers=max_workers,
         task_ids=[task["id"] for task in snapshot.dag["tasks"]],
+        git_common_dir=str(git_common_dir),
         worker_command=worker_command,
     )
     state["planDirectory"] = str(plan_dir)
@@ -116,11 +124,12 @@ def resume(plan_slug: str, run_id: str) -> str:
     run_dir = repository / ".agent" / plan_slug / "runs" / run_id
     if not run_dir.is_dir():
         raise TaskGraphRuntimeError(f"run does not exist: {run_dir}")
+    state = load_state(run_dir)
+    _validate_persisted_git_common_dir(state)
     try:
         with RunLock(run_dir):
             return _resume_locked(run_dir)
     except TaskGraphRuntimeError:
-        state = load_state(run_dir)
         tmux = TmuxClient()
         controller = state.get("controller", {})
         pane_id, pid = controller.get("paneId"), controller.get("pid")
@@ -141,6 +150,7 @@ def run_controller(run_dir: Path) -> None:
 
 def _resume_locked(run_dir: Path) -> str:
     state = load_state(run_dir)
+    _validate_persisted_git_common_dir(state)
     tmux = TmuxClient()
     controller = state.get("controller", {})
     pane_id, pid = controller.get("paneId"), controller.get("pid")
@@ -169,6 +179,22 @@ def _repository_root() -> Path:
     if result.returncode != 0:
         raise TaskGraphRuntimeError(result.stderr.strip() or "not inside a Git repository")
     return Path(result.stdout.strip()).resolve()
+
+
+def _validate_persisted_git_common_dir(state: dict[str, object]) -> Path:
+    persisted = require_git_common_dir(state)
+    try:
+        resolved = TaskGraphGit(Path(str(state["repository"]))).common_dir()
+    except (KeyError, TaskGraphGitError) as exc:
+        raise TaskGraphRuntimeError(
+            "cannot validate shared Git metadata directory; start a fresh run from a clean base"
+        ) from exc
+    if persisted != resolved:
+        raise TaskGraphRuntimeError(
+            "run state gitCommonDir does not match the repository; "
+            "start a fresh run from a clean base"
+        )
+    return persisted
 
 
 def _run_id() -> str:

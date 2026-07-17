@@ -60,6 +60,13 @@ Workers run focused tests from their task briefs and must make exactly one
 non-merge commit. The controller deliberately does not run a final full suite
 in this MVP.
 
+Each worker runs in `workspace-write` mode and is additionally granted access
+only to the repository's shared Git metadata directory, so it can stage and
+commit safely from its linked worktree. Python bytecode generation is disabled,
+and pytest runs with its cache provider disabled while preserving any existing
+`PYTEST_ADDOPTS`; workers therefore do not create `__pycache__/` or
+`.pytest_cache/` artifacts.
+
 To recover after interruption:
 
 ```bash

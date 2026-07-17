@@ -25,6 +25,16 @@ def _repo(root: Path) -> None:
 
 
 class TaskGraphGitTests(unittest.TestCase):
+    def test_common_dir_returns_owning_repository_metadata_from_linked_worktree(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            root.mkdir()
+            _repo(root)
+            linked = root.parent / "linked"
+            _git(root, "worktree", "add", "--quiet", "-b", "linked", str(linked))
+
+            self.assertEqual((root / ".git").resolve(), TaskGraphGit(linked).common_dir())
+
     def test_worker_commit_is_one_non_merge_commit_from_launch_base(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "repo"

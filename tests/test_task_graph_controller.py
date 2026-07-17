@@ -6,7 +6,13 @@ import unittest
 from pathlib import Path
 
 from scripts.task_graph_controller import TaskGraphController
-from scripts.task_graph_runtime import create_run_snapshot, create_state, load_state, write_state
+from scripts.task_graph_runtime import (
+    TaskGraphRuntimeError,
+    create_run_snapshot,
+    create_state,
+    load_state,
+    write_state,
+)
 from scripts.task_graph_tmux import PaneInfo
 
 
@@ -16,6 +22,9 @@ class FakeGit:
 
     def head_sha(self, worktree: Path) -> str:
         return "feature-head"
+
+    def common_dir(self) -> Path:
+        return Path("/repo/.git")
 
     def create_worker_worktree(self, path: Path, branch: str, base: str) -> None:
         path.mkdir(parents=True)
@@ -93,6 +102,7 @@ class TaskGraphControllerTests(unittest.TestCase):
                 feature_branch="task-graph/demo/run-1/feature", base_commit="base",
                 snapshot_digest=snapshot.dag_digest, task_digests=snapshot.task_digests,
                 max_workers=1, task_ids=["001-first", "002-second"],
+                git_common_dir="/repo/.git",
             )
             state["integrationWorktree"] = str(run / "integration")
             write_state(run, state)
@@ -148,6 +158,7 @@ class TaskGraphControllerTests(unittest.TestCase):
                 feature_branch="task-graph/demo/run-1/feature", base_commit="base",
                 snapshot_digest=snapshot.dag_digest, task_digests=snapshot.task_digests,
                 max_workers=2, task_ids=["001-first", "002-second"],
+                git_common_dir="/repo/.git",
             )
             state["integrationWorktree"] = str(run / "integration")
             state["planDirectory"] = str(plan)
@@ -173,6 +184,7 @@ class TaskGraphControllerTests(unittest.TestCase):
                 feature_branch="task-graph/demo/run-1/feature", base_commit="base",
                 snapshot_digest=snapshot.dag_digest, task_digests=snapshot.task_digests,
                 max_workers=1, task_ids=["001-first", "002-second"],
+                git_common_dir="/repo/.git",
             )
             state["integrationWorktree"] = str(run / "integration")
             state["session"] = "task-graph-demo-run-1"
@@ -207,6 +219,7 @@ class TaskGraphControllerTests(unittest.TestCase):
                 feature_branch="task-graph/demo/run-1/feature", base_commit="base",
                 snapshot_digest=snapshot.dag_digest, task_digests=snapshot.task_digests,
                 max_workers=1, task_ids=["001-first", "002-second"],
+                git_common_dir="/repo/.git",
             )
             state["integrationWorktree"] = str(run / "integration")
             state["planDirectory"] = str(plan)
@@ -249,6 +262,7 @@ class TaskGraphControllerTests(unittest.TestCase):
                 feature_branch="task-graph/demo/run-1/feature", base_commit="base",
                 snapshot_digest=snapshot.dag_digest, task_digests=snapshot.task_digests,
                 max_workers=1, task_ids=["001-first", "002-second"],
+                git_common_dir="/repo/.git",
             )
             state["workerCommand"] = "/tmp/controller-eval-worker"
             state["integrationWorktree"] = str(run / "integration")
@@ -261,3 +275,53 @@ class TaskGraphControllerTests(unittest.TestCase):
             TaskGraphController(run, git=FakeGit(), tmux=tmux).schedule_ready_tasks()
 
             self.assertIn("/tmp/controller-eval-worker", tmux.commands[0])
+
+    def test_worker_command_allows_shared_git_metadata_and_disables_python_test_caches(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plan = _make_plan(root)
+            run = plan / "runs" / "run-1"
+            snapshot = create_run_snapshot(plan, run)
+            state = create_state(
+                run_id="run-1", plan_slug="demo", repository=str(root),
+                feature_branch="task-graph/demo/run-1/feature", base_commit="base",
+                snapshot_digest=snapshot.dag_digest, task_digests=snapshot.task_digests,
+                max_workers=1, task_ids=["001-first", "002-second"],
+                git_common_dir="/repo/.git",
+            )
+            state["integrationWorktree"] = str(run / "integration")
+            state["planDirectory"] = str(plan)
+            state["session"] = "task-graph-demo-run-1"
+            state["tasks"]["001-first"].update(status="integrated", commitSha="abc123")
+            write_state(run, state)
+            tmux = FakeTmux()
+
+            TaskGraphController(run, git=FakeGit(), tmux=tmux).schedule_ready_tasks()
+
+            command = tmux.commands[0]
+            self.assertIn("--sandbox workspace-write", command)
+            self.assertIn("--add-dir /repo/.git", command)
+            self.assertIn("PYTHONDONTWRITEBYTECODE=1", command)
+            self.assertIn(
+                'PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+${PYTEST_ADDOPTS} }-p no:cacheprovider"',
+                command,
+            )
+
+    def test_controller_rejects_legacy_state_without_git_common_dir(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plan = _make_plan(root)
+            run = plan / "runs" / "run-1"
+            snapshot = create_run_snapshot(plan, run)
+            state = create_state(
+                run_id="run-1", plan_slug="demo", repository=str(root),
+                feature_branch="task-graph/demo/run-1/feature", base_commit="base",
+                snapshot_digest=snapshot.dag_digest, task_digests=snapshot.task_digests,
+                max_workers=1, task_ids=["001-first", "002-second"],
+                git_common_dir="/repo/.git",
+            )
+            del state["gitCommonDir"]
+            write_state(run, state)
+
+            with self.assertRaisesRegex(TaskGraphRuntimeError, "start a fresh run from a clean base"):
+                TaskGraphController(run, git=FakeGit(), tmux=FakeTmux())

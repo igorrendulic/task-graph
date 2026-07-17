@@ -10,7 +10,13 @@ from typing import Any
 
 from scripts.task_graph_board import move_task, render_kanban
 from scripts.task_graph_git import TaskGraphGit, TaskGraphGitError
-from scripts.task_graph_runtime import load_snapshot, load_state, write_state
+from scripts.task_graph_runtime import (
+    TaskGraphRuntimeError,
+    load_snapshot,
+    load_state,
+    require_git_common_dir,
+    write_state,
+)
 from scripts.task_graph_tmux import TmuxClient
 
 
@@ -30,6 +36,19 @@ class TaskGraphController:
         self.state = load_state(self.run_dir)
         self.tasks = {task["id"]: task for task in self.snapshot.dag["tasks"]}
         self.git = git or TaskGraphGit(Path(self.state["repository"]))
+        self.git_common_dir = require_git_common_dir(self.state)
+        try:
+            resolved_common_dir = self.git.common_dir()
+        except TaskGraphGitError as exc:
+            raise TaskGraphRuntimeError(
+                "cannot validate shared Git metadata directory; "
+                "start a fresh run from a clean base"
+            ) from exc
+        if self.git_common_dir != resolved_common_dir:
+            raise TaskGraphRuntimeError(
+                "run state gitCommonDir does not match the repository; "
+                "start a fresh run from a clean base"
+            )
         self.tmux = tmux or TmuxClient()
         self.codex_bin = codex_bin or self.state.get("workerCommand", "codex")
         self.integration_worktree = Path(self.state["integrationWorktree"])
@@ -231,6 +250,8 @@ the Task Graph controller/runtime artifacts.
                 "--json",
                 "--sandbox",
                 "workspace-write",
+                "--add-dir",
+                shlex.quote(str(self.git_common_dir)),
                 "-C",
                 shlex.quote(str(worktree)),
                 shlex.quote(self.build_worker_prompt(task_id, repair_context)),
@@ -248,6 +269,8 @@ the Task Graph controller/runtime artifacts.
             f"| {shlex.quote(sys.executable)} {shlex.quote(str(formatter))} & stdout_pid=$!; "
             f"tee {shlex.quote(str(stderr))} <\"$stderr_pipe\" "
             "| tee \"$combined_pipe\" >&2 & stderr_pid=$!; "
+            "PYTHONDONTWRITEBYTECODE=1 "
+            'PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+${PYTEST_ADDOPTS} }-p no:cacheprovider" '
             f"{codex} >\"$stdout_pipe\" 2>\"$stderr_pipe\"; code=$?; "
             "wait \"$stdout_pid\"; wait \"$stderr_pid\"; wait \"$combined_pid\"; "
             f"printf '%s\\n' \"$code\" >{shlex.quote(str(exit_file))}; exit \"$code\""
