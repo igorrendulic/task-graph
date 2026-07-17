@@ -46,6 +46,22 @@ The DAG has a `schemaVersion`, `planSlug`, and task records with stable IDs, tas
 
 The main [skill entry point](SKILL.md) stays short as more workflows are added. The complete `tasks` contract lives in [the DAG-generation reference](references/dag-generation.md), which the skill requires agents to read before generating planning artifacts.
 
+## Start implementation
+
+With a generated DAG and a clean, committed checkout, prompt Codex:
+
+> Invoke `$task-graph start` for `<plan-slug>` with up to 4 workers.
+
+Codex starts the controller and returns an attach command such as:
+
+```bash
+tmux attach-session -t task-graph-<plan-slug>-<run-id>
+```
+
+Run that command to observe the controller and worker windows. The panes show
+live task progress, commands, file changes, agent messages, and completion or
+error output; finished worker panes remain available for inspection.
+
 ## Conservative scheduling
 
 `dependsOn` is authoritative: a task can begin only after all listed task IDs are complete. `parallelSafe` is explanatory evidence, not a second scheduler.
