@@ -276,6 +276,46 @@ class TaskGraphControllerTests(unittest.TestCase):
             self.assertEqual("awaiting_integration", controller.state["tasks"]["001-first"]["status"])
             self.assertEqual(["worker_exit"], [event["kind"] for event in events])
 
+    def test_terminal_event_failure_does_not_prevent_a_worker_exit_state_write(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plan = _make_plan(root)
+            run = plan / "runs" / "run-1"
+            snapshot = create_run_snapshot(plan, run)
+            state = create_state(
+                run_id="run-1", plan_slug="demo", repository=str(root),
+                feature_branch="task-graph/demo/run-1/feature", base_commit="base",
+                snapshot_digest=snapshot.dag_digest, task_digests=snapshot.task_digests,
+                max_workers=1, task_ids=["001-first", "002-second"],
+                git_common_dir="/repo/.git",
+            )
+            state["integrationWorktree"] = str(run / "integration")
+            exit_file = run / "logs" / "first.exit"
+            exit_file.parent.mkdir(parents=True)
+            exit_file.write_text("0\n", encoding="utf-8")
+            state["tasks"]["001-first"].update(
+                status="running",
+                attempts=[{
+                    "worktree": str(run / "worktrees" / "first"),
+                    "launchBaseSha": "base",
+                    "exitFile": str(exit_file),
+                }],
+            )
+            write_state(run, state)
+            git = FakeGit()
+            git.inspect_one_task_commit = lambda *_: SimpleNamespace(
+                valid=True, commit_sha="abc123", commit_count=1, has_merge=False
+            )
+
+            def broken_terminal(_: dict[str, str]) -> None:
+                raise OSError("terminal unavailable")
+
+            TaskGraphController(
+                run, git=git, tmux=FakeTmux(), event_sink=broken_terminal
+            ).poll_running_attempts()
+
+            self.assertEqual("awaiting_integration", load_state(run)["tasks"]["001-first"]["status"])
+
     def test_ready_dependent_creates_a_fresh_observable_attempt(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

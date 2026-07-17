@@ -316,7 +316,10 @@ the Task Graph controller/runtime artifacts.
             event = {"kind": event_kind, "taskId": task_id, "from": previous, "to": status}
             if detail:
                 event["detail"] = detail
-            self.event_sink(event)
+            try:
+                self.event_sink(event)
+            except (OSError, ValueError):
+                pass
         return True
 
     def _update_board(self, task_id: str, column: str) -> None:
