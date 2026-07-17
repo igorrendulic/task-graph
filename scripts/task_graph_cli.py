@@ -15,6 +15,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.task_graph_controller import TaskGraphController
+from scripts.task_graph_display import TerminalDashboard
 from scripts.task_graph_git import TaskGraphGit, TaskGraphGitError
 from scripts.task_graph_runtime import (
     RunLock,
@@ -141,11 +142,25 @@ def resume(plan_slug: str, run_id: str) -> str:
 def run_controller(run_dir: Path) -> None:
     """Long-lived tmux service loop. The lock prevents duplicate schedulers."""
     with RunLock(run_dir, blocking=True):
-        controller = TaskGraphController(run_dir)
-        while not controller.is_complete():
-            controller.run_once()
-            if not controller.is_complete():
-                time.sleep(1)
+        dashboard = TerminalDashboard(sys.stdout)
+        controller = TaskGraphController(run_dir, event_sink=dashboard.record_event)
+        try:
+            dashboard.start(controller.state, controller.tasks)
+            while not controller.is_complete():
+                controller.run_once()
+                dashboard.redraw(controller.state, controller.tasks)
+                if not controller.is_complete():
+                    time.sleep(1)
+            dashboard.finish(controller.state, controller.tasks, _run_summary(controller.state))
+        finally:
+            dashboard.cleanup()
+
+
+def _run_summary(state: dict[str, object]) -> str:
+    tasks = state["tasks"]
+    assert isinstance(tasks, dict)
+    counts = {status: sum(item["status"] == status for item in tasks.values()) for status in ("integrated", "failed", "blocked")}
+    return f"run complete: {counts['integrated']} integrated, {counts['failed']} failed, {counts['blocked']} blocked"
 
 
 def _resume_locked(run_dir: Path) -> str:

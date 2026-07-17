@@ -14,6 +14,34 @@ from scripts.task_graph_runtime import TaskGraphRuntimeError, create_state, writ
 
 
 class TaskGraphCliTests(unittest.TestCase):
+    @patch("scripts.task_graph_cli.TerminalDashboard")
+    @patch("scripts.task_graph_cli.TaskGraphController")
+    def test_controller_cleans_up_dashboard_when_initial_draw_raises(
+        self, controller_class, dashboard_class
+    ):
+        dashboard_class.return_value.start.side_effect = RuntimeError("terminal gone")
+
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(RuntimeError, "terminal gone"):
+                task_graph_cli.run_controller(Path(temp))
+
+        dashboard_class.return_value.cleanup.assert_called_once()
+
+    @patch("scripts.task_graph_cli.TerminalDashboard")
+    @patch("scripts.task_graph_cli.TaskGraphController")
+    @patch("scripts.task_graph_cli.time.sleep")
+    def test_controller_lifecycle_uses_dashboard_and_leaves_final_summary(self, sleep, controller_class, dashboard_class):
+        with tempfile.TemporaryDirectory() as temp:
+            controller = controller_class.return_value
+            controller.is_complete.side_effect = [False, True, True]
+            controller.state = {"tasks": {"001": {"status": "integrated"}}}
+            controller.tasks = {"001": {"instructions": "Finish."}}
+            task_graph_cli.run_controller(Path(temp))
+
+            dashboard_class.return_value.start.assert_called_once()
+            controller.run_once.assert_called_once()
+            dashboard_class.return_value.finish.assert_called_once()
+            sleep.assert_not_called()
     def test_start_accepts_fixed_max_worker_limit(self):
         args = build_parser().parse_args(["start", "demo-plan", "--max-workers", "3"])
 

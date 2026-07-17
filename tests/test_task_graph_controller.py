@@ -91,6 +91,34 @@ def _make_plan(root: Path) -> Path:
 
 
 class TaskGraphControllerTests(unittest.TestCase):
+    def test_transition_events_are_emitted_once_for_real_lifecycle_changes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plan = _make_plan(root)
+            run = plan / "runs" / "run-1"
+            snapshot = create_run_snapshot(plan, run)
+            state = create_state(
+                run_id="run-1", plan_slug="demo", repository=str(root),
+                feature_branch="task-graph/demo/run-1/feature", base_commit="base",
+                snapshot_digest=snapshot.dag_digest, task_digests=snapshot.task_digests,
+                max_workers=1, task_ids=["001-first", "002-second"],
+                git_common_dir="/repo/.git",
+            )
+            state["integrationWorktree"] = str(run / "integration")
+            write_state(run, state)
+            events = []
+            controller = TaskGraphController(run, git=FakeGit(), tmux=FakeTmux(), event_sink=events.append)
+
+            controller._transition("001-first", "running", "launch")
+            controller._transition("001-first", "running", "launch")
+            controller._transition("001-first", "retrying", "retry", "worker exit 1")
+
+            self.assertEqual(
+                [
+                    {"kind": "launch", "taskId": "001-first", "from": "pending", "to": "running"},
+                    {"kind": "retry", "taskId": "001-first", "from": "running", "to": "retrying", "detail": "worker exit 1"},
+                ], events,
+            )
     def test_worker_command_streams_formatted_output_and_preserves_raw_logs(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -6,6 +6,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from scripts.task_graph_board import move_task, render_kanban
@@ -30,6 +31,7 @@ class TaskGraphController:
         git: TaskGraphGit | None = None,
         tmux: TmuxClient | None = None,
         codex_bin: str | None = None,
+        event_sink: Callable[[dict[str, str]], None] | None = None,
     ) -> None:
         self.run_dir = run_dir.resolve()
         self.snapshot = load_snapshot(self.run_dir)
@@ -52,6 +54,7 @@ class TaskGraphController:
         self.tmux = tmux or TmuxClient()
         self.codex_bin = codex_bin or self.state.get("workerCommand", "codex")
         self.integration_worktree = Path(self.state["integrationWorktree"])
+        self.event_sink = event_sink
 
     def build_worker_prompt(self, task_id: str, repair_context: str | None = None) -> str:
         """Build a self-contained prompt without relying on `.agent` in a worktree."""
@@ -109,10 +112,10 @@ the Task Graph controller/runtime artifacts.
                 continue
             commit = task_state.get("commitSha")
             if commit and self.git.is_ancestor(commit, self.integration_worktree):
-                task_state["status"] = "integrated"
+                self._transition(task_id, "integrated", "integration")
                 task_state["integratedAt"] = time.time()
             else:
-                task_state["status"] = "awaiting_integration"
+                self._transition(task_id, "awaiting_integration", "worker_exit")
         write_state(self.run_dir, self.state)
 
     def poll_running_attempts(self) -> None:
@@ -154,7 +157,7 @@ the Task Graph controller/runtime artifacts.
             if task_state["status"] != "awaiting_integration":
                 continue
             commit = task_state["commitSha"]
-            task_state["status"] = "integrating"
+            self._transition(task_id, "integrating")
             write_state(self.run_dir, self.state)
             try:
                 self.git.cherry_pick(self.integration_worktree, commit)
@@ -163,7 +166,7 @@ the Task Graph controller/runtime artifacts.
                 self._record_failure(task_id, f"cherry-pick failed: {exc}")
                 write_state(self.run_dir, self.state)
                 continue
-            task_state["status"] = "integrated"
+            self._transition(task_id, "integrated", "integration")
             task_state["integratedAt"] = time.time()
             attempt = task_state["attempts"][-1]
             try:
@@ -215,7 +218,7 @@ the Task Graph controller/runtime artifacts.
             "pid": None,
         }
         task_state["attempts"].append(attempt)
-        task_state["status"] = "running"
+        self._transition(task_id, "running", "launch")
         self._update_board(task_id, "in-progress")
         write_state(self.run_dir, self.state)
 
@@ -281,9 +284,9 @@ the Task Graph controller/runtime artifacts.
         task_state = self.state["tasks"][task_id]
         task_state["attempts"][-1]["failureSummary"] = summary
         if len(task_state["attempts"]) < 2:
-            task_state["status"] = "retrying"
+            self._transition(task_id, "retrying", "retry", summary)
             return
-        task_state["status"] = "failed"
+        self._transition(task_id, "failed", "failure", summary)
         self._block_descendants(task_id)
 
     def _block_descendants(self, failed_task_id: str) -> None:
@@ -298,9 +301,23 @@ the Task Graph controller/runtime artifacts.
                     self.state["tasks"][dependency]["status"] in {"failed", "blocked"}
                     for dependency in task["dependsOn"]
                 ):
-                    task_state["status"] = "blocked"
+                    self._transition(task_id, "blocked", "block", failed_task_id)
                     task_state["blockedBy"] = failed_task_id
                     changed = True
+
+    def _transition(self, task_id: str, status: str, event_kind: str | None = None, detail: str | None = None) -> bool:
+        """Change state once and publish only real lifecycle transitions."""
+        task_state = self.state["tasks"][task_id]
+        previous = task_state["status"]
+        if previous == status:
+            return False
+        task_state["status"] = status
+        if event_kind and self.event_sink:
+            event = {"kind": event_kind, "taskId": task_id, "from": previous, "to": status}
+            if detail:
+                event["detail"] = detail
+            self.event_sink(event)
+        return True
 
     def _update_board(self, task_id: str, column: str) -> None:
         plan_directory = self.state.get("planDirectory")
