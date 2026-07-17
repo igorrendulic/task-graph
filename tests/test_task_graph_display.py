@@ -67,7 +67,7 @@ class TaskGraphDisplayTests(unittest.TestCase):
         lines = panel.splitlines()
         running_index = next(index for index, line in enumerate(lines) if "002-second" in line)
 
-        self.assertIn("Build the live dashboard", lines[running_index])
+        self.assertIn("Build the live dashboard", lines[running_index + 1])
         self.assertIn("running 00:10", lines[running_index + 1])
 
     def test_formatter_bounds_wide_rows_to_the_terminal_width(self):
@@ -76,6 +76,14 @@ class TaskGraphDisplayTests(unittest.TestCase):
         visible_lines = [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in panel.splitlines()]
 
         self.assertTrue(all(len(line) <= 80 for line in visible_lines))
+
+    def test_formatter_keeps_compact_rows_within_a_twenty_column_terminal(self):
+        panel = format_dashboard(_state(), TASKS, now=105.0, width=20)
+
+        visible_lines = [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in panel.splitlines()]
+
+        self.assertTrue(all(len(line) <= 20 for line in visible_lines))
+        self.assertEqual(15, len(visible_lines))
 
     def test_terminal_adapter_reserves_panel_redraws_for_resize_and_cleans_up(self):
         output = io.StringIO()
@@ -121,3 +129,19 @@ class TaskGraphDisplayTests(unittest.TestCase):
         self.assertIn("003-third", second_page)
         self.assertNotIn("\x1b[8;1H", output.getvalue())
         self.assertIn(";7r", output.getvalue())
+
+    def test_terminal_adapter_lists_wrapped_page_members_without_a_misleading_range(self):
+        output = io.StringIO()
+        state = _state()
+        del state["tasks"]["006-sixth"]
+        tasks = {task_id: task for task_id, task in TASKS.items() if task_id != "006-sixth"}
+        dashboard = TerminalDashboard(output, size_provider=lambda: (100, 7))
+
+        dashboard.start(state, tasks, now=105.0)
+        dashboard.redraw(state, tasks, now=106.0)
+        second_page = output.getvalue()
+        dashboard.redraw(state, tasks, now=107.0)
+        wrapped_page = output.getvalue()[len(second_page):]
+
+        self.assertIn("showing tasks 5, 1 of 5", wrapped_page)
+        self.assertNotIn("5-1", wrapped_page)

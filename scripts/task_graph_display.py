@@ -44,14 +44,16 @@ def format_dashboard(
         task = tasks.get(task_id, {})
         status = _display_status(task_state["status"])
         symbol, colour = STYLES.get(task_state["status"], ("?", "37"))
-        label = f"{symbol} {task_id} {status}"
-        styled_label = f"{CSI}{colour}m{label}{RESET}"
         detail = _task_detail(task_state, task, task_states, current)
         if compact:
-            instruction = _shorten(str(task.get("instructions", "")), max(1, width - len(label) - 2))
-            detail = _shorten(detail, max(1, width - 2))
-            lines.extend([f"{styled_label}  {instruction}", f"  {detail}"])
+            label = _shorten(f"{symbol} {status} {task_id}", width)
+            styled_label = f"{CSI}{colour}m{label}{RESET}"
+            instruction = _shorten(str(task.get("instructions", "")), max(1, width - 2))
+            compact_detail = instruction if detail == status else f"{detail} — {instruction}"
+            lines.extend([styled_label, f"  {_shorten(compact_detail, max(1, width - 2))}"])
         else:
+            label = _shorten(f"{symbol} {task_id} {status}", max(1, width - 6))
+            styled_label = f"{CSI}{colour}m{label}{RESET}"
             remaining = max(2, width - len(label) - 4)
             instruction_width = remaining // 2
             detail_width = remaining - instruction_width
@@ -139,9 +141,8 @@ class TerminalDashboard:
             for line in task_lines[index * task_height:(index + 1) * task_height]
         ]
         self._page_start = (start + visible_count) % task_count
-        first = start + 1
-        last = indexes[-1] + 1
-        notice = f"… showing tasks {first}-{last} of {task_count}; refresh rotates pages"
+        shown = ", ".join(str(index + 1) for index in indexes)
+        notice = f"… showing tasks {shown} of {task_count}; refresh rotates pages"
         return [*header, *visible, _shorten(notice, columns)]
 
     def finish(self, state: Mapping[str, Any], tasks: Mapping[str, Mapping[str, Any]], summary: str, *, now: float | None = None) -> None:
