@@ -89,13 +89,23 @@ the Task Graph controller/runtime artifacts.
         active = sum(
             task["status"] == "running" for task in self.state["tasks"].values()
         )
+        if any(
+            task_state["status"] == "running" and not self.tasks[task_id]["parallelSafe"]
+            for task_id, task_state in self.state["tasks"].items()
+        ):
+            return
         capacity = self.state["maxWorkers"] - active
         for task_id in sorted(self.tasks):
             if capacity <= 0:
                 break
             if self._is_ready(task_id):
+                if not self.tasks[task_id]["parallelSafe"] and active:
+                    continue
                 self._launch_attempt(task_id)
                 capacity -= 1
+                active += 1
+                if not self.tasks[task_id]["parallelSafe"]:
+                    return
 
     def run_once(self) -> None:
         """Reconcile persistence, inspect exits, integrate commits, then schedule."""

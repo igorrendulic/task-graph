@@ -209,6 +209,54 @@ class TaskGraphGitTests(unittest.TestCase):
 
             self.assertTrue(git.is_ancestor(commit, integration))
 
+    def test_integration_cherry_pick_preserves_an_intentionally_empty_worker_commit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            root.mkdir()
+            _repo(root)
+            git = TaskGraphGit(root)
+            base = git.head_sha(root)
+            feature = "task-graph/demo/run-1/feature"
+            integration = root / "integration"
+            worker = root / "worker"
+            git.create_branch(feature, base)
+            git.add_worktree(integration, feature)
+            git.create_worker_worktree(worker, "task-graph/demo/run-1/worker/verify", base)
+            _git(worker, "commit", "--allow-empty", "--quiet", "-m", "verify only")
+            commit = git.inspect_one_task_commit(worker, base).commit_sha
+
+            git.cherry_pick(integration, commit)
+
+            self.assertTrue(git.is_ancestor(commit, integration))
+
+    def test_integration_cherry_pick_keeps_commit_that_becomes_redundant(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            root.mkdir()
+            _repo(root)
+            git = TaskGraphGit(root)
+            base = git.head_sha(root)
+            feature = "task-graph/demo/run-1/feature"
+            integration = root / "integration"
+            first_worker = root / "first-worker"
+            second_worker = root / "second-worker"
+            git.create_branch(feature, base)
+            git.add_worktree(integration, feature)
+            git.create_worker_worktree(first_worker, "task-graph/demo/run-1/worker/first", base)
+            git.create_worker_worktree(second_worker, "task-graph/demo/run-1/worker/second", base)
+            for worker in (first_worker, second_worker):
+                (worker / "verification.txt").write_text("verified")
+                _git(worker, "add", "verification.txt")
+                _git(worker, "commit", "--quiet", "-m", f"verify {worker.name}")
+
+            git.cherry_pick(integration, git.head_sha(first_worker))
+            git.cherry_pick(integration, git.head_sha(second_worker))
+
+            self.assertEqual(
+                ["verify second-worker", "verify first-worker", "baseline"],
+                _git(integration, "log", "--format=%s", "-3").splitlines(),
+            )
+
     def test_multiple_commits_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "repo"

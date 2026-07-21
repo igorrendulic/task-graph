@@ -359,6 +359,38 @@ class TaskGraphControllerTests(unittest.TestCase):
             self.assertIn("code=$?", command)
             self.assertIn(str(Path(attempt["exitFile"])), command)
 
+    def test_non_parallel_safe_ready_task_waits_for_active_worker(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plan = _make_plan(root)
+            dag = json.loads((plan / "dag.json").read_text(encoding="utf-8"))
+            dag["tasks"][1]["dependsOn"] = []
+            (plan / "dag.json").write_text(json.dumps(dag), encoding="utf-8")
+            (plan / "todo" / "002-second.md").write_text(
+                "# Second\n\n## Dependencies\n\nNone\n", encoding="utf-8"
+            )
+            run = plan / "runs" / "run-1"
+            snapshot = create_run_snapshot(plan, run)
+            state = create_state(
+                run_id="run-1", plan_slug="demo", repository=str(root),
+                feature_branch="task-graph/demo/run-1/feature", base_commit="base",
+                snapshot_digest=snapshot.dag_digest, task_digests=snapshot.task_digests,
+                max_workers=2, task_ids=["001-first", "002-second"],
+                git_common_dir="/repo/.git",
+            )
+            state["integrationWorktree"] = str(run / "integration")
+            state["planDirectory"] = str(plan)
+            state["session"] = "task-graph-demo-run-1"
+            write_state(run, state)
+            git = FakeGit()
+
+            TaskGraphController(run, git=git, tmux=FakeTmux()).schedule_ready_tasks()
+
+            saved = load_state(run)
+            self.assertEqual("running", saved["tasks"]["001-first"]["status"])
+            self.assertEqual("pending", saved["tasks"]["002-second"]["status"])
+            self.assertEqual(1, len(git.worker_calls))
+
     def test_worker_command_comes_from_persisted_run_state(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

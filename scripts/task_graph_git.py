@@ -132,7 +132,14 @@ class TaskGraphGit:
         return CommitInspection(True, self.head_sha(worktree), commit_count, False)
 
     def cherry_pick(self, integration_worktree: Path, commit_sha: str) -> None:
-        self._run(integration_worktree, "cherry-pick", commit_sha)
+        self._run(
+            integration_worktree,
+            "cherry-pick",
+            "--ff",
+            "--allow-empty",
+            "--empty=keep",
+            commit_sha,
+        )
 
     def abort_cherry_pick(self, integration_worktree: Path) -> bool:
         result = self._run_result(integration_worktree, "rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD")

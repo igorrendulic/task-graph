@@ -170,7 +170,8 @@ atomic replacement. Each attempt retains raw stdout, raw stderr, and a
 chronological combined log in `runs/<run-id>/logs/`; failed worktrees remain
 available for investigation.
 Workers run focused tests from their task briefs and must make exactly one
-non-merge commit. The controller deliberately does not run a final full suite
+non-merge commit. Intentionally empty verification commits are retained during
+integration. The controller deliberately does not run a final full suite
 in this MVP.
 
 Each worker runs in `workspace-write` mode and is additionally granted access
