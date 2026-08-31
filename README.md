@@ -76,6 +76,47 @@ Run that command to observe the controller and worker windows. The panes show
 live task progress, commands, file changes, agent messages, and completion or
 error output; finished worker panes remain available for inspection.
 
+## Multi-project workspaces
+
+Task Graph can coordinate any number of independently versioned Git projects
+under a non-Git parent folder. Declare the projects it may touch in the parent
+workspace’s `.agent/task-graph.workspace.json`:
+
+```json
+{
+  "schemaVersion": 1,
+  "projects": [
+    { "id": "frontend", "path": "apps/frontend" },
+    { "id": "api", "path": "services/api" },
+    { "id": "worker", "path": "services/worker" }
+  ]
+}
+```
+
+Each path is safe and workspace-relative and must be an independent clean Git
+checkout. The workspace parent itself need not be a repository; undeclared
+folders are never touched. Workspace DAGs use schema version 2 and assign each
+task a declared `project`; task paths stay project-relative. Planning inspects
+all declared projects and uses normal `dependsOn` edges for shared contracts.
+
+```bash
+python3 scripts/task_graph_cli.py start <plan-slug> --workspace <workspace-root> --max-workers 4
+python3 scripts/task_graph_cli.py status <plan-slug> --workspace <workspace-root>
+python3 scripts/task_graph_cli.py resume <plan-slug> <run-id> --workspace <workspace-root>
+```
+
+Independent tasks in separate projects can execute concurrently. A dependent
+worker waits for its prerequisite to integrate and receives that project’s ID,
+integrated commit SHA, and integration worktree as read-only context. Each
+declared project has its own base metadata, feature branch, integration worktree, and
+worker worktrees, which status reports for review. After a coordinated success,
+inspect and promote projects explicitly:
+
+```bash
+python3 scripts/task_graph_cli.py checkout <plan-slug> --run-id <run-id> --workspace <workspace-root> --project api
+python3 scripts/task_graph_cli.py merge <plan-slug> --run-id <run-id> --workspace <workspace-root> --project api
+```
+
 ## Inspect and merge completed implementation
 
 After a run succeeds and all its tasks are integrated, check out its feature

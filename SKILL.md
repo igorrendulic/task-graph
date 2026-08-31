@@ -27,6 +27,30 @@ Assume the repository root is the current working directory unless the user give
 
 For every plan, read the supplied implementation plan and derive and announce a concise lowercase kebab-case `<plan-slug>` from its goal. Reuse that slug when resuming the same plan. The target repository must contain `.agent/`; if it does not, ask before creating project workflow files. Do not use or update a legacy shared `.agent/tasks`, `.agent/kanban.md`, or `.agent/runs` layout.
 
+### Multi-project workspaces
+
+For independently versioned projects under one parent folder, use the parent as
+the workspace root. It need not itself be a Git checkout. Declare only the
+projects Task Graph may execute in `.agent/task-graph.workspace.json`:
+
+```json
+{
+  "schemaVersion": 1,
+  "projects": [
+    { "id": "frontend", "path": "apps/frontend" },
+    { "id": "api", "path": "services/api" }
+  ]
+}
+```
+
+Every declared path must be a safe relative path to an independent Git root;
+undeclared folders are never touched. In a workspace DAG, every task must name
+one declared `project`, and `predictedPaths` are relative to that project.
+Inspect all declared projects while planning. Use cross-project `dependsOn`
+edges for contracts and delivery order; a dependent begins only after its
+prerequisite has been integrated into that prerequisite project’s integration
+worktree.
+
 ## `tasks` workflow
 
 Use this workflow when the user asks to turn an approved plan into implementation tasks.
@@ -43,6 +67,20 @@ session. Invoke it with:
 ```sh
 python3 scripts/task_graph_cli.py start <plan-slug> --max-workers <n>
 ```
+
+For a workspace, add `--workspace <workspace-root>` to every lifecycle command:
+
+```sh
+python3 scripts/task_graph_cli.py start <plan-slug> --workspace <workspace-root> --max-workers <n>
+python3 scripts/task_graph_cli.py resume <plan-slug> <run-id> --workspace <workspace-root>
+python3 scripts/task_graph_cli.py status <plan-slug> --workspace <workspace-root>
+```
+
+Workspace workers are isolated in their task’s project and receive each
+prerequisite project’s integration worktree, project ID, and integrated commit
+SHA as read-only implementation context. Independent tasks in distinct projects
+may run concurrently. The run retains one feature branch and integration
+worktree per used project for review.
 
 Return the exact `tmux attach-session -t task-graph-<plan-slug>-<run-id>`
 command printed by `start` to the current user so they can observe workers.
@@ -89,6 +127,14 @@ Promotion must name the run explicitly:
 
 ```sh
 python3 scripts/task_graph_cli.py merge <plan-slug> --run-id <run-id>
+```
+
+Workspace review and promotion are deliberately per project after the
+coordinated run succeeds:
+
+```sh
+python3 scripts/task_graph_cli.py checkout <plan-slug> --run-id <run-id> --workspace <workspace-root> --project <project-id>
+python3 scripts/task_graph_cli.py merge <plan-slug> --run-id <run-id> --workspace <workspace-root> --project <project-id>
 ```
 
 Before invoking `merge`, ensure all tasks are integrated, check out the base

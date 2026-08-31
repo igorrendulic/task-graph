@@ -86,16 +86,20 @@ def ensure_clean_base(repository: Path, plan_slug: str) -> None:
         )
 
 
-def create_run_snapshot(plan_dir: Path, run_dir: Path) -> Snapshot:
+def create_run_snapshot(
+    plan_dir: Path, run_dir: Path, *, workspace_project_ids: set[str] | None = None
+) -> Snapshot:
     """Validate then freeze the DAG and resolved task briefs for a single run."""
     dag_path = plan_dir / "dag.json"
     try:
-        validate_dag_file(dag_path, plan_dir)
+        validate_dag_file(dag_path, plan_dir, workspace_project_ids=workspace_project_ids)
     except DagValidationError as exc:
         raise TaskGraphRuntimeError(f"invalid plan DAG: {exc}") from exc
 
     dag_bytes = dag_path.read_bytes()
     dag = json.loads(dag_bytes)
+    if dag.get("schemaVersion") == 2 and workspace_project_ids is None:
+        raise TaskGraphRuntimeError("workspace DAG requires start --workspace <workspace-root>")
     input_dir = run_dir / "input"
     task_dir = input_dir / "tasks"
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -193,6 +197,10 @@ def load_state(run_dir: Path) -> dict[str, Any]:
         raise TaskGraphRuntimeError(f"cannot load run state: {exc}") from exc
     if not isinstance(value, dict) or value.get("schemaVersion") != STATE_SCHEMA_VERSION:
         raise TaskGraphRuntimeError("invalid run state schema")
+    if isinstance(value.get("projects"), dict):
+        if not value["projects"]:
+            raise TaskGraphRuntimeError("workspace run state has no projects")
+        return value
     require_git_common_dir(value)
     return value
 

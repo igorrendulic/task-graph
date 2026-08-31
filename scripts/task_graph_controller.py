@@ -37,32 +37,56 @@ class TaskGraphController:
         self.snapshot = load_snapshot(self.run_dir)
         self.state = load_state(self.run_dir)
         self.tasks = {task["id"]: task for task in self.snapshot.dag["tasks"]}
-        self.git = git or TaskGraphGit(Path(self.state["repository"]))
-        self.git_common_dir = require_git_common_dir(self.state)
-        try:
-            resolved_common_dir = self.git.common_dir()
-        except TaskGraphGitError as exc:
-            raise TaskGraphRuntimeError(
-                "cannot validate shared Git metadata directory; "
-                "start a fresh run from a clean base"
-            ) from exc
-        if self.git_common_dir != resolved_common_dir:
-            raise TaskGraphRuntimeError(
-                "run state gitCommonDir does not match the repository; "
-                "start a fresh run from a clean base"
-            )
+        self.workspace_mode = isinstance(self.state.get("projects"), dict)
+        if self.workspace_mode:
+            self.projects = self.state["projects"]
+            self.gits = {project_id: TaskGraphGit(Path(project["repository"])) for project_id, project in self.projects.items()}
+            for project_id, project in self.projects.items():
+                common_dir = Path(project["gitCommonDir"])
+                try:
+                    resolved_common_dir = self.gits[project_id].common_dir()
+                except TaskGraphGitError as exc:
+                    raise TaskGraphRuntimeError(f"cannot validate Git metadata for workspace project {project_id}: {exc}") from exc
+                if common_dir != resolved_common_dir:
+                    raise TaskGraphRuntimeError(f"workspace project {project_id} Git metadata does not match its repository")
+            self.git = None
+            self.git_common_dir = None
+        else:
+            self.projects = {}
+            self.git = git or TaskGraphGit(Path(self.state["repository"]))
+            self.git_common_dir = require_git_common_dir(self.state)
+            try:
+                resolved_common_dir = self.git.common_dir()
+            except TaskGraphGitError as exc:
+                raise TaskGraphRuntimeError(
+                    "cannot validate shared Git metadata directory; "
+                    "start a fresh run from a clean base"
+                ) from exc
+            if self.git_common_dir != resolved_common_dir:
+                raise TaskGraphRuntimeError(
+                    "run state gitCommonDir does not match the repository; "
+                    "start a fresh run from a clean base"
+                )
         self.tmux = tmux or TmuxClient()
         self.codex_bin = codex_bin or self.state.get("workerCommand", "codex")
-        self.integration_worktree = Path(self.state["integrationWorktree"])
+        self.integration_worktree = Path(self.state["integrationWorktree"]) if not self.workspace_mode else None
         self.event_sink = event_sink
 
     def build_worker_prompt(self, task_id: str, repair_context: str | None = None) -> str:
         """Build a self-contained prompt without relying on `.agent` in a worktree."""
         task = self.tasks[task_id]
-        dependency_lines = [
-            f"- {dependency}: {self.state['tasks'][dependency]['commitSha']}"
-            for dependency in task["dependsOn"]
-        ]
+        dependency_lines = []
+        for dependency in task["dependsOn"]:
+            dependency_task = self.tasks[dependency]
+            dependency_state = self.state["tasks"][dependency]
+            if self.workspace_mode:
+                project_id = dependency_task["project"]
+                project = self.projects[project_id]
+                dependency_lines.append(
+                    f"- {dependency}: project={project_id}; integratedCommit={dependency_state['commitSha']}; integrationWorktree={project['integrationWorktree']} (read-only)"
+                )
+            else:
+                dependency_lines.append(f"- {dependency}: {dependency_state['commitSha']}")
         dependencies = "\n".join(dependency_lines) or "- None"
         repair = repair_context or "None"
         return f"""You are the isolated worker for Task Graph task {task_id}.
@@ -116,12 +140,14 @@ the Task Graph controller/runtime artifacts.
 
     def reconcile(self) -> None:
         """Recover an interrupted integration without trusting stale status alone."""
-        self.git.abort_cherry_pick(self.integration_worktree)
         for task_id, task_state in self.state["tasks"].items():
             if task_state["status"] != "integrating":
                 continue
             commit = task_state.get("commitSha")
-            if commit and self.git.is_ancestor(commit, self.integration_worktree):
+            git = self._git_for_task(task_id)
+            integration = self._integration_for_task(task_id)
+            git.abort_cherry_pick(integration)
+            if commit and git.is_ancestor(commit, integration):
                 self._transition(task_id, "integrated", "integration")
                 task_state["integratedAt"] = time.time()
             else:
@@ -149,7 +175,7 @@ the Task Graph controller/runtime artifacts.
                 continue
             attempt["exitCode"] = exit_code
             attempt["endedAt"] = time.time()
-            inspection = self.git.inspect_one_task_commit(
+            inspection = self._git_for_task(task_id).inspect_one_task_commit(
                 Path(attempt["worktree"]), attempt["launchBaseSha"]
             )
             if exit_code == 0 and inspection.valid and inspection.commit_sha:
@@ -170,9 +196,9 @@ the Task Graph controller/runtime artifacts.
             self._transition(task_id, "integrating")
             write_state(self.run_dir, self.state)
             try:
-                self.git.cherry_pick(self.integration_worktree, commit)
+                self._git_for_task(task_id).cherry_pick(self._integration_for_task(task_id), commit)
             except TaskGraphGitError as exc:
-                self.git.abort_cherry_pick(self.integration_worktree)
+                self._git_for_task(task_id).abort_cherry_pick(self._integration_for_task(task_id))
                 self._record_failure(task_id, f"cherry-pick failed: {exc}")
                 write_state(self.run_dir, self.state)
                 continue
@@ -180,7 +206,7 @@ the Task Graph controller/runtime artifacts.
             task_state["integratedAt"] = time.time()
             attempt = task_state["attempts"][-1]
             try:
-                self.git.remove_worktree(Path(attempt["worktree"]))
+                self._git_for_task(task_id).remove_worktree(Path(attempt["worktree"]))
             except TaskGraphGitError:
                 attempt["cleanupFailed"] = True
             self._update_board(task_id, "done")
@@ -204,12 +230,11 @@ the Task Graph controller/runtime artifacts.
     def _launch_attempt(self, task_id: str) -> None:
         task_state = self.state["tasks"][task_id]
         attempt_number = len(task_state["attempts"]) + 1
-        launch_base = self.git.head_sha(self.integration_worktree)
-        worktree = self.run_dir / "worktrees" / f"{task_id}-attempt-{attempt_number}"
-        branch = (
-            f"task-graph/{self.state['planSlug']}/{self.state['runId']}"
-            f"/worker/{task_id}/attempt-{attempt_number}"
-        )
+        project_id = self.tasks[task_id].get("project")
+        launch_base = self._git_for_task(task_id).head_sha(self._integration_for_task(task_id))
+        worktree = self.run_dir / "worktrees" / (project_id or "repository") / f"{task_id}-attempt-{attempt_number}"
+        branch_prefix = f"task-graph/{self.state['planSlug']}/{self.state['runId']}"
+        branch = f"{branch_prefix}/{project_id}/worker/{task_id}/attempt-{attempt_number}" if project_id else f"{branch_prefix}/worker/{task_id}/attempt-{attempt_number}"
         logs = self.run_dir / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         prefix = logs / f"{task_id}-attempt-{attempt_number}"
@@ -232,7 +257,7 @@ the Task Graph controller/runtime artifacts.
         self._update_board(task_id, "in-progress")
         write_state(self.run_dir, self.state)
 
-        self.git.create_worker_worktree(worktree, branch, launch_base)
+        self._git_for_task(task_id).create_worker_worktree(worktree, branch, launch_base)
         repair_context = task_state["attempts"][-2].get("failureSummary") if attempt_number > 1 else None
         command = self._worker_command(worktree, task_id, attempt, repair_context)
         pane_id = self.tmux.create_window(
@@ -256,15 +281,21 @@ the Task Graph controller/runtime artifacts.
         exit_file = Path(attempt["exitFile"])
         formatter = Path(__file__).with_name("task_graph_jsonl.py")
         stream_template = combined.parent / ".task-graph-stream.XXXXXX"
-        codex = " ".join(
-            [
+        codex_args = [
                 shlex.quote(self.codex_bin),
                 "exec",
                 "--json",
                 "--sandbox",
                 "workspace-write",
                 "--add-dir",
-                shlex.quote(str(self.git_common_dir)),
+                shlex.quote(str(self._git_common_dir_for_task(task_id))),
+        ]
+        if self.workspace_mode:
+            for dependency in self.tasks[task_id]["dependsOn"]:
+                project = self.projects[self.tasks[dependency]["project"]]
+                codex_args.extend(["--add-dir", shlex.quote(str(project["integrationWorktree"]))])
+        codex = " ".join(
+            codex_args + [
                 "-C",
                 shlex.quote(str(worktree)),
                 shlex.quote(self.build_worker_prompt(task_id, repair_context)),
@@ -339,3 +370,21 @@ the Task Graph controller/runtime artifacts.
         plan_dir = Path(plan_directory)
         move_task(plan_dir, self.tasks[task_id]["taskFile"], column)
         render_kanban(plan_dir)
+
+    def _git_for_task(self, task_id: str) -> TaskGraphGit:
+        if self.workspace_mode:
+            return self.gits[self.tasks[task_id]["project"]]
+        assert self.git is not None
+        return self.git
+
+    def _integration_for_task(self, task_id: str) -> Path:
+        if self.workspace_mode:
+            return Path(self.projects[self.tasks[task_id]["project"]]["integrationWorktree"])
+        assert self.integration_worktree is not None
+        return self.integration_worktree
+
+    def _git_common_dir_for_task(self, task_id: str) -> Path:
+        if self.workspace_mode:
+            return Path(self.projects[self.tasks[task_id]["project"]]["gitCommonDir"])
+        assert self.git_common_dir is not None
+        return self.git_common_dir

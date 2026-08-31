@@ -76,3 +76,37 @@ Rules:
 ## v1 boundary
 
 Version 1 only plans work. The `tasks` workflow must not create feature branches, task branches, worktrees, worker sessions, merges, or pull requests. A later execution workflow may consume `dependsOn` to start and integrate work in dependency order.
+
+## Workspace DAGs
+
+When the parent workspace has `.agent/task-graph.workspace.json`, inspect every
+declared project before drafting tasks. Write the plan under the parent’s
+`.agent/<plan-slug>/`; do not write planning or execution artifacts into an
+undeclared folder. Use schema version `2` and add a required `project` field to
+each task. Its value must be a manifest project ID. `predictedPaths` are safe,
+project-relative paths (never absolute or parent-traversing).
+
+```json
+{
+  "schemaVersion": 2,
+  "planSlug": "coordinated-change",
+  "tasks": [{
+    "id": "001-api-contract",
+    "project": "api",
+    "taskFile": "001-api-contract.md",
+    "title": "Publish API contract",
+    "instructions": "Implement the contract.",
+    "predictedPaths": ["src/contracts/widget.ts"],
+    "predictedSymbols": ["Widget"],
+    "dependsOn": [],
+    "parallelSafe": true,
+    "schedulingRationale": "disjoint surface from the frontend task."
+  }]
+}
+```
+
+Cross-project dependencies are normal `dependsOn` task-ID edges. Record the
+shared contract in the scheduling rationale and task brief. A dependent worker
+will receive the prerequisite project's integrated worktree and commit SHA, so
+it can implement against the actual integrated contract rather than a guessed
+copy.

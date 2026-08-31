@@ -85,3 +85,20 @@ class ValidateDagTests(unittest.TestCase):
 
         with self.assertRaisesRegex(DagValidationError, "duplicate task ID"):
             validate_dag(dag)
+
+    def test_workspace_dag_requires_declared_project_and_safe_project_relative_paths(self):
+        dag = valid_dag()
+        dag["schemaVersion"] = 2
+        dag["tasks"][0]["project"] = "frontend"
+        dag["tasks"][1]["project"] = "api"
+
+        validate_dag(dag, workspace_project_ids={"frontend", "api"})
+
+        dag["tasks"][1]["project"] = "undeclared"
+        with self.assertRaisesRegex(DagValidationError, "declared workspace project"):
+            validate_dag(dag, workspace_project_ids={"frontend", "api"})
+
+        dag["tasks"][1]["project"] = "api"
+        dag["tasks"][1]["predictedPaths"] = ["../other/project.py"]
+        with self.assertRaisesRegex(DagValidationError, "project-relative"):
+            validate_dag(dag, workspace_project_ids={"frontend", "api"})

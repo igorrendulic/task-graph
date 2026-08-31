@@ -28,12 +28,13 @@ REQUIRED_TASK_FIELDS = {
 TASK_COLUMNS = ("todo", "in-progress", "done")
 
 
-def validate_dag(dag: Mapping[str, Any]) -> None:
+def validate_dag(dag: Mapping[str, Any], *, workspace_project_ids: set[str] | None = None) -> None:
     """Raise DagValidationError unless *dag* satisfies the v1 JSON contract."""
     if not isinstance(dag, Mapping):
         raise DagValidationError("DAG root must be an object")
-    if dag.get("schemaVersion") != 1:
-        raise DagValidationError("schemaVersion must be 1")
+    schema_version = dag.get("schemaVersion")
+    if schema_version not in {1, 2}:
+        raise DagValidationError("schemaVersion must be 1 or 2")
     _require_nonempty_string(dag.get("planSlug"), "planSlug")
 
     tasks = dag.get("tasks")
@@ -62,6 +63,20 @@ def validate_dag(dag: Mapping[str, Any]) -> None:
         )
         if not isinstance(task["parallelSafe"], bool):
             raise DagValidationError(f"tasks[{index}].parallelSafe must be a boolean")
+        project = task.get("project")
+        workspace_task = schema_version == 2 or workspace_project_ids is not None
+        if workspace_task:
+            project = _require_nonempty_string(project, f"tasks[{index}].project")
+            if workspace_project_ids is not None and project not in workspace_project_ids:
+                raise DagValidationError(
+                    f"tasks[{index}].project is not a declared workspace project: {project}"
+                )
+            for path in task["predictedPaths"]:
+                candidate = Path(path)
+                if candidate.is_absolute() or ".." in candidate.parts:
+                    raise DagValidationError(
+                        f"tasks[{index}].predictedPaths must be project-relative safe paths"
+                    )
         if task_id in ids:
             raise DagValidationError(f"duplicate task ID: {task_id}")
         if task_file in filenames:
@@ -81,7 +96,9 @@ def validate_dag(dag: Mapping[str, Any]) -> None:
     _ensure_acyclic(dependencies)
 
 
-def validate_dag_file(dag_path: Path, plan_dir: Path | None = None) -> None:
+def validate_dag_file(
+    dag_path: Path, plan_dir: Path | None = None, *, workspace_project_ids: set[str] | None = None
+) -> None:
     """Validate a DAG JSON file and, when supplied, its plan task files."""
     try:
         dag = json.loads(dag_path.read_text(encoding="utf-8"))
@@ -89,14 +106,16 @@ def validate_dag_file(dag_path: Path, plan_dir: Path | None = None) -> None:
         raise DagValidationError(f"cannot read DAG JSON: {exc}") from exc
 
     if plan_dir is None:
-        validate_dag(dag)
+        validate_dag(dag, workspace_project_ids=workspace_project_ids)
         return
-    validate_dag_artifacts(dag, plan_dir)
+    validate_dag_artifacts(dag, plan_dir, workspace_project_ids=workspace_project_ids)
 
 
-def validate_dag_artifacts(dag: Mapping[str, Any], plan_dir: Path) -> None:
+def validate_dag_artifacts(
+    dag: Mapping[str, Any], plan_dir: Path, *, workspace_project_ids: set[str] | None = None
+) -> None:
     """Validate an in-memory DAG against its generated plan task files."""
-    validate_dag(dag)
+    validate_dag(dag, workspace_project_ids=workspace_project_ids)
     if dag["planSlug"] != plan_dir.name:
         raise DagValidationError(
             f"planSlug {dag['planSlug']!r} does not match plan directory {plan_dir.name!r}"

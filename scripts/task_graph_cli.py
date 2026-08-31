@@ -28,6 +28,7 @@ from scripts.task_graph_runtime import (
     write_state,
 )
 from scripts.task_graph_tmux import TmuxClient
+from scripts.task_graph_workspace import WorkspaceError, load_workspace
 
 
 DEFAULT_MAX_WORKERS = 4
@@ -38,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="action", required=True)
     start = subcommands.add_parser("start", help="start a new plan run")
     start.add_argument("plan_slug")
+    start.add_argument("--workspace", type=Path, help="workspace root containing .agent/task-graph.workspace.json")
     start.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
     start.add_argument(
         "--worker-command",
@@ -47,17 +49,23 @@ def build_parser() -> argparse.ArgumentParser:
     resume = subcommands.add_parser("resume", help="reconnect or restart a plan controller")
     resume.add_argument("plan_slug")
     resume.add_argument("run_id")
+    resume.add_argument("--workspace", type=Path)
     status = subcommands.add_parser("status", help="report the state of a plan run")
     status.add_argument("plan_slug")
     status.add_argument("--run-id")
+    status.add_argument("--workspace", type=Path)
     merge = subcommands.add_parser("merge", help="promote a successful plan run")
     merge.add_argument("plan_slug")
     merge.add_argument("--run-id", required=True)
+    merge.add_argument("--workspace", type=Path)
+    merge.add_argument("--project", help="declared workspace project ID to promote")
     checkout = subcommands.add_parser(
         "checkout", help="check out a successful plan run for local inspection"
     )
     checkout.add_argument("plan_slug")
     checkout.add_argument("--run-id", required=True)
+    checkout.add_argument("--workspace", type=Path)
+    checkout.add_argument("--project", help="declared workspace project ID to inspect")
     controller = subcommands.add_parser("controller", help=argparse.SUPPRESS)
     controller.add_argument("--run-dir", required=True, type=Path)
     return parser
@@ -75,9 +83,13 @@ def controller_command(run_dir: Path) -> str:
     )
 
 
-def start(plan_slug: str, max_workers: int, worker_command: str = "codex") -> str:
+def start(
+    plan_slug: str, max_workers: int, worker_command: str = "codex", workspace: Path | None = None
+) -> str:
     if max_workers < 1:
         raise TaskGraphRuntimeError("max_workers must be at least 1")
+    if workspace is not None:
+        return _workspace_start(plan_slug, max_workers, worker_command, workspace)
     repository = _repository_root()
     plan_dir = repository / ".agent" / plan_slug
     if not plan_dir.is_dir():
@@ -133,7 +145,9 @@ def start(plan_slug: str, max_workers: int, worker_command: str = "codex") -> st
     return _attach_command(session)
 
 
-def resume(plan_slug: str, run_id: str) -> str:
+def resume(plan_slug: str, run_id: str, workspace: Path | None = None) -> str:
+    if workspace is not None:
+        return _workspace_resume(plan_slug, run_id, workspace)
     repository = _repository_root()
     run_dir = repository / ".agent" / plan_slug / "runs" / run_id
     if not run_dir.is_dir():
@@ -152,8 +166,10 @@ def resume(plan_slug: str, run_id: str) -> str:
         raise
 
 
-def status(plan_slug: str, run_id: str | None = None) -> str:
+def status(plan_slug: str, run_id: str | None = None, workspace: Path | None = None) -> str:
     """Report the newest (or explicitly selected) persisted run."""
+    if workspace is not None:
+        return _workspace_status(plan_slug, run_id, workspace)
     repository = _repository_root()
     run_dir = _run_directory(repository, plan_slug, run_id)
     state = load_state(run_dir)
@@ -181,8 +197,12 @@ def _cleanup_integration_worktree(git: TaskGraphGit, run_dir: Path) -> str:
     return "; integration worktree removed"
 
 
-def merge(plan_slug: str, run_id: str) -> str:
+def merge(
+    plan_slug: str, run_id: str, workspace: Path | None = None, project: str | None = None
+) -> str:
     """Promote a completed run feature branch into its recorded base branch."""
+    if workspace is not None:
+        return _workspace_merge(plan_slug, run_id, workspace, project)
     repository = _repository_root()
     run_dir = _run_directory(repository, plan_slug, run_id)
     with RunLock(run_dir):
@@ -241,8 +261,12 @@ def merge(plan_slug: str, run_id: str) -> str:
     return f"{run_id}: merged into {base_branch} ({result.merge_sha}){cleanup}"
 
 
-def checkout(plan_slug: str, run_id: str) -> str:
+def checkout(
+    plan_slug: str, run_id: str, workspace: Path | None = None, project: str | None = None
+) -> str:
     """Switch the primary checkout to a succeeded run's feature branch."""
+    if workspace is not None:
+        return _workspace_checkout(plan_slug, run_id, workspace, project)
     repository = _repository_root()
     run_dir = _run_directory(repository, plan_slug, run_id)
     with RunLock(run_dir):
@@ -288,6 +312,166 @@ def checkout(plan_slug: str, run_id: str) -> str:
         f"{run_id}: checked out {feature_branch}. "
         f"Return to {base_branch}: {switch_back}. Then merge: {merge_command}"
     )
+
+
+def _workspace_context(path: Path):
+    try:
+        return load_workspace(path)
+    except WorkspaceError as exc:
+        raise TaskGraphRuntimeError(str(exc)) from exc
+
+
+def _workspace_run_directory(workspace: Path, plan_slug: str, run_id: str | None) -> Path:
+    return _run_directory(workspace, plan_slug, run_id)
+
+
+def _workspace_start(plan_slug: str, max_workers: int, worker_command: str, path: Path) -> str:
+    workspace = _workspace_context(path)
+    plan_dir = workspace.root / ".agent" / plan_slug
+    if not plan_dir.is_dir():
+        raise TaskGraphRuntimeError(f"plan directory does not exist: {plan_dir}")
+    for project in workspace.projects:
+        ensure_clean_base(project.path, plan_slug)
+    run_id = _run_id()
+    run_dir = plan_dir / "runs" / run_id
+    snapshot = create_run_snapshot(
+        plan_dir, run_dir, workspace_project_ids=set(workspace.by_id)
+    )
+    projects: dict[str, dict[str, object]] = {}
+    for project in workspace.projects:
+        git = TaskGraphGit(project.path)
+        try:
+            common_dir, base_branch = git.common_dir(), git.current_branch(project.path)
+            base_commit = git.head_sha(project.path)
+        except TaskGraphGitError as exc:
+            raise TaskGraphRuntimeError(f"cannot prepare workspace project {project.id}: {exc}") from exc
+        projects[project.id] = {
+            "repository": str(project.path), "gitCommonDir": str(common_dir),
+            "baseBranch": base_branch, "baseCommit": base_commit,
+            "featureBranch": f"task-graph/{plan_slug}/{run_id}/{project.id}/feature",
+            "integrationWorktree": str(run_dir / "projects" / project.id / "integration"),
+            "used": True,
+        }
+    state = {
+        "schemaVersion": 1, "workspace": str(workspace.root), "runId": run_id,
+        "planSlug": plan_slug, "planDirectory": str(plan_dir), "projects": projects,
+        "dagDigest": snapshot.dag_digest, "taskDigests": snapshot.task_digests,
+        "maxWorkers": max_workers, "workerCommand": worker_command, "createdAt": time.time(),
+        "controller": {}, "session": f"task-graph-{plan_slug}-{run_id}",
+        "tasks": {task["id"]: {"status": "pending", "attempts": [], "commitSha": None} for task in snapshot.dag["tasks"]},
+    }
+    with RunLock(run_dir):
+        for project_id, info in projects.items():
+            git = TaskGraphGit(Path(str(info["repository"])))
+            git.create_branch(str(info["featureBranch"]), str(info["baseCommit"]))
+            git.add_worktree(Path(str(info["integrationWorktree"])), str(info["featureBranch"]))
+        write_state(run_dir, state)
+        tmux = TmuxClient()
+        pane_id = tmux.create_session(state["session"], workspace.root, controller_command(run_dir))
+        pane = tmux.pane_info(pane_id)
+        state["controller"] = {"attemptToken": uuid.uuid4().hex, "paneId": pane_id, "pid": pane.pid if pane else None, "startedAt": time.time()}
+        write_state(run_dir, state)
+    return _attach_command(state["session"])
+
+
+def _workspace_resume(plan_slug: str, run_id: str, path: Path) -> str:
+    workspace = _workspace_context(path)
+    run_dir = _workspace_run_directory(workspace.root, plan_slug, run_id)
+    with RunLock(run_dir):
+        state = load_state(run_dir)
+        _validate_workspace_projects(state)
+        return _resume_locked(run_dir)
+
+
+def _workspace_status(plan_slug: str, run_id: str | None, path: Path) -> str:
+    workspace = _workspace_context(path)
+    state = load_state(_workspace_run_directory(workspace.root, plan_slug, run_id))
+    projects = state.get("projects", {})
+    detail = "; ".join(
+        f"{project_id}: {project.get('featureBranch')} ({project.get('integrationWorktree')}); "
+        f"promotion={'merged' if project.get('promotion') else 'pending'}"
+        for project_id, project in projects.items() if project.get("used")
+    )
+    return f"{state['runId']}: {_run_status(state)}" + (f"; {detail}" if detail else "")
+
+
+def _workspace_project(state: dict[str, object], project_id: str | None) -> tuple[str, dict[str, object]]:
+    projects = state.get("projects")
+    if not isinstance(projects, dict):
+        raise TaskGraphRuntimeError("run is not a workspace run")
+    if not project_id:
+        raise TaskGraphRuntimeError("--project is required to promote or check out a workspace project")
+    project = projects.get(project_id)
+    if not isinstance(project, dict) or not project.get("used"):
+        raise TaskGraphRuntimeError(f"unknown or unused workspace project: {project_id}")
+    return project_id, project
+
+
+def _workspace_merge(plan_slug: str, run_id: str, path: Path, project_id: str | None) -> str:
+    workspace = _workspace_context(path)
+    run_dir = _workspace_run_directory(workspace.root, plan_slug, run_id)
+    with RunLock(run_dir):
+        state = load_state(run_dir)
+        _validate_workspace_projects(state)
+        project_id, project = _workspace_project(state, project_id)
+        if _run_status(state) != "succeeded":
+            raise TaskGraphRuntimeError("cannot merge until all tasks are integrated")
+        if project.get("promotion"):
+            return f"{run_id}: {project_id} already merged"
+        repository = Path(str(project["repository"]))
+        git = TaskGraphGit(repository)
+        try:
+            if git.current_branch(repository) != project["baseBranch"]:
+                raise TaskGraphRuntimeError(f"checked out branch is not recorded base branch {project['baseBranch']}")
+            if not git.is_clean():
+                raise TaskGraphRuntimeError(f"workspace project {project_id} is dirty")
+            result = git.merge_feature_branch(repository, str(project["featureBranch"]), f"Task Graph {plan_slug} run {run_id} ({project_id})")
+        except TaskGraphGitError as exc:
+            raise TaskGraphRuntimeError(f"cannot merge workspace project {project_id}: {exc}") from exc
+        if result.outcome == "conflict_aborted":
+            return f"{run_id}: {project_id} merge conflict aborted; target branch unchanged"
+        if result.outcome == "already_merged":
+            return f"{run_id}: {project_id} already merged"
+        project["promotion"] = {"targetBranch": project["baseBranch"], "mergeSha": result.merge_sha, "mergedAt": time.time()}
+        write_state(run_dir, state)
+        return f"{run_id}: {project_id} merged into {project['baseBranch']} ({result.merge_sha})"
+
+
+def _workspace_checkout(plan_slug: str, run_id: str, path: Path, project_id: str | None) -> str:
+    workspace = _workspace_context(path)
+    run_dir = _workspace_run_directory(workspace.root, plan_slug, run_id)
+    with RunLock(run_dir):
+        state = load_state(run_dir)
+        _validate_workspace_projects(state)
+        project_id, project = _workspace_project(state, project_id)
+        if _run_status(state) != "succeeded":
+            raise TaskGraphRuntimeError("only succeeded runs can be checked out")
+        if project.get("promotion"):
+            raise TaskGraphRuntimeError(f"workspace project {project_id} is already merged")
+        repository = Path(str(project["repository"]))
+        git = TaskGraphGit(repository)
+        try:
+            if not git.is_clean():
+                raise TaskGraphRuntimeError(f"workspace project {project_id} is dirty")
+            git.switch_branch(repository, str(project["featureBranch"]), ignore_other_worktrees=True)
+        except TaskGraphGitError as exc:
+            raise TaskGraphRuntimeError(f"cannot check out workspace project {project_id}: {exc}") from exc
+    return f"{run_id}: checked out {project['featureBranch']} in {project_id}. Return to {project['baseBranch']} before merging."
+
+
+def _validate_workspace_projects(state: dict[str, object]) -> None:
+    projects = state.get("projects")
+    if not isinstance(projects, dict):
+        raise TaskGraphRuntimeError("run is not a workspace run")
+    for project_id, project in projects.items():
+        if not isinstance(project, dict):
+            raise TaskGraphRuntimeError("workspace run state has invalid projects")
+        try:
+            git = TaskGraphGit(Path(str(project["repository"])))
+            if Path(str(project["gitCommonDir"])).resolve() != git.common_dir():
+                raise TaskGraphRuntimeError(f"workspace project {project_id} Git metadata does not match its repository")
+        except (KeyError, TaskGraphGitError) as exc:
+            raise TaskGraphRuntimeError(f"cannot validate workspace project {project_id}") from exc
 
 
 def run_controller(run_dir: Path) -> None:
@@ -355,6 +539,24 @@ def _notify_run_completion(run_dir: Path, state: dict[str, object]) -> None:
         return
     plan_slug = str(state.get("planSlug", "<plan-slug>"))
     run_id = str(state.get("runId", "<run-id>"))
+    workspace = state.get("workspace")
+    workspace_args = (
+        ["--workspace", shlex.quote(str(workspace))]
+        if isinstance(workspace, str) and workspace
+        else []
+    )
+    if workspace_args:
+        command = " ".join(
+            [shlex.quote(sys.executable), shlex.quote(str(Path(__file__).resolve())), "status", shlex.quote(plan_slug), "--run-id", shlex.quote(run_id), *workspace_args]
+        )
+        attempted_at = time.time()
+        outcome = notify_completion(
+            succeeded=run_status == "succeeded",
+            message=(f"Workspace run {run_id} {run_status}. Inspect project branches and worktrees with: {command}"),
+        )
+        state["notification"] = {"completionStatus": run_status, "attemptedAt": attempted_at, "outcome": outcome["outcome"], **({"error": outcome["error"]} if "error" in outcome else {})}
+        write_state(run_dir, state)
+        return
     command = " ".join(
         [
             shlex.quote(sys.executable),
@@ -409,9 +611,11 @@ def _resume_locked(run_dir: Path) -> str:
         return _attach_command(state["session"])
     command = controller_command(run_dir)
     if tmux.session_exists(state["session"]):
-        pane_id = tmux.create_window(state["session"], "controller-recovery", Path(state["repository"]), command)
+        controller_cwd = Path(str(state.get("repository") or state.get("workspace")))
+        pane_id = tmux.create_window(state["session"], "controller-recovery", controller_cwd, command)
     else:
-        pane_id = tmux.create_session(state["session"], Path(state["repository"]), command)
+        controller_cwd = Path(str(state.get("repository") or state.get("workspace")))
+        pane_id = tmux.create_session(state["session"], controller_cwd, command)
     pane = tmux.pane_info(pane_id)
     state["controller"] = {
         "attemptToken": uuid.uuid4().hex,
@@ -459,15 +663,15 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         if args.action == "start":
-            print(start(args.plan_slug, args.max_workers, args.worker_command))
+            print(start(args.plan_slug, args.max_workers, args.worker_command, args.workspace))
         elif args.action == "resume":
-            print(resume(args.plan_slug, args.run_id))
+            print(resume(args.plan_slug, args.run_id, args.workspace))
         elif args.action == "status":
-            print(status(args.plan_slug, args.run_id))
+            print(status(args.plan_slug, args.run_id, args.workspace))
         elif args.action == "merge":
-            print(merge(args.plan_slug, args.run_id))
+            print(merge(args.plan_slug, args.run_id, args.workspace, args.project))
         elif args.action == "checkout":
-            print(checkout(args.plan_slug, args.run_id))
+            print(checkout(args.plan_slug, args.run_id, args.workspace, args.project))
         else:
             run_controller(args.run_dir)
     except TaskGraphRuntimeError as exc:
