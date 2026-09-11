@@ -15,6 +15,7 @@ from typing import Any
 
 from scripts.dag_validation import DagValidationError, validate_dag_file
 from scripts.task_graph_git import TaskGraphGit, TaskGraphGitError
+from scripts.task_graph_verification import require_execution_contract
 
 
 STATE_SCHEMA_VERSION = 1
@@ -100,6 +101,11 @@ def create_run_snapshot(
     dag = json.loads(dag_bytes)
     if dag.get("schemaVersion") == 2 and workspace_project_ids is None:
         raise TaskGraphRuntimeError("workspace DAG requires start --workspace <workspace-root>")
+    for task in dag["tasks"]:
+        try:
+            require_execution_contract(task)
+        except DagValidationError as exc:
+            raise TaskGraphRuntimeError(f"task {task['id']} cannot execute: {exc}; update the plan before starting a fresh run") from exc
     input_dir = run_dir / "input"
     task_dir = input_dir / "tasks"
     task_dir.mkdir(parents=True, exist_ok=True)

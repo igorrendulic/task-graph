@@ -206,14 +206,59 @@ It runs only dependency-ready tasks, uses fresh worktrees for both the first
 attempt and one repair attempt, and blocks only descendants after a second
 failure.
 
+An interrupted worker is different from a failed task: when its pane disappears
+without a completion sentinel, the controller recovers its exact Codex session
+ID from raw JSONL and runs `codex exec resume <session-id>` once in the same
+worktree. Existing edits and commits survive; the continuation must amend an
+existing task commit rather than add another. Original invocation logs are kept
+under `attempt.recoveries`; continuation logs use a `-resume-1` suffix. Missing
+session history, failed continuation, or another interruption falls back to the
+normal fresh-worktree repair attempt. Recovery requires the same local Codex
+session store. `resume` does not interrupt workers that are still alive.
+
 State is written to `runs/<run-id>/state.json` with a run lock and durable
 atomic replacement. Each attempt retains raw stdout, raw stderr, and a
 chronological combined log in `runs/<run-id>/logs/`; failed worktrees remain
 available for investigation.
 Workers run focused tests from their task briefs and must make exactly one
 non-merge commit. Intentionally empty verification commits are retained during
-integration. The controller deliberately does not run a final full suite
-in this MVP.
+integration. Before integration, the controller independently checks that the
+commit descends from its launch base, that the worktree is clean, and that every
+changed path is declared in `predictedPaths`. Rename source and destination paths
+both count; `.agent/` changes are rejected. It then runs the frozen task's
+verification commands and checks that HEAD and worktree cleanliness are unchanged.
+
+Every executable task needs a verification contract, for example:
+
+```json
+"verification": {
+  "commands": [["python3", "-m", "unittest", "tests.test_config"]],
+  "timeoutSeconds": 300
+}
+```
+
+Commands are argument arrays executed in the task worktree, in order, without
+implicit shell expansion. They run with the controller's local permissions and
+environment, so review them as part of the approved plan. Choose reproducible,
+noninteractive checks; required dependencies must already be available. Timeout
+is per command (default 300 seconds, allowed 1–3600). A timeout kills the command
+process group. Verification is synchronous in the controller; existing workers
+continue, but scheduling waits for the check to finish.
+
+Use `{"skipReason": "Documentation-only task; no automated check applies."}`
+only when appropriate, never to bypass missing dependencies or failing tests.
+Skipped automation still requires a valid, clean, in-scope commit. Verification
+evidence is stored in each attempt's `verification` record, including the commit
+SHA, changed paths, skip reason or commands, exit codes, and log paths. Failing
+checks trigger the normal repair policy. Failed worktrees remain available.
+
+`predictedPaths` accepts exact project-relative files and directory prefixes
+ending in `/`. Wildcards and unresolved scopes must be refined before execution.
+Older DAGs remain readable, but `start` requires this contract; update the plan
+and create a fresh run rather than editing an existing run's frozen snapshot.
+Old commits awaiting integration without verification evidence are rejected.
+The controller does not run a final full suite unless the DAG includes it, and
+passing declared checks does not substitute for reviewing acceptance criteria.
 
 Each worker runs in `workspace-write` mode and is additionally granted access
 only to the repository's shared Git metadata directory, so it can stage and

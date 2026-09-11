@@ -78,8 +78,8 @@ class WorkspaceManifestTests(unittest.TestCase):
             (plan / "todo" / "001-api.md").write_text("# API\n\n## Dependencies\n\nNone\n")
             (plan / "todo" / "002-frontend.md").write_text("# Frontend\n\n## Dependencies\n\n- 001-api.md\n")
             (plan / "dag.json").write_text(json.dumps({"schemaVersion": 2, "planSlug": "demo", "tasks": [
-                {"id": "001-api", "project": "api", "taskFile": "001-api.md", "title": "API", "instructions": "API", "predictedPaths": ["contract.ts"], "predictedSymbols": [], "dependsOn": [], "parallelSafe": True, "schedulingRationale": "disjoint"},
-                {"id": "002-frontend", "project": "frontend", "taskFile": "002-frontend.md", "title": "Frontend", "instructions": "Frontend", "predictedPaths": ["page.tsx"], "predictedSymbols": [], "dependsOn": ["001-api"], "parallelSafe": True, "schedulingRationale": "shared contract"},
+                {"id": "001-api", "project": "api", "taskFile": "001-api.md", "title": "API", "instructions": "API", "predictedPaths": ["contract.ts"], "predictedSymbols": [], "dependsOn": [], "parallelSafe": True, "schedulingRationale": "disjoint", "verification": {"skipReason": "Scheduling fixture."}},
+                {"id": "002-frontend", "project": "frontend", "taskFile": "002-frontend.md", "title": "Frontend", "instructions": "Frontend", "predictedPaths": ["page.tsx"], "predictedSymbols": [], "dependsOn": ["001-api"], "parallelSafe": True, "schedulingRationale": "shared contract", "verification": {"skipReason": "Scheduling fixture."}},
             ]}))
             run = plan / "runs" / "run-1"
             snapshot = create_run_snapshot(plan, run, workspace_project_ids={"api", "frontend"})

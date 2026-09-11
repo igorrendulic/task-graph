@@ -85,7 +85,12 @@ worktree per used project for review.
 Return the exact `tmux attach-session -t task-graph-<plan-slug>-<run-id>`
 command printed by `start` to the current user so they can observe workers.
 Workers run focused task tests and create one task-scoped commit; the controller
-does not run a final full suite in MVP.
+independently runs each task's frozen verification commands before integration.
+It does not run a final full suite unless the plan includes a task for it.
+Before `start`, every task must provide `verification.commands` (argv arrays),
+or an explicit `verification.skipReason` when no automated check applies.
+`predictedPaths` must be concrete project-relative files or directory prefixes
+ending in `/`; unresolved or wildcard scopes must be refined before execution.
 
 Use `resume` with the plan slug and run ID after interruption. It reconnects to
 the live controller when its saved pane and PID are still valid, or starts one
@@ -94,6 +99,29 @@ replacement controller from the persisted snapshot:
 ```sh
 python3 scripts/task_graph_cli.py resume <plan-slug> <run-id>
 ```
+
+The controller records each worker's Codex `threadId` from its raw JSONL output.
+If a worker pane dies without a completion sentinel, it resumes that exact
+conversation once in the same branch and worktree, preserving unfinished edits
+and original logs. It never uses `--last`. Live workers are left running.
+If no session ID was captured, or continuation fails or is interrupted again,
+the normal fresh-worktree repair policy applies. Existing runs without session
+IDs can recover them from retained stdout logs; the local Codex session store
+must still be available.
+
+Integration requires exactly one non-merge commit descended from the launch
+base, a clean worktree, and changes confined to `predictedPaths`. Both sides of
+renames are checked; `.agent/` changes are always rejected. The controller runs
+the frozen verification commands in the worker worktree with bounded timeouts,
+records command output and exit codes, and rejects checks that change HEAD or
+leave staged, unstaged, or untracked changes. An explicit skip reason remains
+visible in the evidence and does not bypass commit, cleanliness, or scope checks.
+These checks enforce the declared contract; they do not independently prove
+every acceptance criterion or replace code review.
+
+Older plans remain readable for planning but cannot start without the execution
+contract. Update the canonical plan and start a fresh run. Do not edit frozen
+run inputs; unverified pending integration from an old run is not accepted.
 
 ## `status`, `checkout`, and `merge` workflows
 

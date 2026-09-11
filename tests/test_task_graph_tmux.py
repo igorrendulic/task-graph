@@ -22,6 +22,14 @@ class FakeRunner:
 
 
 class TmuxClientTests(unittest.TestCase):
+    def test_recovers_only_the_exact_named_worker_window(self):
+        def runner(command):
+            return subprocess.CompletedProcess(command, 0,
+                '001-first-attempt-1\t%10\t1234\n001-first-attempt-1-resume-1\t%11\t2345\n', '')
+        tmux = TmuxClient(runner=runner)
+        self.assertEqual(PaneInfo('%11', 2345), tmux.find_window('session', '001-first-attempt-1-resume-1'))
+        self.assertIsNone(tmux.find_window('session', '001'))
+
     def test_creates_controller_session_and_returns_pane_identity(self):
         runner = FakeRunner()
         tmux = TmuxClient(runner=runner)

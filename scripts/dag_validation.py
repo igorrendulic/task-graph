@@ -58,6 +58,8 @@ def validate_dag(dag: Mapping[str, Any], *, workspace_project_ids: set[str] | No
             _require_nonempty_string(task[field], f"tasks[{index}].{field}")
         _require_string_list(task["predictedPaths"], f"tasks[{index}].predictedPaths")
         _require_string_list(task["predictedSymbols"], f"tasks[{index}].predictedSymbols")
+        if "verification" in task:
+            validate_verification(task["verification"])
         task_dependencies = _require_string_list(
             task["dependsOn"], f"tasks[{index}].dependsOn"
         )
@@ -190,6 +192,33 @@ def _require_nonempty_string(value: Any, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise DagValidationError(f"{name} must be a non-empty string")
     return value
+
+
+def validate_verification(value: Any) -> None:
+    """Require argv commands or an explicit reason why automation is absent."""
+    if not isinstance(value, dict):
+        raise DagValidationError("verification must specify commands or skipReason")
+    if set(value) - {"commands", "skipReason", "timeoutSeconds"}:
+        raise DagValidationError("verification contains unknown fields")
+    if "skipReason" in value:
+        if set(value) != {"skipReason"}:
+            raise DagValidationError("verification skipReason cannot be combined with commands or timeoutSeconds")
+        _require_nonempty_string(value["skipReason"], "verification.skipReason")
+        return
+    commands = value.get("commands")
+    if not isinstance(commands, list) or not commands:
+        raise DagValidationError("verification.commands must be a non-empty array of argv arrays")
+    for command in commands:
+        if (
+            not isinstance(command, list)
+            or not command
+            or not all(isinstance(arg, str) and "\0" not in arg for arg in command)
+            or not command[0].strip()
+        ):
+            raise DagValidationError("each verification command must be a non-empty argv array of strings without NUL")
+    timeout = value.get("timeoutSeconds", 300)
+    if type(timeout) is not int or not 1 <= timeout <= 3600:
+        raise DagValidationError("verification.timeoutSeconds must be an integer from 1 to 3600")
 
 
 def _require_task_filename(value: Any, name: str) -> str:

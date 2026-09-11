@@ -80,6 +80,23 @@ class TmuxClient:
     def session_exists(self, session: str) -> bool:
         return self._runner(["tmux", "has-session", "-t", session]).returncode == 0
 
+    def find_window(self, session: str, name: str) -> PaneInfo | None:
+        """Recover a launch that reached tmux before its identity was persisted."""
+        result = self._runner(["tmux", "list-panes", "-s", "-t", session,
+                               "-F", "#{window_name}\t#{pane_id}\t#{pane_pid}"])
+        if result.returncode != 0:
+            if not self.session_exists(session):
+                return None
+            raise TmuxError(result.stderr.strip() or "cannot inspect worker windows")
+        matches = []
+        for line in result.stdout.splitlines():
+            fields = line.split('\t')
+            if len(fields) == 3 and fields[0] == name and fields[2].isdigit():
+                matches.append(PaneInfo(fields[1], int(fields[2])))
+        if len(matches) > 1:
+            raise TmuxError(f"ambiguous worker window: {name}")
+        return matches[0] if matches else None
+
     def pane_is_live(self, pane_id: str, expected_pid: int) -> bool:
         info = self.pane_info(pane_id)
         if info is None or info.pid != expected_pid:

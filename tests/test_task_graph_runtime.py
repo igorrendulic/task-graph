@@ -39,6 +39,7 @@ def _make_plan(root: Path) -> Path:
                         "title": "First",
                         "instructions": "Implement the first task.",
                         "predictedPaths": ["src/first.py"],
+                        "verification": {"skipReason": "Snapshot fixture; no implementation."},
                         "predictedSymbols": [],
                         "dependsOn": [],
                         "parallelSafe": True,

@@ -130,7 +130,7 @@ def _assert_parallel_success(run: EvalRun) -> None:
     _require(_branch_exists(run.repository, state["featureBranch"]), "feature branch was not created")
     _require(state["workerCommand"] == str(run.worker), "worker command was not persisted")
     _require(
-        set(_window_names(run.session)) == {"controller", "001-alpha", "002-beta"},
+        set(_window_names(run.session)) == {"controller", "001-alpha-attempt-1", "002-beta-attempt-1"},
         "parallel run did not have exactly controller plus two named worker windows",
     )
     _release(run)
@@ -205,7 +205,38 @@ def _assert_resume(run: EvalRun) -> None:
     _require(all(task["status"] == "integrated" for task in state["tasks"].values()), "recovery did not finish run")
 
 
+def _assert_worker_resume(run: EvalRun) -> None:
+    _wait_for(lambda: _workers_are_ready(run, "001-first"), "worker conversation and unfinished edits")
+    before = run.state()
+    attempt = before['tasks']['001-first']['attempts'][0]
+    _tmux('kill-pane', '-t', before['controller']['paneId'])
+    _wait_for(lambda: not _controller_is_live(before['controller']), 'stopped controller')
+    _tmux('kill-pane', '-t', attempt['paneId'])
+    _require(not Path(attempt['exitFile']).exists(), 'interrupted worker unexpectedly wrote a sentinel')
+    _resume(run)
+    state = _wait_for(lambda: _terminal_state(run), 'worker conversation continuation')
+    task = state['tasks']['001-first']
+    _require(task['status'] == 'integrated', 'resumed worker did not integrate')
+    _require(len(task['attempts']) == 1, 'conversation recovery created a fresh task attempt')
+    resumed = task['attempts'][0]
+    _require(resumed['worktree'] == attempt['worktree'], 'conversation recovery replaced the worktree')
+    _require(resumed['threadId'] == '0199a213-81c0-7800-8aa1-bbab2a035a53', 'wrong conversation resumed')
+    _require(len(resumed['recoveries']) == 1, 'original invocation logs were not retained')
+    _require(resumed['verification']['passed'], 'resumed commit was not verified')
+
+
 _EVAL_SCENARIOS = (
+    EvalScenario(
+        'worker-resume',
+        'verifies an interrupted conversation resumes with unfinished edits',
+        (EvalTask('001-first', 'resume-once'),), 1, _assert_worker_resume,
+    ),
+    EvalScenario(
+        'verification-failure',
+        'rejects successful worker exits when independent verification fails',
+        (EvalTask('001-first', 'bad-content'), EvalTask('002-second', 'success', ('001-first',))),
+        1, _assert_terminal_failure,
+    ),
     EvalScenario(
         "parallel-success",
         "verifies two independent tasks execute concurrently and integrate",
@@ -290,6 +321,7 @@ def _create_repository(repository: Path, control: Path, tasks: tuple[EvalTask, .
                 "title": task.task_id,
                 "instructions": f"Controller eval action: {task.action}",
                 "predictedPaths": [f"outputs/{task.task_id}.txt"],
+                "verification": {"commands": [[sys.executable, "-c", f"from pathlib import Path; assert {task.task_id!r} + ' completed' in Path('outputs/{task.task_id}.txt').read_text()"]]},
                 "predictedSymbols": [],
                 "dependsOn": list(task.depends_on),
                 "parallelSafe": not task.depends_on,
@@ -312,7 +344,7 @@ def _write_worker(root: Path) -> Path:
     worker = root / "scripted-worker.py"
     worker.write_text(
         f"#!{sys.executable}\n"
-        + '''import re
+        + '''import json
 import re
 import subprocess
 import sys
@@ -334,7 +366,20 @@ control = Path(marker("EVAL_CONTROL_DIR"))
 expected = marker("EVAL_EXPECT")
 control.mkdir(parents=True, exist_ok=True)
 
-if action == "gate-success":
+if action == "resume-once":
+    thread_id = "0199a213-81c0-7800-8aa1-bbab2a035a53"
+    output = worktree / "outputs" / (task_id + ".txt")
+    if "resume" in sys.argv:
+        assert sys.argv[sys.argv.index("resume") + 1] == thread_id
+        assert output.read_text() == "unfinished edits"
+    else:
+        print(json.dumps({"type": "thread.started", "thread_id": thread_id}), flush=True)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("unfinished edits")
+        (control / ("ready-" + task_id)).write_text("ready\\n", encoding="utf-8")
+        time.sleep(30)
+        raise SystemExit("worker should have been interrupted")
+elif action == "gate-success":
     (control / ("ready-" + task_id)).write_text("ready\\n", encoding="utf-8")
     deadline = time.monotonic() + 15
     while not (control / "release").exists():
@@ -353,6 +398,8 @@ elif action == "fail-twice":
 output = worktree / "outputs" / (task_id + ".txt")
 output.parent.mkdir(parents=True, exist_ok=True)
 contents = task_id + " completed\\n"
+if action == "bad-content":
+    contents = "incorrect result\\n"
 if action == "serial-success":
     prerequisite = worktree / "outputs" / (expected + ".txt")
     if not prerequisite.is_file():

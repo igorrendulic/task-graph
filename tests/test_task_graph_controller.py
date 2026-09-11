@@ -46,6 +46,18 @@ class FakeGit:
     def remove_worktree(self, path: Path) -> None:
         pass
 
+    def remove_worktree_safely(self, path: Path) -> None:
+        pass
+
+    def is_clean(self, worktree):
+        return True
+
+    def changed_paths(self, *args):
+        return []
+
+    def validate_worker_worktree(self, *args):
+        pass
+
 
 class FakeTmux:
     def __init__(self) -> None:
@@ -60,6 +72,9 @@ class FakeTmux:
 
     def pane_is_live(self, pane_id: str, pid: int) -> bool:
         return False
+
+    def find_window(self, session, name):
+        return None
 
 
 def _make_plan(root: Path) -> Path:
@@ -77,11 +92,13 @@ def _make_plan(root: Path) -> Path:
                     {
                         "id": "001-first", "taskFile": "001-first.md", "title": "First",
                         "instructions": "First.", "predictedPaths": [], "predictedSymbols": [],
+                        "verification": {"skipReason": "Scheduler fixture; no implementation."},
                         "dependsOn": [], "parallelSafe": True, "schedulingRationale": "isolated",
                     },
                     {
                         "id": "002-second", "taskFile": "002-second.md", "title": "Second",
                         "instructions": "Second.", "predictedPaths": [], "predictedSymbols": [],
+                        "verification": {"skipReason": "Scheduler fixture; no implementation."},
                         "dependsOn": ["001-first"], "parallelSafe": False, "schedulingRationale": "depends",
                     },
                 ],
@@ -92,6 +109,57 @@ def _make_plan(root: Path) -> Path:
 
 
 class TaskGraphControllerTests(unittest.TestCase):
+    def test_dead_worker_resumes_recorded_conversation_in_same_worktree(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run = root / '.agent/demo/runs/run-1'
+            snapshot = create_run_snapshot(_make_plan(root), run)
+            state = create_state(
+                run_id='run-1', plan_slug='demo', repository=str(root),
+                feature_branch='feature', base_commit='base',
+                snapshot_digest=snapshot.dag_digest, task_digests=snapshot.task_digests,
+                max_workers=1, task_ids=list(snapshot.task_contents), git_common_dir='/repo/.git',
+            )
+            state.update(integrationWorktree=str(run / 'integration'), session='session')
+            write_state(run, state)
+            tmux = FakeTmux()
+            git = FakeGit()
+            controller = TaskGraphController(run, git=git, tmux=tmux)
+            controller.schedule_ready_tasks()
+            attempt = controller.state['tasks']['001-first']['attempts'][0]
+            thread_id = '0199a213-81c0-7800-8aa1-bbab2a035a53'
+            Path(attempt['stdoutLog']).write_text(json.dumps({'type': 'thread.started', 'thread_id': thread_id}) + '\n')
+            original_worktree = attempt['worktree']
+
+            # A replacement controller discovers the ID from durable raw output.
+            controller = TaskGraphController(run, git=git, tmux=tmux)
+            controller.poll_running_attempts()
+            saved = load_state(run)['tasks']['001-first']
+            self.assertEqual('running', saved['status'])
+            self.assertEqual(1, len(saved['attempts']))
+            self.assertEqual(original_worktree, saved['attempts'][0]['worktree'])
+            self.assertEqual(thread_id, saved['attempts'][0]['threadId'])
+            self.assertEqual(1, len(git.worker_calls))
+            self.assertIn('resume', tmux.commands[-1])
+            self.assertIn(thread_id, tmux.commands[-1])
+            self.assertNotIn('--last', tmux.commands[-1])
+            self.assertTrue(Path(saved['attempts'][0]['recoveries'][0]['stdoutLog']).is_file())
+
+            # Crash after tmux launch but before saving the pane must reconnect.
+            controller.state['tasks']['001-first']['attempts'][0].update(paneId=None, pid=None)
+            write_state(run, controller.state)
+            tmux.find_window = lambda *_: PaneInfo('%resumed', 5678)
+            tmux.pane_is_live = lambda *_: True
+            controller = TaskGraphController(run, git=git, tmux=tmux)
+            controller.poll_running_attempts()
+            self.assertEqual(2, len(tmux.commands))
+            self.assertEqual('%resumed', load_state(run)['tasks']['001-first']['attempts'][0]['paneId'])
+
+            # Repeated interruption is bounded, then uses the normal repair path.
+            tmux.pane_is_live = lambda *_: False
+            controller.poll_running_attempts()
+            self.assertEqual('retrying', controller.state['tasks']['001-first']['status'])
+
     def test_transition_events_are_emitted_once_for_real_lifecycle_changes(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

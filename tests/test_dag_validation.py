@@ -38,6 +38,23 @@ def valid_dag():
 
 
 class ValidateDagTests(unittest.TestCase):
+    def test_validates_explicit_verification_contract(self):
+        for value in ({'commands': [['python3', '-m', 'unittest']]}, {'skipReason': 'No automated test for this documentation task.'}):
+            dag = valid_dag()
+            dag['tasks'][0]['verification'] = value
+            validate_dag(dag)
+        for value in (None, {}, {'commands': []}, {'commands': ['pytest']},
+                      {'commands': [[]]}, {'commands': [['']]},
+                      {'commands': [['pytest']], 'timeoutSeconds': True},
+                      {'commands': [['pytest']], 'timeoutSeconds': 0},
+                      {'commands': [['pytest']], 'skipReason': 'skip'},
+                      {'skipReason': ''}, {'comands': [['pytest']]}):
+            with self.subTest(value=value):
+                dag = valid_dag()
+                dag['tasks'][0]['verification'] = value
+                with self.assertRaises(DagValidationError):
+                    validate_dag(dag)
+
     def test_accepts_valid_dag_and_matching_task_dependencies(self):
         with tempfile.TemporaryDirectory() as temp:
             plan_dir = Path(temp) / "example-plan"

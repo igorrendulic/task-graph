@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import shlex
 import sys
 import time
+import uuid
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any
@@ -19,6 +21,7 @@ from scripts.task_graph_runtime import (
     write_state,
 )
 from scripts.task_graph_tmux import TmuxClient
+from scripts.task_graph_verification import verify_task_commit
 
 
 class TaskGraphController:
@@ -103,6 +106,13 @@ the Task Graph controller/runtime artifacts.
 
 {dependencies}
 
+## Controller verification contract
+
+Allowed changed paths: {json.dumps(task['predictedPaths'])}
+Verification: {json.dumps(task.get('verification'))}
+Leave a clean worktree, including no untracked files. The controller checks the
+commit's paths and independently runs these commands before integration.
+
 ## Repair context
 
 {repair}
@@ -160,11 +170,20 @@ the Task Graph controller/runtime artifacts.
             if task_state["status"] != "running":
                 continue
             attempt = task_state["attempts"][-1]
+            self._capture_thread_id(attempt)
             exit_file = Path(attempt["exitFile"])
+            missing_identity = not attempt.get("paneId") or not isinstance(attempt.get("pid"), int)
+            if missing_identity and not exit_file.is_file():
+                if attempt.get("windowName"):
+                    self._launch_saved_attempt(task_id, attempt)
+                else:
+                    raise TaskGraphRuntimeError(f"cannot establish worker identity for {task_id}; inspect its retained worktree and tmux session")
             if not exit_file.is_file():
                 pane_id = attempt.get("paneId")
                 pid = attempt.get("pid")
                 if pane_id and isinstance(pid, int) and not self.tmux.pane_is_live(pane_id, pid):
+                    if self._resume_worker(task_id, attempt):
+                        continue
                     self._record_failure(task_id, "worker pane exited without completion sentinel")
                     write_state(self.run_dir, self.state)
                 continue
@@ -172,19 +191,94 @@ the Task Graph controller/runtime artifacts.
                 exit_code = int(exit_file.read_text(encoding="utf-8").strip())
             except ValueError:
                 self._record_failure(task_id, "worker completion sentinel is invalid")
+                write_state(self.run_dir, self.state)
                 continue
             attempt["exitCode"] = exit_code
             attempt["endedAt"] = time.time()
-            inspection = self._git_for_task(task_id).inspect_one_task_commit(
-                Path(attempt["worktree"]), attempt["launchBaseSha"]
-            )
+            try:
+                inspection = self._git_for_task(task_id).inspect_one_task_commit(
+                    Path(attempt["worktree"]), attempt["launchBaseSha"]
+                )
+            except TaskGraphGitError as exc:
+                self._record_failure(task_id, f"cannot inspect worker commit: {exc}")
+                write_state(self.run_dir, self.state)
+                continue
             if exit_code == 0 and inspection.valid and inspection.commit_sha:
-                task_state["commitSha"] = inspection.commit_sha
-                self._transition(task_id, "awaiting_integration", "worker_exit", f"exit {exit_code}")
+                log_dir = self.run_dir / "logs" / f"{task_id}-attempt-{len(task_state['attempts'])}-verification"
+                attempt["verification"] = verify_task_commit(
+                    self._git_for_task(task_id), self.tasks[task_id], attempt, inspection.commit_sha, log_dir
+                )
+                if attempt["verification"]["passed"]:
+                    task_state["commitSha"] = inspection.commit_sha
+                    self._transition(task_id, "awaiting_integration", "worker_exit", "verified")
+                else:
+                    self._record_failure(task_id, attempt["verification"]["reason"])
             else:
                 reason = f"worker exit {exit_code}; commits={inspection.commit_count}; merge={inspection.has_merge}"
                 self._record_failure(task_id, reason)
             write_state(self.run_dir, self.state)
+
+    def _capture_thread_id(self, attempt: dict[str, Any]) -> None:
+        """Recover the exact conversation ID from the worker's durable JSONL."""
+        if attempt.get("threadId") or not attempt.get("stdoutLog"):
+            return
+        try:
+            with Path(attempt["stdoutLog"]).open(encoding="utf-8", errors="replace") as stream:
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                        if not isinstance(event, dict) or event.get("type") != "thread.started":
+                            continue
+                        thread_id = str(uuid.UUID(event["thread_id"]))
+                    except (ValueError, KeyError, TypeError, AttributeError):
+                        continue
+                    attempt["threadId"] = thread_id
+                    write_state(self.run_dir, self.state)
+                    return
+        except FileNotFoundError:
+            pass
+
+    def _resume_worker(self, task_id: str, attempt: dict[str, Any]) -> bool:
+        """Continue one interrupted invocation without resetting its worktree."""
+        if not attempt.get("threadId") or attempt.get("recoveries"):
+            return False
+        try:
+            uuid.UUID(attempt['threadId'])
+        except (ValueError, TypeError, AttributeError):
+            return False
+        worktree = Path(attempt["worktree"])
+        if not worktree.is_dir():
+            return False
+        keys = ("stdoutLog", "stderrLog", "combinedLog", "exitFile", "paneId", "pid")
+        attempt["recoveries"] = [{key: attempt.get(key) for key in keys}]
+        prefix = self.run_dir / "logs" / f"{task_id}-attempt-{attempt['number']}-resume-1"
+        for key, suffix in (("stdoutLog", ".stdout"), ("stderrLog", ".stderr"),
+                            ("combinedLog", ".log"), ("exitFile", ".exit")):
+            attempt[key] = str(prefix.with_suffix(suffix))
+        attempt.update(paneId=None, pid=None, resumedAt=time.time(), windowName=f"{task_id}-attempt-{attempt['number']}-resume-1")
+        # Persist intent before launching. Never overwrite the original logs.
+        write_state(self.run_dir, self.state)
+        self._launch_saved_attempt(task_id, attempt)
+        return True
+
+    def _launch_saved_attempt(self, task_id: str, attempt: dict[str, Any]) -> None:
+        pane = self.tmux.find_window(self.state['session'], attempt['windowName'])
+        if pane is None:
+            worktree = Path(attempt['worktree'])
+            git = self._git_for_task(task_id)
+            if not worktree.exists() and not attempt.get('recoveries'):
+                git.create_worker_worktree(worktree, attempt['branch'], attempt['launchBaseSha'])
+            git.validate_worker_worktree(worktree, attempt['branch'], attempt['launchBaseSha'])
+            attempts = self.state['tasks'][task_id]['attempts']
+            repair = attempts[-2].get('failureSummary') if len(attempts) > 1 else None
+            command = self._worker_command(worktree, task_id, attempt, repair,
+                                           resume_thread=attempt.get('threadId') if attempt.get('recoveries') else None)
+            pane_id = self.tmux.create_window(self.state['session'], attempt['windowName'], worktree, command)
+            pane = self.tmux.pane_info(pane_id)
+            attempt['paneId'] = pane_id
+        if pane:
+            attempt.update(paneId=pane.pane_id, pid=pane.pid)
+        write_state(self.run_dir, self.state)
 
     def integrate_waiting_tasks(self) -> None:
         """Cherry-pick completed worker commits in a persistent state transition."""
@@ -193,6 +287,12 @@ the Task Graph controller/runtime artifacts.
             if task_state["status"] != "awaiting_integration":
                 continue
             commit = task_state["commitSha"]
+            attempt = task_state["attempts"][-1]
+            evidence = attempt.get("verification", {})
+            if not evidence.get("passed") or evidence.get("commitSha") != commit:
+                self._record_failure(task_id, "missing verification evidence for task commit; restart legacy runs with an explicit verification contract")
+                write_state(self.run_dir, self.state)
+                continue
             self._transition(task_id, "integrating")
             write_state(self.run_dir, self.state)
             try:
@@ -206,7 +306,7 @@ the Task Graph controller/runtime artifacts.
             task_state["integratedAt"] = time.time()
             attempt = task_state["attempts"][-1]
             try:
-                self._git_for_task(task_id).remove_worktree(Path(attempt["worktree"]))
+                self._git_for_task(task_id).remove_worktree_safely(Path(attempt["worktree"]))
             except TaskGraphGitError:
                 attempt["cleanupFailed"] = True
             self._update_board(task_id, "done")
@@ -251,22 +351,14 @@ the Task Graph controller/runtime artifacts.
             "attemptToken": f"{task_id}-{attempt_number}-{time.time_ns()}",
             "paneId": None,
             "pid": None,
+            "windowName": f"{task_id}-attempt-{attempt_number}",
         }
         task_state["attempts"].append(attempt)
         self._transition(task_id, "running", "launch")
         self._update_board(task_id, "in-progress")
         write_state(self.run_dir, self.state)
 
-        self._git_for_task(task_id).create_worker_worktree(worktree, branch, launch_base)
-        repair_context = task_state["attempts"][-2].get("failureSummary") if attempt_number > 1 else None
-        command = self._worker_command(worktree, task_id, attempt, repair_context)
-        pane_id = self.tmux.create_window(
-            self.state["session"], task_id, worktree, command
-        )
-        pane = self.tmux.pane_info(pane_id)
-        attempt["paneId"] = pane_id
-        attempt["pid"] = pane.pid if pane else None
-        write_state(self.run_dir, self.state)
+        self._launch_saved_attempt(task_id, attempt)
 
     def _worker_command(
         self,
@@ -274,6 +366,8 @@ the Task Graph controller/runtime artifacts.
         task_id: str,
         attempt: dict[str, Any],
         repair_context: str | None,
+        *,
+        resume_thread: str | None = None,
     ) -> str:
         stdout = Path(attempt["stdoutLog"])
         stderr = Path(attempt["stderrLog"])
@@ -294,13 +388,12 @@ the Task Graph controller/runtime artifacts.
             for dependency in self.tasks[task_id]["dependsOn"]:
                 project = self.projects[self.tasks[dependency]["project"]]
                 codex_args.extend(["--add-dir", shlex.quote(str(project["integrationWorktree"]))])
-        codex = " ".join(
-            codex_args + [
-                "-C",
-                shlex.quote(str(worktree)),
-                shlex.quote(self.build_worker_prompt(task_id, repair_context)),
-            ]
-        )
+        codex_args.extend(["-C", shlex.quote(str(worktree))])
+        prompt = self.build_worker_prompt(task_id, repair_context)
+        if resume_thread:
+            codex_args.extend(["resume", shlex.quote(resume_thread)])
+            prompt += "\nContinue after interruption in this same worktree. Inspect existing changes and commits first. Keep exactly one task commit; amend it if already created.\n"
+        codex = " ".join(codex_args + [shlex.quote(prompt)])
         script = (
             f"stream_dir=$(mktemp -d {shlex.quote(str(stream_template))}) || exit 1; "
             "stdout_pipe=\"$stream_dir/stdout\"; stderr_pipe=\"$stream_dir/stderr\"; "
@@ -315,7 +408,7 @@ the Task Graph controller/runtime artifacts.
             "| tee \"$combined_pipe\" >&2 & stderr_pid=$!; "
             "PYTHONDONTWRITEBYTECODE=1 "
             'PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+${PYTEST_ADDOPTS} }-p no:cacheprovider" '
-            f"{codex} >\"$stdout_pipe\" 2>\"$stderr_pipe\"; code=$?; "
+            f"{codex} </dev/null >\"$stdout_pipe\" 2>\"$stderr_pipe\"; code=$?; "
             "wait \"$stdout_pid\"; wait \"$stderr_pid\"; wait \"$combined_pid\"; "
             f"printf '%s\\n' \"$code\" >{shlex.quote(str(exit_file))}; exit \"$code\""
         )
@@ -323,7 +416,19 @@ the Task Graph controller/runtime artifacts.
 
     def _record_failure(self, task_id: str, summary: str) -> None:
         task_state = self.state["tasks"][task_id]
-        task_state["attempts"][-1]["failureSummary"] = summary
+        attempt = task_state["attempts"][-1]
+        diagnostics = []
+        for key in ("stderrLog", "stdoutLog"):
+            if attempt.get(key):
+                path = Path(attempt[key])
+                try:
+                    with path.open('rb') as stream:
+                        stream.seek(0, 2)
+                        stream.seek(max(0, stream.tell() - 4000))
+                        diagnostics.append(f"{key}: {path}\n{stream.read().decode('utf-8', errors='replace')}")
+                except OSError:
+                    pass
+        attempt["failureSummary"] = summary + ('\n\n' + '\n\n'.join(diagnostics) if diagnostics else '')
         if len(task_state["attempts"]) < 2:
             self._transition(task_id, "retrying", "retry", summary)
             return

@@ -18,6 +18,22 @@ Use this reference only for the `tasks` workflow. It defines how to create task 
    - `Acceptance Criteria`
    - `Test Notes`
 4. Predict every task's edited files and relevant symbols. Include contract surfaces, tests, generated artifacts, and docs when they may be touched. If the surface cannot be established confidently, record it as uncertain.
+   For execution, refine uncertain scopes into concrete project-relative file
+   paths or directory prefixes ending in `/`; the controller enforces these
+   paths against the actual commit, including both sides of renames. Do not use
+   wildcard patterns. An empty list permits only an empty commit. `.agent/`
+   artifacts cannot be changed by a worker.
+   Add `verification` to each task: `{"commands": [["python3", "-m", "unittest", "tests.test_config"]], "timeoutSeconds": 300}`.
+   Derive focused, reproducible, noninteractive commands from the task's Test
+   Notes and Acceptance Criteria. Each command is an argv array, runs from the
+   task's project worktree without implicit shell expansion, and uses the
+   controller's permissions and environment. Timeout is per command, defaults
+   to 300 seconds, and must be an integer from 1 to 3600. Commands must not alter
+   HEAD or leave staged, unstaged, or untracked changes. For a task where no
+   automated check applies, use only `{"skipReason": "Specific explanation"}`.
+   Never use a skip to hide failing tests or missing dependencies. Keep Test
+   Notes aligned with this machine-readable contract. Legacy DAGs without
+   verification may be inspected, but cannot start execution until updated.
 5. Build the DAG from the same task drafts. `dependsOn` is the sole scheduling authority; do not create a duplicate conflict matrix or use `parallelSafe` to override dependencies.
 6. Schedule conservatively:
    - A task is `parallelSafe: true` only when its predicted edit surface is demonstrably disjoint from every task that could otherwise run beside it.
@@ -46,6 +62,10 @@ Use this reference only for the `tasks` workflow. It defines how to create task 
       "instructions": "Implement the task file's Scope and Acceptance Criteria.",
       "predictedPaths": ["src/schema.py", "tests/test_schema.py"],
       "predictedSymbols": ["Schema", "parse_schema"],
+      "verification": {
+        "commands": [["python3", "-m", "unittest", "tests.test_schema"]],
+        "timeoutSeconds": 300
+      },
       "dependsOn": [],
       "parallelSafe": true,
       "schedulingRationale": "Its predicted code and test surfaces are disjoint from the other root task."
@@ -98,6 +118,7 @@ project-relative paths (never absolute or parent-traversing).
     "instructions": "Implement the contract.",
     "predictedPaths": ["src/contracts/widget.ts"],
     "predictedSymbols": ["Widget"],
+    "verification": {"commands": [["npm", "test", "--", "--runInBand", "widget.test.ts"]]},
     "dependsOn": [],
     "parallelSafe": true,
     "schedulingRationale": "disjoint surface from the frontend task."

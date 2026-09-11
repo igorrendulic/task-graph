@@ -127,9 +127,19 @@ class TaskGraphGit:
         commit_count = int(self._run(worktree, "rev-list", "--count", f"{launch_base_sha}..HEAD").strip())
         merges = self._run(worktree, "rev-list", "--merges", f"{launch_base_sha}..HEAD").strip()
         has_merge = bool(merges)
-        if commit_count != 1 or has_merge:
+        if commit_count != 1 or has_merge or not self.is_ancestor(launch_base_sha, worktree):
             return CommitInspection(False, None, commit_count, has_merge)
         return CommitInspection(True, self.head_sha(worktree), commit_count, False)
+
+    def changed_paths(self, worktree: Path, base: str, commit: str) -> list[str]:
+        """Use NUL separation and disable renames so both sides are checked."""
+        output = self._run(worktree, "diff", "--name-only", "--no-renames", "-z", base, commit, "--")
+        return [path for path in output.split('\0') if path]
+
+    def validate_worker_worktree(self, worktree: Path, branch: str, base: str) -> None:
+        common = self._run(worktree, 'rev-parse', '--path-format=absolute', '--git-common-dir').strip()
+        if Path(common).resolve() != self.common_dir() or self.current_branch(worktree) != branch or not self.is_ancestor(base, worktree):
+            raise TaskGraphGitError("worker worktree repository, branch, or launch base changed")
 
     def cherry_pick(self, integration_worktree: Path, commit_sha: str) -> None:
         self._run(
