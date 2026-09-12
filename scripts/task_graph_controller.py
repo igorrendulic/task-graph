@@ -12,6 +12,7 @@ from collections.abc import Callable
 from typing import Any
 
 from scripts.task_graph_board import move_task, render_kanban
+from scripts.task_graph_activity import WorkerActivity
 from scripts.task_graph_git import TaskGraphGit, TaskGraphGitError
 from scripts.task_graph_runtime import (
     TaskGraphRuntimeError,
@@ -21,7 +22,7 @@ from scripts.task_graph_runtime import (
     write_state,
 )
 from scripts.task_graph_tmux import TmuxClient
-from scripts.task_graph_verification import verify_task_commit
+from scripts.task_graph_verification import VerificationJob
 
 
 class TaskGraphController:
@@ -74,6 +75,21 @@ class TaskGraphController:
         self.codex_bin = codex_bin or self.state.get("workerCommand", "codex")
         self.integration_worktree = Path(self.state["integrationWorktree"]) if not self.workspace_mode else None
         self.event_sink = event_sink
+        self.activity: dict[str, WorkerActivity] = {}
+        self.verifications: dict[str, VerificationJob] = {}
+
+    def observe_workers(self) -> None:
+        """Read progress without treating agent messages as scheduler outcomes."""
+        for task_id, task_state in self.state['tasks'].items():
+            if not task_state['attempts']:
+                continue
+            attempt = task_state['attempts'][-1]
+            self._observe_worker(task_id, attempt)
+
+    def close(self) -> None:
+        """Stop verification commands before releasing the controller lock."""
+        for job in self.verifications.values():
+            job.close()
 
     def build_worker_prompt(self, task_id: str, repair_context: str | None = None) -> str:
         """Build a self-contained prompt without relying on `.agent` in a worktree."""
@@ -144,6 +160,7 @@ commit's paths and independently runs these commands before integration.
     def run_once(self) -> None:
         """Reconcile persistence, inspect exits, integrate commits, then schedule."""
         self.reconcile()
+        self.observe_workers()
         self.poll_running_attempts()
         self.integrate_waiting_tasks()
         self.schedule_ready_tasks()
@@ -170,7 +187,10 @@ commit's paths and independently runs these commands before integration.
             if task_state["status"] != "running":
                 continue
             attempt = task_state["attempts"][-1]
-            self._capture_thread_id(attempt)
+            if attempt.get('phase') == 'verifying':
+                self._poll_verification(task_id, attempt)
+                continue
+            self._observe_worker(task_id, attempt)
             exit_file = Path(attempt["exitFile"])
             missing_identity = not attempt.get("paneId") or not isinstance(attempt.get("pid"), int)
             if missing_identity and not exit_file.is_file():
@@ -181,7 +201,8 @@ commit's paths and independently runs these commands before integration.
             if not exit_file.is_file():
                 pane_id = attempt.get("paneId")
                 pid = attempt.get("pid")
-                if pane_id and isinstance(pid, int) and not self.tmux.pane_is_live(pane_id, pid):
+                attempt['workerAlive'] = bool(pane_id and isinstance(pid, int) and self.tmux.pane_is_live(pane_id, pid))
+                if pane_id and isinstance(pid, int) and not attempt['workerAlive']:
                     if self._resume_worker(task_id, attempt):
                         continue
                     self._record_failure(task_id, "worker pane exited without completion sentinel")
@@ -204,39 +225,58 @@ commit's paths and independently runs these commands before integration.
                 write_state(self.run_dir, self.state)
                 continue
             if exit_code == 0 and inspection.valid and inspection.commit_sha:
-                log_dir = self.run_dir / "logs" / f"{task_id}-attempt-{len(task_state['attempts'])}-verification"
-                attempt["verification"] = verify_task_commit(
-                    self._git_for_task(task_id), self.tasks[task_id], attempt, inspection.commit_sha, log_dir
-                )
-                if attempt["verification"]["passed"]:
-                    task_state["commitSha"] = inspection.commit_sha
-                    self._transition(task_id, "awaiting_integration", "worker_exit", "verified")
-                else:
-                    self._record_failure(task_id, attempt["verification"]["reason"])
+                attempt.update(phase='verifying', phaseStartedAt=time.time(), verificationCommit=inspection.commit_sha)
+                write_state(self.run_dir, self.state)
+                self._poll_verification(task_id, attempt)
             else:
                 reason = f"worker exit {exit_code}; commits={inspection.commit_count}; merge={inspection.has_merge}"
                 self._record_failure(task_id, reason)
             write_state(self.run_dir, self.state)
 
-    def _capture_thread_id(self, attempt: dict[str, Any]) -> None:
-        """Recover the exact conversation ID from the worker's durable JSONL."""
-        if attempt.get("threadId") or not attempt.get("stdoutLog"):
+    def _poll_verification(self, task_id: str, attempt: dict[str, Any]) -> None:
+        task_state = self.state['tasks'][task_id]
+        if task_id not in self.verifications:
+            log_dir = self.run_dir / 'logs' / f"{task_id}-attempt-{len(task_state['attempts'])}-verification"
+            self.verifications[task_id] = VerificationJob(
+                self._git_for_task(task_id), self.tasks[task_id], attempt,
+                attempt['verificationCommit'], log_dir,
+            )
+        job = self.verifications[task_id]
+        previous = len(job.evidence['commands'])
+        pending = job.evidence['commands'][-1] if previous and job.evidence['commands'][-1]['exitCode'] is None else None
+        done = job.poll()
+        attempt['verification'] = job.evidence
+        attempt['verificationWaiting'] = job.waiting_for_lock
+        if pending is not None and pending.get('exitCode') is not None:
+            outcome = 'passed' if pending['exitCode'] == 0 else f"failed (exit {pending['exitCode']})"
+            self._emit({'kind': 'verification', 'taskId': task_id, 'detail': f'Check {previous} {outcome}'})
+        if len(job.evidence['commands']) > previous:
+            command = job.evidence['commands'][-1]
+            self._emit({'kind': 'verification', 'taskId': task_id,
+                        'detail': f"Check {len(job.evidence['commands'])}/{len(self.tasks[task_id]['verification']['commands'])}: {shlex.join(command['argv'])}"})
+        if done:
+            del self.verifications[task_id]
+            attempt.pop('phase', None)
+            if job.evidence['passed']:
+                task_state['commitSha'] = attempt['verificationCommit']
+                self._transition(task_id, 'awaiting_integration', 'worker_exit', 'verified')
+            else:
+                self._record_failure(task_id, job.evidence['reason'])
+        write_state(self.run_dir, self.state)
+
+    def _observe_worker(self, task_id: str, attempt: dict[str, Any]) -> None:
+        """Share one incremental cursor for activity and conversation recovery."""
+        if not attempt.get('stdoutLog'):
             return
-        try:
-            with Path(attempt["stdoutLog"]).open(encoding="utf-8", errors="replace") as stream:
-                for line in stream:
-                    try:
-                        event = json.loads(line)
-                        if not isinstance(event, dict) or event.get("type") != "thread.started":
-                            continue
-                        thread_id = str(uuid.UUID(event["thread_id"]))
-                    except (ValueError, KeyError, TypeError, AttributeError):
-                        continue
-                    attempt["threadId"] = thread_id
-                    write_state(self.run_dir, self.state)
-                    return
-        except FileNotFoundError:
-            pass
+        reader = self.activity.setdefault(task_id, WorkerActivity())
+        for detail in reader.read(Path(attempt['stdoutLog'])):
+            self._emit({'kind': 'activity', 'taskId': task_id, 'detail': detail})
+        if not attempt.get('threadId') and reader.thread_id:
+            try:
+                attempt['threadId'] = str(uuid.UUID(reader.thread_id))
+            except ValueError:
+                return
+            write_state(self.run_dir, self.state)
 
     def _resume_worker(self, task_id: str, attempt: dict[str, Any]) -> bool:
         """Continue one interrupted invocation without resetting its worktree."""
@@ -293,7 +333,7 @@ commit's paths and independently runs these commands before integration.
                 self._record_failure(task_id, "missing verification evidence for task commit; restart legacy runs with an explicit verification contract")
                 write_state(self.run_dir, self.state)
                 continue
-            self._transition(task_id, "integrating")
+            self._transition(task_id, "integrating", "integration_start")
             write_state(self.run_dir, self.state)
             try:
                 self._git_for_task(task_id).cherry_pick(self._integration_for_task(task_id), commit)
@@ -458,15 +498,20 @@ commit's paths and independently runs these commands before integration.
         if previous == status:
             return False
         task_state["status"] = status
+        task_state['phaseStartedAt'] = time.time()
         if event_kind and self.event_sink:
             event = {"kind": event_kind, "taskId": task_id, "from": previous, "to": status}
             if detail:
                 event["detail"] = detail
+            self._emit(event)
+        return True
+
+    def _emit(self, event: dict[str, str]) -> None:
+        if self.event_sink:
             try:
                 self.event_sink(event)
             except (OSError, ValueError):
                 pass
-        return True
 
     def _update_board(self, task_id: str, column: str) -> None:
         plan_directory = self.state.get("planDirectory")

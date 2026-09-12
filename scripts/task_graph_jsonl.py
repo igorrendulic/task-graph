@@ -24,9 +24,9 @@ def format_jsonl_line(line: str) -> str:
         thread_id = event.get("thread_id")
         return f"[task] started {thread_id}" if thread_id else "[task] started"
     if event_type == "turn.started":
-        return "[task] started"
+        return "[agent turn] started"
     if event_type == "turn.completed":
-        return "[task] completed"
+        return "[agent turn] completed"
     if event_type == "error":
         return f"[error] {_text(event.get('message') or event.get('error') or event)}"
 

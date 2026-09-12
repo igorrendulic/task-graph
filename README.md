@@ -76,6 +76,34 @@ Run that command to observe the controller and worker windows. The panes show
 live task progress, commands, file changes, agent messages, and completion or
 error output; finished worker panes remain available for inspection.
 
+To preview the dashboard with simulated tasks, run this from the repository root:
+
+```bash
+tmux new-session -s task-graph-preview \
+  'python3 scripts/task_graph_preview.py'
+```
+
+The `DEMO` preview repeats a 30-second cycle with changing activity, task phases,
+elapsed times, and simulated events. Resize the terminal to inspect compact rows
+and hidden-task counts. Press Ctrl+C to exit, or tmux's prefix followed by `d` to
+detach and later run `tmux attach-session -t task-graph-preview` to return.
+It uses in-memory data and creates no agents, worktrees, or run-state files;
+worker transcript windows are not included. You can also run
+`python3 scripts/task_graph_preview.py` directly in an existing terminal pane.
+
+The controller dashboard shows each task's current activity and time in that
+activity, with separate working, verifying, awaiting integration, and integrating
+phases. Active and failed tasks stay above waiting and completed tasks; small
+terminals summarize hidden rows instead of rotating pages. Recent timestamped
+events remain visible below the task list. Use tmux's prefix followed by `w` to
+select a worker window for its full transcript.
+
+Worker activity comes from incremental reads of the retained JSONL logs. Quiet
+workers show time since the last event, with an `alive` indicator only after a
+successful pane/PID check. Quiet time does not imply a stalled worker. An agent
+turn finishing does not mark its task complete: completion requires verification
+and integration of its commit.
+
 ## Multi-project workspaces
 
 Task Graph can coordinate any number of independently versioned Git projects
@@ -242,8 +270,13 @@ implicit shell expansion. They run with the controller's local permissions and
 environment, so review them as part of the approved plan. Choose reproducible,
 noninteractive checks; required dependencies must already be available. Timeout
 is per command (default 300 seconds, allowed 1–3600). A timeout kills the command
-process group. Verification is synchronous in the controller; existing workers
-continue, but scheduling waits for the check to finish.
+process group. Verification is polled without blocking dashboard refresh, worker
+event collection, or scheduling of independent tasks within the worker limit.
+The dashboard shows the active check and its elapsed time. A verifying task
+continues to occupy its worker slot, and its dependents wait for integration.
+Normal controller shutdown stops its verification commands. After an abrupt
+controller loss, a replacement waits for any previous command holding the
+attempt's verification lock to exit, then repeats verification before integration.
 
 Use `{"skipReason": "Documentation-only task; no automated check applies."}`
 only when appropriate, never to bypass missing dependencies or failing tests.

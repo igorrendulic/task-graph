@@ -8,7 +8,7 @@ class TaskGraphJsonlTests(unittest.TestCase):
     def test_formats_representative_codex_events(self):
         cases = [
             ('{"type":"thread.started","thread_id":"thread-123"}', "[task] started thread-123"),
-            ('{"type":"turn.completed"}', "[task] completed"),
+            ('{"type":"turn.completed"}', "[agent turn] completed"),
             (
                 '{"type":"item.completed","item":{"type":"command_execution","command":"git status","exit_code":0}}',
                 "[command] $ git status (exit 0)",
@@ -38,5 +38,5 @@ class TaskGraphJsonlTests(unittest.TestCase):
             output,
         )
 
-        self.assertEqual("[task] started\n[task] completed\n", output.getvalue())
+        self.assertEqual("[agent turn] started\n[agent turn] completed\n", output.getvalue())
 

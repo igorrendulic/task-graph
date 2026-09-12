@@ -234,7 +234,7 @@ class TaskGraphControllerTests(unittest.TestCase):
             )
 
             self.assertEqual(7, result.returncode, result.stderr)
-            self.assertEqual("[task] started\n[task] completed\n", result.stdout)
+            self.assertEqual("[agent turn] started\n[agent turn] completed\n", result.stdout)
             self.assertEqual("worker diagnostic\n", result.stderr)
             self.assertIn('"type": "turn.started"', Path(attempt["stdoutLog"]).read_text(encoding="utf-8"))
             self.assertEqual("worker diagnostic\n", Path(attempt["stderrLog"]).read_text(encoding="utf-8"))

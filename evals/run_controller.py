@@ -225,6 +225,36 @@ def _assert_worker_resume(run: EvalRun) -> None:
     _require(resumed['verification']['passed'], 'resumed commit was not verified')
 
 
+def _assert_live_dashboard(run: EvalRun) -> None:
+    _wait_for(lambda: (run.control / 'verifying').exists(), 'long verification command')
+    _wait_for(lambda: _workers_are_ready(run, '002-live'), 'live worker during verification')
+    pane = run.state()['controller']['paneId']
+    _tmux('resize-window', '-t', pane, '-x', '140', '-y', '30')
+    (run.control / 'activity').touch()
+
+    def capture():
+        return _tmux('capture-pane', '-p', '-t', pane).stdout
+
+    def observed_activity():
+        text = capture()
+        live_row = next((line for line in text.splitlines() if line.startswith('● 002-live')), '')
+        return text if text.startswith('Task Graph') and 'Dashboard live event' in live_row and 'Check 1/2' in text else None
+
+    panel = _wait_for(observed_activity, 'live dashboard activity')
+    _require('verifying' in panel and 'working' in panel, 'dashboard conflates worker and verification phases')
+    _require('RECENT EVENTS' in panel, 'dashboard omits recent events')
+    _require(sum(line.startswith('● 002-live') for line in panel.splitlines()) == 1,
+             'resize left stale task rows in the terminal')
+    _require(run.state()['tasks']['001-check']['status'] == 'running', 'verification gate finished early')
+    print('Captured live dashboard during verification:\n' + panel.rstrip(), flush=True)
+    _tmux('resize-window', '-t', pane, '-x', '60', '-y', '16')
+    _wait_for(lambda: 'TASK / PHASE / AGE' in capture(), 'compact dashboard after resize')
+    (run.control / 'verification-release').touch()
+    _release(run)
+    state = _wait_for(lambda: _terminal_state(run), 'dashboard scenario integration')
+    _require(all(task['status'] == 'integrated' for task in state['tasks'].values()), 'dashboard scenario failed')
+
+
 _EVAL_SCENARIOS = (
     EvalScenario(
         'worker-resume',
@@ -284,6 +314,11 @@ _EVAL_SCENARIOS = (
         1,
         _assert_resume,
     ),
+    EvalScenario(
+        'live-dashboard', 'observes live worker events during verification and terminal resize',
+        (EvalTask('001-check', 'slow-verification'), EvalTask('002-live', 'gate-success')),
+        2, _assert_live_dashboard,
+    ),
 )
 
 
@@ -314,6 +349,19 @@ def _create_repository(repository: Path, control: Path, tasks: tuple[EvalTask, .
         )
     dag_tasks = []
     for task in tasks:
+        commands = [[sys.executable, '-c', f"from pathlib import Path; assert {task.task_id!r} + ' completed' in Path('outputs/{task.task_id}.txt').read_text()"]]
+        if task.action == 'slow-verification':
+            check = control / 'verify.py'
+            check.write_text(
+                "import time\nfrom pathlib import Path\n"
+                f"control = Path({str(control)!r})\n"
+                "(control / 'verifying').touch()\n"
+                "deadline = time.monotonic() + 15\n"
+                "while not (control / 'verification-release').exists():\n"
+                "    assert time.monotonic() < deadline, 'verification gate timed out'\n"
+                "    time.sleep(.05)\n"
+            )
+            commands.insert(0, [sys.executable, str(check)])
         dag_tasks.append(
             {
                 "id": task.task_id,
@@ -321,7 +369,7 @@ def _create_repository(repository: Path, control: Path, tasks: tuple[EvalTask, .
                 "title": task.task_id,
                 "instructions": f"Controller eval action: {task.action}",
                 "predictedPaths": [f"outputs/{task.task_id}.txt"],
-                "verification": {"commands": [[sys.executable, "-c", f"from pathlib import Path; assert {task.task_id!r} + ' completed' in Path('outputs/{task.task_id}.txt').read_text()"]]},
+                "verification": {"commands": commands},
                 "predictedSymbols": [],
                 "dependsOn": list(task.depends_on),
                 "parallelSafe": not task.depends_on,
@@ -382,7 +430,11 @@ if action == "resume-once":
 elif action == "gate-success":
     (control / ("ready-" + task_id)).write_text("ready\\n", encoding="utf-8")
     deadline = time.monotonic() + 15
+    activity_sent = False
     while not (control / "release").exists():
+        if (control / "activity").exists() and not activity_sent:
+            print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Dashboard live event"}}), flush=True)
+            activity_sent = True
         if time.monotonic() >= deadline:
             raise SystemExit("gate timed out")
         time.sleep(0.05)

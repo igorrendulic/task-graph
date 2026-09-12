@@ -38,9 +38,10 @@ python3 -m evals.run_controller
 ```
 
 Controller evals require Python, Git, and tmux. They do not require Codex.
-Seven scenarios cover worker conversation recovery, rejected false-success
+Eight scenarios cover worker conversation recovery, rejected false-success
 results, parallel and dependent tasks, repair attempts, terminal failures, and
-controller recovery. Scripted workers exercise real tmux sessions, Git commits,
+controller recovery, and live dashboard activity during verification and resize.
+Scripted workers exercise real tmux sessions, Git commits,
 and controller-owned verification commands; they do not test model behavior.
 
 ## Running and debugging behavior cases

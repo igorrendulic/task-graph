@@ -20,20 +20,20 @@ class TaskGraphControllerEvalTests(unittest.TestCase):
     @patch("evals.run_controller._require_executables")
     @patch("evals.run_controller.time.monotonic")
     def test_reports_each_scenario_and_a_passing_summary(self, monotonic, require_executables, run_scenario):
-        monotonic.side_effect = [6.0, 6.25, 7.0, 7.5, 10.0, 10.25, 11.0, 11.5, 12.0, 12.75, 13.0, 14.0, 15.0, 16.25]
+        monotonic.side_effect = [6.0, 6.25, 7.0, 7.5, 10.0, 10.25, 11.0, 11.5, 12.0, 12.75, 13.0, 14.0, 15.0, 16.25, 17.0, 18.0]
         output = StringIO()
 
         with patch("sys.stdout", output):
             run_controller_evals()
 
-        self.assertEqual(7, run_scenario.call_count)
+        self.assertEqual(8, run_scenario.call_count)
         self.assertIn(
             "RUN  parallel-success — verifies two independent tasks execute concurrently and integrate\n",
             output.getvalue(),
         )
         self.assertIn("PASS parallel-success (0.2s)\n", output.getvalue())
         self.assertIn("PASS resume (1.2s)\n", output.getvalue())
-        self.assertIn("Summary: 7 passed, 0 failed\n", output.getvalue())
+        self.assertIn("Summary: 8 passed, 0 failed\n", output.getvalue())
         require_executables.assert_called_once_with()
 
     @patch("evals.run_controller._run_scenario", side_effect=RuntimeError("boom"))

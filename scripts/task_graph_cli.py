@@ -478,7 +478,13 @@ def run_controller(run_dir: Path) -> None:
     """Long-lived tmux service loop. The lock prevents duplicate schedulers."""
     with RunLock(run_dir, blocking=True):
         dashboard = TerminalDashboard(sys.stdout)
-        controller = TaskGraphController(run_dir, event_sink=dashboard.record_event)
+        def record_event(event):
+            dashboard.record_event(event)
+            if event['kind'] != 'activity':
+                dashboard.redraw(controller.state, controller.tasks)
+
+        controller = TaskGraphController(run_dir, event_sink=record_event)
+        dashboard.activity = controller.activity
         try:
             dashboard.start(controller.state, controller.tasks)
             while not controller.is_complete():
@@ -488,7 +494,10 @@ def run_controller(run_dir: Path) -> None:
                     time.sleep(1)
             dashboard.finish(controller.state, controller.tasks, _run_summary(controller.state))
         finally:
-            dashboard.cleanup()
+            try:
+                controller.close()
+            finally:
+                dashboard.cleanup()
         _notify_run_completion(run_dir, controller.state)
 
 
